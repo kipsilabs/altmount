@@ -15,7 +15,7 @@ import (
 	"github.com/javi11/altmount/frontend"
 	"github.com/javi11/altmount/internal/api"
 	"github.com/javi11/altmount/internal/arrs"
-	"github.com/javi11/altmount/internal/stremio"
+	"github.com/javi11/altmount/internal/arrs/registrar"
 	"github.com/javi11/altmount/internal/config"
 	"github.com/javi11/altmount/internal/health"
 	"github.com/javi11/altmount/internal/metadata"
@@ -24,6 +24,7 @@ import (
 	"github.com/javi11/altmount/internal/progress"
 	"github.com/javi11/altmount/internal/rclone"
 	"github.com/javi11/altmount/internal/slogutil"
+	"github.com/javi11/altmount/internal/stremio"
 	"github.com/javi11/altmount/internal/webdav"
 	"github.com/spf13/cobra"
 )
@@ -277,7 +278,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		}
 
 		if apiKey != "" {
-			logger.InfoContext(bgCtx, "Triggering automatic ARR webhook registration", "webhook_url", cfg.GetWebhookBaseURL())
+			logger.InfoContext(bgCtx, "Triggering automatic ARR webhook registration", "webhook_url", registrar.RedactWebhookURLForLog(cfg.GetWebhookBaseURL()))
 			if err := arrsService.EnsureWebhookRegistration(bgCtx, cfg.GetWebhookBaseURL(), apiKey); err != nil {
 				logger.ErrorContext(bgCtx, "Failed to register ARR webhooks on startup", "error", err)
 			}
