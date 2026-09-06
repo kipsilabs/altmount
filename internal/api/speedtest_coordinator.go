@@ -124,10 +124,7 @@ func (sc *speedtestCoordinator) sweepExpired() {
 // nntppool-side provider name (used by SpeedTest).
 func (sc *speedtestCoordinator) getOrBuildClient(ctx context.Context, p *config.ProviderConfig) (*nntppool.Client, string, error) {
 	host := fmt.Sprintf("%s:%d", p.Host, p.Port)
-	providerName := host
-	if p.Username != "" {
-		providerName = host + "+" + p.Username
-	}
+	providerName := p.NNTPPoolName()
 
 	sc.mu.Lock()
 	if entry, ok := sc.clients[p.ID]; ok && time.Now().Before(entry.expiresAt) {
@@ -160,6 +157,7 @@ func (sc *speedtestCoordinator) getOrBuildClient(ctx context.Context, p *config.
 	client, err := nntppool.NewClient(ctx, []nntppool.Provider{
 		{
 			Host:        host,
+			Name:        providerName,
 			TLSConfig:   tlsCfg,
 			Auth:        nntppool.Auth{Username: p.Username, Password: p.Password},
 			Connections: p.MaxConnections,

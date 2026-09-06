@@ -3703,6 +3703,7 @@ components:
         host:
           type: string
         id:
+          description: Stable public provider identifier; never credentials or non-graphic characters
           type: string
         inflight_requests:
           type: integer
@@ -3777,6 +3778,7 @@ components:
         host:
           type: string
         id:
+          description: Stable public provider identifier; never credentials or non-graphic characters
           type: string
         last_connection_attempt:
           type: string
@@ -3800,8 +3802,6 @@ components:
           type: string
         used_connections:
           type: integer
-        username:
-          type: string
       type: object
     api.ProviderTestRequest:
       properties:

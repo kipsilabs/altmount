@@ -346,7 +346,6 @@ export interface LibrarySyncStatus {
 export interface ProviderStatus {
 	id: string;
 	host: string;
-	username: string;
 	used_connections: number;
 	max_connections: number;
 	state: string;

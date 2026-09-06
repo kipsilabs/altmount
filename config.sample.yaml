@@ -266,7 +266,7 @@ profiler_enabled: false # Enable performance profiling (default: false)
 # Configure multiple providers for redundancy and load balancing
 providers:
   # Primary provider with SSL
-  - id: 1 # Auto-generated hash ID based on host:port@username (leave empty for auto-generation)
+  - id: provider_primary # Stable public identifier; keep unique and free of credentials/non-graphic characters
     host: 'ssl-news.provider.com' # Replace with your provider's SSL hostname
     port: 563
     username: 'your_username' # Replace with your username
@@ -279,7 +279,7 @@ providers:
     is_backup_provider: false # Mark as backup provider (default: false)
 
   # Backup provider without SSL
-  - id: 2 # Auto-generated hash ID (leave empty for auto-generation)
+  - id: provider_backup # Stable public identifier; keep unique and free of credentials/non-graphic characters
     host: 'news.provider.com' # Replace with your provider's standard hostname
     port: 119
     username: 'your_username' # Replace with your username
@@ -293,7 +293,7 @@ providers:
 
 
   # Secondary provider (optional)
-  # - id: '' # Auto-generated
+  # - id: provider_secondary # Stable public identifier; keep unique and free of credentials/non-graphic characters
   #   host: "news.otherprovider.com"
   #   port: 563
   #   username: "other_username"

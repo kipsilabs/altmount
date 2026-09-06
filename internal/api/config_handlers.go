@@ -401,6 +401,12 @@ func (s *Server) handleTestProvider(c *fiber.Ctx) error {
 	defer cancel()
 
 	host := fmt.Sprintf("%s:%d", testReq.Host, testReq.Port)
+	providerName := testReq.ProviderID
+	if providerName == "" {
+		// Ad-hoc tests have no persisted provider ID. Keep the endpoint context
+		// while preventing nntppool from deriving a name from Auth.Username.
+		providerName = host
+	}
 	var tlsCfg *tls.Config
 	if testReq.TLS {
 		tlsCfg = &tls.Config{
@@ -411,6 +417,7 @@ func (s *Server) handleTestProvider(c *fiber.Ctx) error {
 
 	result := nntppool.TestProvider(ctx, nntppool.Provider{
 		Host:      host,
+		Name:      providerName,
 		TLSConfig: tlsCfg,
 		Auth:      nntppool.Auth{Username: testReq.Username, Password: testReq.Password},
 		SkipPing:  testReq.SkipPing,
@@ -467,6 +474,22 @@ func (s *Server) handleTestProvider(c *fiber.Ctx) error {
 //	@Failure		400		{object}	APIResponse
 //	@Security		BearerAuth
 //	@Router			/providers [post]
+// nextProviderID picks the lowest-numbered "provider_N" id not already used
+// by an existing provider. Providers can be deleted, so the next free index
+// is not simply len(existing)+1 — that can collide with a surviving provider.
+func nextProviderID(existing []config.ProviderConfig) string {
+	used := make(map[string]struct{}, len(existing))
+	for _, p := range existing {
+		used[p.ID] = struct{}{}
+	}
+	for i := len(existing) + 1; ; i++ {
+		candidate := fmt.Sprintf("provider_%d", i)
+		if _, exists := used[candidate]; !exists {
+			return candidate
+		}
+	}
+}
+
 func (s *Server) handleCreateProvider(c *fiber.Ctx) error {
 	if s.configManager == nil {
 		return RespondServiceUnavailable(c, "Configuration management not available", "CONFIG_UNAVAILABLE")
@@ -517,8 +540,8 @@ func (s *Server) handleCreateProvider(c *fiber.Ctx) error {
 		createReq.MaxConnections = 1 // Default
 	}
 
-	// Generate new ID
-	newID := fmt.Sprintf("provider_%d", len(currentConfig.Providers)+1)
+	// Generate a new ID that doesn't collide with an existing one.
+	newID := nextProviderID(currentConfig.Providers)
 
 	// Create new provider
 	newProvider := config.ProviderConfig{

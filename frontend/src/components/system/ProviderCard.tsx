@@ -125,10 +125,10 @@ export function ProviderCard({ provider, className, onResetQuota }: ProviderCard
 								{stateBadge.text}
 							</span>
 							<span
-								className="cursor-pointer font-mono text-base-content/40 text-xs blur-sm transition-all hover:blur-none"
-								title="Click to unblur"
+								className="font-mono text-base-content/40 text-xs"
+								title="Provider ID"
 							>
-								{provider.username || "anonymous"}
+								{provider.id}
 							</span>
 						</div>
 					</div>

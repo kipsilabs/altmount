@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"time"
 
@@ -55,14 +54,9 @@ func (s *Server) handleTestProviderSpeed(c *fiber.Ctx) error {
 	testCtx, cancel := context.WithTimeout(c.Context(), 5*time.Minute)
 	defer cancel()
 
-	// Build the nntppool provider name the same way the production pool
-	// and coordinator do, so we can match the right per-provider stats
-	// entry in the result.
-	host := fmt.Sprintf("%s:%d", targetProvider.Host, targetProvider.Port)
-	providerName := host
-	if targetProvider.Username != "" {
-		providerName = host + "+" + targetProvider.Username
-	}
+	// Use the stable provider ID used by the production pool and coordinator
+	// to match the right per-provider stats entry in the result.
+	providerName := targetProvider.NNTPPoolName()
 
 	// Prefer the production pool when this provider is already part of
 	// it; otherwise fall back to the singleton coordinator so we never
@@ -134,16 +128,8 @@ func (s *Server) runProviderSpeedTest(ctx context.Context, p *config.ProviderCon
 	if s.poolManager != nil {
 		if cp, err := s.poolManager.GetPool(); err == nil && cp != nil {
 			if real, ok := cp.(*nntppool.Client); ok {
-				// Match the name the production pool registers for this
-				// provider: ToNNTPProvider sets Host = "host:port", and
-				// nntppool's resolveProviderName derives "host:port+user".
-				// Building the lookup from p.Host alone (no port) never
-				// matches, forcing the slow coordinator fallback.
-				host := fmt.Sprintf("%s:%d", p.Host, p.Port)
-				providerName := host
-				if p.Username != "" {
-					providerName = host + "+" + p.Username
-				}
+				// ToNNTPProvider registers the provider under its stable ID.
+				providerName := p.NNTPPoolName()
 				// Try the production pool first. If the provider isn't
 				// in it, nntppool returns an error and we fall through
 				// to the coordinator.

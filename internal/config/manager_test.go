@@ -1,6 +1,7 @@
 package config
 
 import (
+	"os"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -457,4 +458,33 @@ func TestMigrateArrsCleanup_AutoFailureFlag_FalseClearsOnly(t *testing.T) {
 	// Flag off: no rule seeded, existing rules untouched, flag cleared.
 	assert.Equal(t, rules, cfg.Arrs.QueueCleanupRules)
 	assert.Nil(t, cfg.Arrs.CleanupAutomaticImportFailure)
+}
+
+// A provider written by hand with no "id" (or an empty one) predates the id
+// requirement and must not prevent the process from starting: LoadConfig
+// should migrate it to a stable id rather than failing Validate.
+func TestLoadConfig_ProviderWithBlankIDDoesNotFailStartup(t *testing.T) {
+	tempDir := t.TempDir()
+	configFile := tempDir + "/config.yaml"
+
+	yamlContent := `
+providers:
+  - id: ''
+    host: news.example.test
+    port: 563
+    max_connections: 5
+  - host: news.other.test
+    port: 119
+    max_connections: 5
+`
+	err := os.WriteFile(configFile, []byte(yamlContent), 0644)
+	assert.NoError(t, err)
+
+	cfg, err := LoadConfig(configFile)
+	assert.NoError(t, err)
+	assert.NotNil(t, cfg)
+
+	assert.NotEmpty(t, cfg.Providers[0].ID)
+	assert.NotEmpty(t, cfg.Providers[1].ID)
+	assert.NotEqual(t, cfg.Providers[0].ID, cfg.Providers[1].ID)
 }

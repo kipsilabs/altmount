@@ -1751,6 +1751,36 @@ func (r *Repository) UpdateSystemStat(ctx context.Context, key string, value int
 	return nil
 }
 
+// MigrateSystemStats atomically writes replacement system-stat keys and removes
+// a bounded set of legacy keys. Callers must treat returned errors as sensitive
+// and avoid logging their raw values.
+func (r *Repository) MigrateSystemStats(ctx context.Context, stats map[string]int64, deleteKeys []string) error {
+	if len(stats) == 0 && len(deleteKeys) == 0 {
+		return nil
+	}
+
+	return r.WithTransaction(ctx, func(txRepo *Repository) error {
+		for key, value := range stats {
+			query := `
+				INSERT INTO system_stats (key, value, updated_at)
+				VALUES (?, ?, CURRENT_TIMESTAMP)
+				ON CONFLICT(key) DO UPDATE SET
+				value = excluded.value,
+				updated_at = CURRENT_TIMESTAMP
+			`
+			if _, err := txRepo.db.ExecContext(ctx, query, key, value); err != nil {
+				return fmt.Errorf("failed to write migrated system stat: %w", err)
+			}
+		}
+		for _, key := range deleteKeys {
+			if _, err := txRepo.db.ExecContext(ctx, `DELETE FROM system_stats WHERE key = ?`, key); err != nil {
+				return fmt.Errorf("failed to remove migrated system stat: %w", err)
+			}
+		}
+		return nil
+	})
+}
+
 // BatchUpdateSystemStats updates multiple system statistics in a single transaction
 func (r *Repository) BatchUpdateSystemStats(ctx context.Context, stats map[string]int64) error {
 	if len(stats) == 0 {
