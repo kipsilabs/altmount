@@ -104,6 +104,30 @@ func (w *BackupWorker) Stop(ctx context.Context) {
 	slog.InfoContext(ctx, "Metadata backup worker stopped")
 }
 
+// backupSource is a directory to walk plus the filename filter deciding which of
+// its files belong in the backup.
+type backupSource struct {
+	path    string
+	matches func(name string) bool
+}
+
+func isMetaFile(name string) bool {
+	return strings.HasSuffix(name, ".meta")
+}
+
+func isNzbFile(name string) bool {
+	return strings.HasSuffix(name, ".nzbz") || strings.HasSuffix(name, ".nzb")
+}
+
+// nzbStorePath mirrors importer.Service.GetNzbFolder: the persistent NZB store
+// lives next to the database file.
+func nzbStorePath(cfg *config.Config) string {
+	if cfg.Database.Path == "" {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(cfg.Database.Path), ".nzbs")
+}
+
 func (w *BackupWorker) performBackup() {
 	cfg := w.configGetter()
 	backupRoot := cfg.Metadata.Backup.Path
@@ -121,14 +145,22 @@ func (w *BackupWorker) performBackup() {
 
 	count := 0
 
-	// Paths to back up
-	pathsToBackup := []string{metadataDir}
+	// Roots to back up, each with the set of files it contributes.
+	rootsToBackup := []backupSource{{path: metadataDir, matches: isMetaFile}}
 	if cfg.Health.LibraryDir != nil && *cfg.Health.LibraryDir != "" {
-		pathsToBackup = append(pathsToBackup, *cfg.Health.LibraryDir)
+		rootsToBackup = append(rootsToBackup, backupSource{path: *cfg.Health.LibraryDir, matches: isMetaFile})
+	}
+	// Persistent NZB store (configDir/.nzbs) holds the .nzbz files the queue and
+	// stremio endpoints replay from; without them a restored metadata set has no
+	// source NZB to fall back on.
+	if nzbStoreDir := nzbStorePath(cfg); nzbStoreDir != "" {
+		if info, err := os.Stat(nzbStoreDir); err == nil && info.IsDir() {
+			rootsToBackup = append(rootsToBackup, backupSource{path: nzbStoreDir, matches: isNzbFile})
+		}
 	}
 
-	for _, root := range pathsToBackup {
-		err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+	for _, root := range rootsToBackup {
+		err := filepath.Walk(root.path, func(path string, info os.FileInfo, err error) error {
 			if w.workerCtx != nil {
 				select {
 				case <-w.workerCtx.Done():
@@ -154,21 +186,21 @@ func (w *BackupWorker) performBackup() {
 				return nil
 			}
 
-			if !strings.HasSuffix(info.Name(), ".meta") {
+			if !root.matches(info.Name()) {
 				return nil
 			}
 
-			relPath, err := filepath.Rel(root, path)
+			relPath, err := filepath.Rel(root.path, path)
 			if err != nil {
 				return err
 			}
 
 			// Add subdir prefix to avoid collisions
 			var destPath string
-			if root == metadataDir {
+			if root.path == metadataDir {
 				destPath = filepath.Join(backupDir, relPath)
 			} else {
-				destPath = filepath.Join(backupDir, filepath.Base(root), relPath)
+				destPath = filepath.Join(backupDir, filepath.Base(root.path), relPath)
 			}
 
 			if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
