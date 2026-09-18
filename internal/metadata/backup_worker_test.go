@@ -138,3 +138,46 @@ func TestBackupWorker_performBackup_SkipsUnreadableDirs(t *testing.T) {
 	assert.FileExists(t, filepath.Join(backupDir, "readable.meta"))
 	assert.NoFileExists(t, filepath.Join(backupDir, "denied", "hidden.meta"))
 }
+
+func TestBackupWorker_performBackup_IncludesNzbStore(t *testing.T) {
+	tempDir := t.TempDir()
+
+	metadataDir := filepath.Join(tempDir, "metadata")
+	backupRoot := filepath.Join(tempDir, "backups")
+	configDir := filepath.Join(tempDir, "config")
+	nzbStore := filepath.Join(configDir, ".nzbs", "Movies", "42")
+
+	assert.NoError(t, os.MkdirAll(metadataDir, 0755))
+	assert.NoError(t, os.MkdirAll(nzbStore, 0755))
+	assert.NoError(t, os.WriteFile(filepath.Join(metadataDir, "test.meta"), []byte("meta"), 0644))
+	assert.NoError(t, os.WriteFile(filepath.Join(nzbStore, "42-movie.nzbz"), []byte("gz"), 0644))
+	assert.NoError(t, os.WriteFile(filepath.Join(nzbStore, "legacy.nzb"), []byte("xml"), 0644))
+	assert.NoError(t, os.WriteFile(filepath.Join(nzbStore, "notes.txt"), []byte("skip"), 0644))
+
+	enabled := true
+	cfg := &config.Config{
+		Database: config.DatabaseConfig{Path: filepath.Join(configDir, "altmount.db")},
+		Metadata: config.MetadataConfig{
+			RootPath: metadataDir,
+			Backup: config.MetadataBackupConfig{
+				Enabled:     &enabled,
+				Schedule:    "0 3 * * *",
+				KeepBackups: 2,
+				Path:        backupRoot,
+			},
+		},
+	}
+
+	worker := NewBackupWorker(func() *config.Config { return cfg })
+	worker.performBackup()
+
+	dirs, err := os.ReadDir(backupRoot)
+	assert.NoError(t, err)
+	assert.Len(t, dirs, 1)
+
+	backupDir := filepath.Join(backupRoot, dirs[0].Name())
+	assert.FileExists(t, filepath.Join(backupDir, "test.meta"))
+	assert.FileExists(t, filepath.Join(backupDir, ".nzbs", "Movies", "42", "42-movie.nzbz"))
+	assert.FileExists(t, filepath.Join(backupDir, ".nzbs", "Movies", "42", "legacy.nzb"))
+	assert.NoFileExists(t, filepath.Join(backupDir, ".nzbs", "Movies", "42", "notes.txt"))
+}
