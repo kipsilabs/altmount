@@ -9,7 +9,7 @@ import (
 	"github.com/kipsilabs/altmount/internal/database"
 	"github.com/kipsilabs/altmount/internal/pool"
 	"github.com/kipsilabs/altmount/internal/testsupport/fakepool"
-	"github.com/javi11/nntppool/v4"
+	"github.com/javi11/nntppool/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -21,12 +21,12 @@ type stallingClient struct {
 	delay time.Duration
 }
 
-func (c *stallingClient) StatMany(ctx context.Context, ids []string, opts nntppool.StatManyOptions) <-chan nntppool.StatManyResult {
+func (c *stallingClient) ExistsMany(ctx context.Context, ids []string, opts nntppool.ManyOptions) <-chan nntppool.ExistsResult {
 	select {
 	case <-ctx.Done():
 	case <-time.After(c.delay):
 	}
-	return c.NntpClient.StatMany(ctx, ids, opts)
+	return c.NntpClient.ExistsMany(ctx, ids, opts)
 }
 
 // TestManualRecheckTimeoutRestoresPreCheckStatus covers the recovery path that

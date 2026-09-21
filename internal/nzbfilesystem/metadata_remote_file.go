@@ -16,6 +16,7 @@ import (
 	"time"
 
 	lru "github.com/hashicorp/golang-lru/v2"
+	"github.com/javi11/nntppool/v5"
 
 	"github.com/kipsilabs/altmount/internal/config"
 	"github.com/kipsilabs/altmount/internal/database"
@@ -300,6 +301,7 @@ func (mrf *MetadataRemoteFile) OpenFile(ctx context.Context, name string) (bool,
 		NestedSources:           fileMeta.NestedSources,
 		ClipBoundaries:          fileMeta.ClipBoundaries,
 		KnownHoles:              fileMeta.KnownHoles,
+		ReleaseDate:             fileMeta.ReleaseDate,
 		HoleProviderFingerprint: fileMeta.HoleProviderFingerprint,
 	}
 
@@ -838,9 +840,24 @@ type fileHandleMeta struct {
 	// KnownHoles is the persisted hole map: segments confirmed missing on all
 	// providers, zero-filled during streaming without a fetch round-trip.
 	KnownHoles []*metapb.HoleRun
+	// ReleaseDate is the Unix timestamp of the original Usenet post, forwarded
+	// to the pool as nntppool.Req.ArticleDate so per-provider retention limits
+	// apply. 0 (metadata written before the field existed) means unknown,
+	// which applies no policy.
+	ReleaseDate int64
 	// HoleProviderFingerprint is the provider set KnownHoles were confirmed
 	// against; runs recorded under another set are re-probed rather than padded.
 	HoleProviderFingerprint string
+}
+
+// articleDate returns when this file's articles were posted, for the pool's
+// per-provider retention limits. The zero time means unknown, which applies
+// no policy rather than assuming the articles are old.
+func (mvf *MetadataVirtualFile) articleDate() time.Time {
+	if mvf.meta == nil || mvf.meta.ReleaseDate <= 0 {
+		return time.Time{}
+	}
+	return time.Unix(mvf.meta.ReleaseDate, 0)
 }
 
 // MetadataVirtualFile implements afero.File for metadata-backed virtual files
@@ -2136,6 +2153,7 @@ func (mvf *MetadataVirtualFile) createUsenetReader(ctx context.Context, start, e
 	// always). See holes.go.
 	ur, err := usenet.NewUsenetReader(ctx, mvf.poolManager.GetPool, rg, mvf.maxPrefetch, mvf.streamTracker, mvf.streamID, mvf.segmentStore,
 		usenet.WithHoleHooks(mvf.holeHooks()),
+		usenet.WithArticleDate(mvf.articleDate()),
 		usenet.WithSpeculativeBudget(mvf.poolManager.SpeculativeBudget()))
 	if err != nil {
 		return nil, err
@@ -2265,6 +2283,7 @@ func (mvf *MetadataVirtualFile) createUsenetReaderFromSegments(ctx context.Conte
 	}
 
 	ur, err := usenet.NewUsenetReader(ctx, mvf.poolManager.GetPool, rg, mvf.maxPrefetch, mvf.streamTracker, mvf.streamID, mvf.segmentStore,
+		usenet.WithArticleDate(mvf.articleDate()),
 		usenet.WithSpeculativeBudget(mvf.poolManager.SpeculativeBudget()))
 	if err != nil {
 		return nil, err
@@ -2687,7 +2706,11 @@ func (mvf *MetadataVirtualFile) confirmSegmentMissing(ctx context.Context, dcErr
 
 	// Priority lane: a playback read is blocked behind this, so it must not
 	// spend its budget queued behind a large BODY on a busy connection.
-	if _, err := usenetPool.StatPriority(statCtx, dcErr.SegmentID); err != nil {
+	if _, err := usenetPool.Exists(statCtx, nntppool.Req{
+		MessageID:   dcErr.SegmentID,
+		Lane:        nntppool.LanePriority,
+		ArticleDate: mvf.articleDate(),
+	}); err != nil {
 		return true
 	}
 	return false

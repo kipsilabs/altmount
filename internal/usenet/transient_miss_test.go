@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/javi11/nntppool/v4"
+	"github.com/javi11/nntppool/v5"
 	"github.com/kipsilabs/altmount/internal/pool"
 	"github.com/kipsilabs/altmount/internal/testsupport/fakepool"
 	"github.com/kipsilabs/altmount/internal/testsupport/segments"

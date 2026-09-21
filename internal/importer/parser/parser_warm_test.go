@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"github.com/kipsilabs/altmount/internal/testsupport/fakepool"
-	"github.com/javi11/nntppool/v4"
+	"github.com/javi11/nntppool/v5"
 	"github.com/javi11/nzbparser"
 )
 

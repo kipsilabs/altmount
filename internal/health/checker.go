@@ -109,6 +109,9 @@ type healthCheckInput struct {
 	// segment concatenation (nested RAR sources, BD clip remux) — those are
 	// never zero-filled, so hole classification does not apply.
 	hasNestedOrRemuxedSources bool
+	// releaseDate is the Unix timestamp of the original Usenet post, carried
+	// through to the stat sweep as nntppool.Req.ArticleDate. 0 = unknown.
+	releaseDate int64
 }
 
 // preparedCheck is the outcome of the per-file preparation stage shared by the
@@ -130,6 +133,11 @@ type preparedCheck struct {
 	// unless verifyContentOverride forces it either way.
 	currentStatus         database.HealthStatus
 	verifyContentOverride *bool
+	// releaseDate is the file's Usenet post date, forwarded to the pool so a
+	// provider whose retention does not reach back that far is not swept with
+	// ids it cannot hold. Zero (metadata written before the field existed)
+	// means unknown, which applies no policy.
+	releaseDate time.Time
 }
 
 // baseResultEvent builds the shared HealthEvent skeleton. SourceNzbPath is
@@ -197,6 +205,7 @@ func (hc *HealthChecker) prepareCheck(ctx context.Context, filePath string, opts
 		segments:      fileMeta.SegmentData,
 		encryption:    fileMeta.Encryption,
 		knownHoles:    fileMeta.KnownHoles,
+		releaseDate:   fileMeta.ReleaseDate,
 		hasNestedOrRemuxedSources: len(fileMeta.NestedSources) > 0 ||
 			len(fileMeta.SharedOuterSources) > 0 ||
 			len(fileMeta.ClipBoundaries) > 0,
@@ -234,6 +243,9 @@ func (hc *HealthChecker) prepareCheck(ctx context.Context, filePath string, opts
 	)
 
 	prep.totalSegments = len(input.segments)
+	if input.releaseDate > 0 {
+		prep.releaseDate = time.Unix(input.releaseDate, 0)
+	}
 
 	// 1. Metadata integrity check - Verify the entire file map is complete
 	loader := &metadataSegmentLoader{segments: input.segments}
@@ -479,6 +491,7 @@ func (hc *HealthChecker) batchOptions(preps []preparedCheck) usenet.BatchOptions
 	return usenet.BatchOptions{
 		MaxConnections: hc.statSweepConcurrency(cfg),
 		Timeout:        cfg.GetHealthReadTimeout(),
+		ArticleDate:    oldestReleaseDate(preps),
 		ShouldStop: func(fileIdx int, result usenet.ValidationResult) bool {
 			if fileIdx >= len(preps) {
 				return false
@@ -658,4 +671,22 @@ func (l *metadataSegmentLoader) GetSegment(index int) (usenet.Segment, []string,
 		End:   s.EndOffset,
 		Size:  s.SegmentSize,
 	}, []string{}, true
+}
+
+// oldestReleaseDate returns one article date for a batch that spans several
+// files: the oldest post date among them, or the zero time when none is
+// known. A batch mixes releases, and the pool takes one date per sweep, so the
+// oldest is the conservative choice — a provider whose retention stops short
+// of it is swept last rather than handed ids it may no longer hold.
+func oldestReleaseDate(preps []preparedCheck) time.Time {
+	var oldest time.Time
+	for _, p := range preps {
+		if p.releaseDate.IsZero() {
+			continue
+		}
+		if oldest.IsZero() || p.releaseDate.Before(oldest) {
+			oldest = p.releaseDate
+		}
+	}
+	return oldest
 }

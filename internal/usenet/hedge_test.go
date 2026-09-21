@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/javi11/nntppool/v4"
+	"github.com/javi11/nntppool/v5"
 	"github.com/kipsilabs/altmount/internal/pool"
 	"github.com/kipsilabs/altmount/internal/testsupport/fakepool"
 	"github.com/kipsilabs/altmount/internal/testsupport/segments"
@@ -51,7 +51,10 @@ func (p *hedgeProbe) callsFor(id string) int {
 	return p.calls[id]
 }
 
-func (p *hedgeProbe) BodyStreamPriority(ctx context.Context, id string, w io.Writer, onMeta ...func(nntppool.YEncMeta)) (*nntppool.ArticleBody, error) {
+// Fetch delays the configured number of times per message-ID before handing
+// off to the embedded fake, so the hedge policy can be driven deterministically.
+func (p *hedgeProbe) Fetch(ctx context.Context, r nntppool.Req) (*nntppool.ArticleBody, error) {
+	id := r.MessageID
 	p.mu.Lock()
 	n := p.calls[id]
 	p.calls[id]++
@@ -70,7 +73,7 @@ func (p *hedgeProbe) BodyStreamPriority(ctx context.Context, id string, w io.Wri
 		case <-t.C:
 		}
 	}
-	return p.Client.BodyStreamPriority(ctx, id, w, onMeta...)
+	return p.Client.Fetch(ctx, r)
 }
 
 type countingMetrics struct{ downloaded atomic.Int64 }

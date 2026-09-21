@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/javi11/nntppool/v5"
 	"github.com/kipsilabs/altmount/internal/streambench"
 	"github.com/kipsilabs/altmount/internal/testsupport/nntpserver"
 	"github.com/kipsilabs/altmount/internal/testsupport/segments"
@@ -342,7 +343,7 @@ func BenchmarkStreamUnderContention(b *testing.B) {
 					if err != nil {
 						return
 					}
-					body, err := h.client.Body(ctx, segments.MessageID(100000+i))
+					body, err := h.client.Fetch(ctx, nntppool.Req{MessageID: segments.MessageID(100000 + i)})
 					release()
 					if err == nil {
 						importBytes.Add(int64(len(body.Bytes)))

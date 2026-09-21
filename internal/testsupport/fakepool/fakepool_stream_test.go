@@ -7,6 +7,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/javi11/nntppool/v5"
 )
 
 type recordingWriter struct {
@@ -45,7 +47,12 @@ func TestBodyStreamPriorityChunksAndGates(t *testing.T) {
 
 	w := &recordingWriter{}
 	done := make(chan error, 1)
-	go func() { _, err := c.BodyStreamPriority(context.Background(), "a", w); done <- err }()
+	go func() {
+		_, err := c.Fetch(context.Background(), nntppool.Req{
+			MessageID: "a", Writer: w, Lane: nntppool.LanePriority,
+		})
+		done <- err
+	}()
 
 	deadline := time.After(2 * time.Second)
 	for w.count() == 0 {
@@ -77,12 +84,16 @@ func TestBodyStreamPriorityFailAfterFirstChunk(t *testing.T) {
 	c.SetBehavior("a", SegmentBehavior{Bytes: payload, ChunkSize: 4, FailAfterFirstChunk: true, FailErr: errors.New("conn died")})
 
 	w := &recordingWriter{}
-	_, err := c.BodyStreamPriority(context.Background(), "a", w)
+	_, err := c.Fetch(context.Background(), nntppool.Req{
+		MessageID: "a", Writer: w, Lane: nntppool.LanePriority,
+	})
 	if err == nil || w.count() != 1 {
 		t.Fatalf("first call: err=%v writes=%d, want error after one chunk", err, w.count())
 	}
 	w2 := &recordingWriter{}
-	if _, err := c.BodyStreamPriority(context.Background(), "a", w2); err != nil {
+	if _, err := c.Fetch(context.Background(), nntppool.Req{
+		MessageID: "a", Writer: w2, Lane: nntppool.LanePriority,
+	}); err != nil {
 		t.Fatalf("second call must succeed: %v", err)
 	}
 	if w2.count() != 2 || !bytes.Equal(w2.all(), payload) {

@@ -13,7 +13,7 @@ import (
 	"github.com/kipsilabs/altmount/internal/pool"
 	"github.com/kipsilabs/altmount/internal/testsupport/fakepool"
 	"github.com/kipsilabs/altmount/internal/usenet"
-	"github.com/javi11/nntppool/v4"
+	"github.com/javi11/nntppool/v5"
 )
 
 type fastFailPoolManager struct {
@@ -66,11 +66,11 @@ func (m fastFailPoolManager) SpeculativeBudget() *pool.SpeculativeBudget { retur
 
 type uncancelableStatClient struct {
 	pool.NntpClient
-	result nntppool.StatManyResult
+	result nntppool.ExistsResult
 }
 
-func (c uncancelableStatClient) StatMany(context.Context, []string, nntppool.StatManyOptions) <-chan nntppool.StatManyResult {
-	out := make(chan nntppool.StatManyResult, 1)
+func (c uncancelableStatClient) StatMany(context.Context, []string, nntppool.ManyOptions) <-chan nntppool.ExistsResult {
+	out := make(chan nntppool.ExistsResult, 1)
 	out <- c.result
 	close(out)
 	return out
@@ -84,8 +84,8 @@ func newScriptedStatClient(outcomes map[string][]error) *scriptedStatClient {
 	}
 }
 
-func (c *scriptedStatClient) StatMany(ctx context.Context, ids []string, _ nntppool.StatManyOptions) <-chan nntppool.StatManyResult {
-	out := make(chan nntppool.StatManyResult, len(ids))
+func (c *scriptedStatClient) ExistsMany(ctx context.Context, ids []string, _ nntppool.ManyOptions) <-chan nntppool.ExistsResult {
+	out := make(chan nntppool.ExistsResult, len(ids))
 	go func() {
 		defer close(out)
 		for _, id := range ids {
@@ -100,7 +100,7 @@ func (c *scriptedStatClient) StatMany(ctx context.Context, ids []string, _ nntpp
 			}
 			c.mu.Unlock()
 
-			result := nntppool.StatManyResult{MessageID: id, Err: err}
+			result := nntppool.ExistsResult{MessageID: id, Err: err}
 			if err == nil {
 				result.Result = &nntppool.StatResult{MessageID: id}
 			}
@@ -133,6 +133,7 @@ func TestFastFailReleaseProbeRetriesTransientFailure(t *testing.T) {
 		1,
 		100*time.Millisecond,
 		nil,
+		time.Time{},
 	)
 	if err != nil {
 		t.Fatalf("FastFailReleaseProbe error = %v, want nil after transient recovery", err)
@@ -158,6 +159,7 @@ func TestFastFailReleaseProbeDoesNotRetryDefinitiveMiss(t *testing.T) {
 		1,
 		100*time.Millisecond,
 		nil,
+		time.Time{},
 	)
 	if err != nil {
 		t.Fatalf("FastFailReleaseProbe error = %v, want nil for definitive miss", err)
@@ -173,7 +175,7 @@ func TestFastFailReleaseProbeDoesNotRetryDefinitiveMiss(t *testing.T) {
 func TestFastFailReleaseProbeCancellationWinsOverDefinitiveMiss(t *testing.T) {
 	client := uncancelableStatClient{
 		NntpClient: fakepool.New(),
-		result:     nntppool.StatManyResult{MessageID: "gone-0", Err: nntppool.ErrArticleNotFound},
+		result:     nntppool.ExistsResult{MessageID: "gone-0", Err: nntppool.ErrArticleNotFound},
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -186,6 +188,7 @@ func TestFastFailReleaseProbeCancellationWinsOverDefinitiveMiss(t *testing.T) {
 		1,
 		100*time.Millisecond,
 		nil,
+		time.Time{},
 	)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("FastFailReleaseProbe error = %v, want context.Canceled", err)
@@ -209,6 +212,7 @@ func TestFastFailCheckFilesRetriesOnlyTransientIDs(t *testing.T) {
 		100, 2, 100*time.Millisecond, nil,
 		nil,
 		false,
+		time.Time{},
 	)
 	if err != nil {
 		t.Fatalf("FastFailCheckFiles error = %v, want nil after transient recovery", err)
@@ -236,6 +240,7 @@ func TestFastFailCheckFilesTransientExhaustionIsInconclusive(t *testing.T) {
 		100, 1, 100*time.Millisecond, nil,
 		nil,
 		false,
+		time.Time{},
 	)
 	if err == nil {
 		t.Fatal("FastFailCheckFiles error = nil, want inconclusive error after retries are exhausted")
@@ -271,6 +276,7 @@ func TestFastFailReleaseProbeUsesSegmentSamplePercentage(t *testing.T) {
 		1,
 		100*time.Millisecond,
 		nil,
+		time.Time{},
 	)
 	if err != nil {
 		t.Fatalf("FastFailReleaseProbe returned error: %v", err)
@@ -307,6 +313,7 @@ func TestFastFailReleaseProbeReportsMissingOnUnreachableSegment(t *testing.T) {
 		1,
 		100*time.Millisecond,
 		nil,
+		time.Time{},
 	)
 	if err != nil {
 		t.Fatalf("FastFailReleaseProbe error = %v, want nil (a missing segment is not an error)", err)
@@ -325,6 +332,7 @@ func TestFastFailReleaseProbePoolUnavailableReturnsError(t *testing.T) {
 		1,
 		100*time.Millisecond,
 		nil,
+		time.Time{},
 	)
 	if err == nil {
 		t.Fatal("FastFailReleaseProbe returned nil error, want error for nil pool")
@@ -344,6 +352,7 @@ func TestFastFailReleaseProbeNoSegmentsIsHealthy(t *testing.T) {
 		1,
 		100*time.Millisecond,
 		nil,
+		time.Time{},
 	)
 	if err != nil {
 		t.Fatalf("FastFailReleaseProbe error = %v, want nil", err)
@@ -442,6 +451,7 @@ func TestFastFailCheckFilesAllReachable(t *testing.T) {
 		nil,
 		nil,
 		false,
+		time.Time{},
 	)
 	if err != nil {
 		t.Fatalf("FastFailCheckFiles error = %v, want nil", err)
@@ -474,6 +484,7 @@ func TestFastFailCheckFilesOneFileBroken(t *testing.T) {
 		nil,
 		nil,
 		false,
+		time.Time{},
 	)
 	if err != nil {
 		t.Fatalf("FastFailCheckFiles error = %v, want nil", err)
@@ -509,6 +520,7 @@ func TestFastFailCheckFilesBrokenSidecarsAreReported(t *testing.T) {
 		nil,
 		nil,
 		false,
+		time.Time{},
 	)
 	if err != nil {
 		t.Fatalf("FastFailCheckFiles error = %v, want nil", err)
@@ -542,6 +554,7 @@ func TestFastFailCheckFilesBrokenSidecarIsReported(t *testing.T) {
 		nil,
 		nil,
 		false,
+		time.Time{},
 	)
 	if err != nil {
 		t.Fatalf("FastFailCheckFiles error = %v, want nil", err)
@@ -566,6 +579,7 @@ func TestFastFailCheckFilesPoolUnavailableReturnsError(t *testing.T) {
 		nil,
 		nil,
 		false,
+		time.Time{},
 	)
 	if err == nil {
 		t.Fatal("FastFailCheckFiles returned nil error, want error for nil pool")
@@ -600,6 +614,7 @@ func TestFastFailCheckFilesFirstSegmentAlwaysChecked(t *testing.T) {
 		nil,
 		nil,
 		false,
+		time.Time{},
 	)
 	if err != nil {
 		t.Fatalf("FastFailCheckFiles error = %v, want nil", err)
@@ -633,6 +648,7 @@ func TestFastFailCheckFilesGroupPropagation(t *testing.T) {
 		nil,
 		nil,
 		false,
+		time.Time{},
 	)
 	if err != nil {
 		t.Fatalf("FastFailCheckFiles error = %v, want nil", err)
@@ -678,6 +694,7 @@ func TestFastFailCheckFilesGroupShortCircuitSkipsStats(t *testing.T) {
 		nil,
 		nil,
 		false,
+		time.Time{},
 	)
 	if err != nil {
 		t.Fatalf("FastFailCheckFiles error = %v, want nil", err)
@@ -714,6 +731,7 @@ func TestFastFailCheckFilesEmptyGroupKeyNoPropagation(t *testing.T) {
 		nil,
 		nil,
 		false,
+		time.Time{},
 	)
 	if err != nil {
 		t.Fatalf("FastFailCheckFiles error = %v, want nil", err)
@@ -744,6 +762,7 @@ func TestFastFailCheckFilesIndexAligned(t *testing.T) {
 		nil,
 		nil,
 		false,
+		time.Time{},
 	)
 	if err != nil {
 		t.Fatalf("FastFailCheckFiles error = %v", err)
@@ -777,6 +796,7 @@ func TestFastFailReleaseProbeTimeoutIsInconclusive(t *testing.T) {
 		1,
 		10*time.Millisecond,
 		nil,
+		time.Time{},
 	)
 	if err == nil {
 		t.Fatal("FastFailReleaseProbe error = nil, want inconclusive error after retries")
@@ -810,6 +830,7 @@ func TestFastFailReleaseProbeCallerCancellationReturnsError(t *testing.T) {
 		1,
 		time.Minute,
 		nil,
+		time.Time{},
 	)
 	if err == nil {
 		t.Fatal("FastFailReleaseProbe error = nil, want error when the caller cancelled")
@@ -839,6 +860,7 @@ func TestFastFailCheckFilesTimeoutIsInconclusive(t *testing.T) {
 		nil,
 		nil,
 		false,
+		time.Time{},
 	)
 	if err == nil {
 		t.Fatal("FastFailCheckFiles error = nil, want inconclusive error after retries")
@@ -883,6 +905,7 @@ func TestFastFailCheckFilesDeadReleaseSettlesWithoutWaitingForUnverified(t *test
 		100, 10, 100*time.Millisecond, nil,
 		nil,
 		false,
+		time.Time{},
 	)
 	if err != nil {
 		t.Fatalf("FastFailCheckFiles error = %v, want nil for a dead release", err)
@@ -942,6 +965,7 @@ func TestFastFailCheckFilesPlaceholdersAreKnownMissesWithoutStat(t *testing.T) {
 		fastFailPoolManager{client: client},
 		100, 8, 100*time.Millisecond, nil, nil,
 		false,
+		time.Time{},
 	)
 	if err != nil {
 		t.Fatalf("FastFailCheckFiles error = %v", err)
@@ -1026,6 +1050,7 @@ func TestFastFailCheckFilesStopFileOnFirstMissSkipsRestOfFile(t *testing.T) {
 		nil,
 		nil,
 		true,
+		time.Time{},
 	)
 	if err != nil {
 		t.Fatalf("FastFailCheckFiles error = %v, want nil", err)
@@ -1069,6 +1094,7 @@ func TestFastFailCheckFilesStopsWhenNoEligibleFilesRemain(t *testing.T) {
 		tracker,
 		nil,
 		true,
+		time.Time{},
 	)
 	if err != nil {
 		t.Fatalf("FastFailCheckFiles error = %v, want nil", err)
@@ -1104,6 +1130,7 @@ func TestFastFailCheckFilesWithoutStopFileSweepsWholeSample(t *testing.T) {
 		nil,
 		nil,
 		false,
+		time.Time{},
 	)
 	if err != nil {
 		t.Fatalf("FastFailCheckFiles error = %v, want nil", err)
@@ -1143,6 +1170,7 @@ func TestFastFailCheckFilesStopFileOnFirstMissCondemnsGroup(t *testing.T) {
 		nil,
 		nil,
 		true,
+		time.Time{},
 	)
 	if err != nil {
 		t.Fatalf("FastFailCheckFiles error = %v, want nil", err)
@@ -1173,7 +1201,7 @@ func TestFastFailReleaseProbeIgnoresPlaceholders(t *testing.T) {
 		},
 	}}
 
-	missing, err := FastFailReleaseProbe(context.Background(), files, fastFailPoolManager{client: client}, 100, 1, 100*time.Millisecond, nil)
+	missing, err := FastFailReleaseProbe(context.Background(), files, fastFailPoolManager{client: client}, 100, 1, 100*time.Millisecond, nil, time.Time{})
 	if err != nil {
 		t.Fatalf("FastFailReleaseProbe error = %v", err)
 	}

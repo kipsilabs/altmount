@@ -14,7 +14,7 @@ import (
 	"github.com/kipsilabs/altmount/internal/streambench"
 	"github.com/kipsilabs/altmount/internal/testsupport/nntpserver"
 	"github.com/kipsilabs/altmount/internal/usenet"
-	"github.com/javi11/nntppool/v4"
+	"github.com/javi11/nntppool/v5"
 )
 
 // Provider models for the streaming benchmarks. The premium profile matches
@@ -161,7 +161,7 @@ func newBenchHarness(tb testing.TB, p benchProfile, cfgs ...nntpserver.Config) *
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, _ = client.BodyPriority(ctx, "warm@bench")
+			_, _ = client.Fetch(ctx, nntppool.Req{MessageID: "warm@bench", Lane: nntppool.LanePriority})
 		}()
 	}
 	wg.Wait()

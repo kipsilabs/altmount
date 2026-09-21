@@ -8,7 +8,7 @@ import (
 
 	"github.com/kipsilabs/altmount/internal/pool"
 	"github.com/kipsilabs/altmount/internal/testsupport/fakepool"
-	"github.com/javi11/nntppool/v4"
+	"github.com/javi11/nntppool/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -29,9 +29,9 @@ type statOrderClient struct {
 	gotIDs []string
 }
 
-func (c *statOrderClient) StatMany(ctx context.Context, messageIDs []string, opts nntppool.StatManyOptions) <-chan nntppool.StatManyResult {
+func (c *statOrderClient) ExistsMany(ctx context.Context, messageIDs []string, opts nntppool.ManyOptions) <-chan nntppool.ExistsResult {
 	c.gotIDs = append(c.gotIDs, messageIDs...)
-	return c.Client.StatMany(ctx, messageIDs, opts)
+	return c.Client.ExistsMany(ctx, messageIDs, opts)
 }
 
 func idList(prefix string, n int) []string {

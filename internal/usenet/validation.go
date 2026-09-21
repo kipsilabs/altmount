@@ -11,7 +11,7 @@ import (
 	"github.com/kipsilabs/altmount/internal/holes"
 	metapb "github.com/kipsilabs/altmount/internal/metadata/proto"
 	"github.com/kipsilabs/altmount/internal/pool"
-	"github.com/javi11/nntppool/v4"
+	"github.com/javi11/nntppool/v5"
 )
 
 var randPerm = rand.Perm
@@ -107,6 +107,11 @@ type BatchOptions struct {
 	// for a verdict that further checking cannot reverse, since the file's
 	// unchecked segments are then never looked at.
 	ShouldStop func(fileIdx int, result ValidationResult) bool
+
+	// ArticleDate is when the swept release was posted, forwarded to the pool
+	// so a provider whose retention does not reach back that far is not swept
+	// with ids it cannot hold. Zero = unknown, which applies no policy.
+	ArticleDate time.Time
 }
 
 // ValidateSegmentAvailabilityBatch checks pre-sampled segment IDs for many files
@@ -209,7 +214,10 @@ func ValidateSegmentAvailabilityBatch(
 
 		statCtx, cancel := context.WithTimeout(ctx, pool.StatManyTimeout(len(chunk), opts.MaxConnections, opts.Timeout))
 		errByID := make(map[string]error, len(chunk))
-		for r := range usenetPool.StatMany(statCtx, chunk, nntppool.StatManyOptions{Concurrency: opts.MaxConnections}) {
+		for r := range usenetPool.ExistsMany(statCtx, chunk, nntppool.ManyOptions{
+			Concurrency: opts.MaxConnections,
+			ArticleDate: opts.ArticleDate,
+		}) {
 			errByID[r.MessageID] = r.Err
 		}
 		sweepErr := statCtx.Err()

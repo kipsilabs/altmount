@@ -12,7 +12,7 @@ import (
 	"github.com/kipsilabs/altmount/internal/database"
 	"github.com/kipsilabs/altmount/internal/pool"
 	"github.com/kipsilabs/altmount/internal/testsupport/fakepool"
-	"github.com/javi11/nntppool/v4"
+	"github.com/javi11/nntppool/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -23,9 +23,9 @@ type beforeStatManyClient struct {
 	before func()
 }
 
-func (c *beforeStatManyClient) StatMany(ctx context.Context, ids []string, opts nntppool.StatManyOptions) <-chan nntppool.StatManyResult {
+func (c *beforeStatManyClient) ExistsMany(ctx context.Context, ids []string, opts nntppool.ManyOptions) <-chan nntppool.ExistsResult {
 	c.once.Do(c.before)
-	return c.NntpClient.StatMany(ctx, ids, opts)
+	return c.NntpClient.ExistsMany(ctx, ids, opts)
 }
 
 // TestPrepareUpdateForResultInconclusive covers the worker's half of #861: a

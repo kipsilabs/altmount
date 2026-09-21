@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/kipsilabs/altmount/internal/importer/parser/par2"
-	"github.com/javi11/nntppool/v4"
+	"github.com/javi11/nntppool/v5"
 )
 
 // What a parse learns from the wire is immutable per message-id: an article's

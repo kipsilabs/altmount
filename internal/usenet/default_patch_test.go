@@ -8,7 +8,7 @@ import (
 
 	"github.com/kipsilabs/altmount/internal/testsupport/fakepool"
 	"github.com/kipsilabs/altmount/internal/testsupport/segments"
-	"github.com/javi11/nntppool/v4"
+	"github.com/javi11/nntppool/v5"
 )
 
 // Readers built without explicit hole hooks (the import path) still serve

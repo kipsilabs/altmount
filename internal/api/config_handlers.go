@@ -14,7 +14,7 @@ import (
 	"github.com/kipsilabs/altmount/internal/auth"
 	"github.com/kipsilabs/altmount/internal/config"
 	"github.com/kipsilabs/altmount/internal/slogutil"
-	"github.com/javi11/nntppool/v4"
+	"github.com/javi11/nntppool/v5"
 )
 
 // ConfigManager interface defines methods for configuration management

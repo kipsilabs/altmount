@@ -8,13 +8,14 @@ import (
 	"sync"
 	"time"
 
-	"github.com/javi11/nntppool/v4"
+	"github.com/javi11/nntppool/v5"
 )
 
-// BodyClient is the one pool method the fetcher needs: a background-lane
-// article body fetch. Satisfied by pool.NntpClient.
+// BodyClient is the one pool method the fetcher needs: an article body fetch.
+// Satisfied by pool.NntpClient. Repair traffic sets Req.Lane to
+// LaneBackground; see PoolFetcher.Fetch.
 type BodyClient interface {
-	BodyBackground(ctx context.Context, messageID string, onMeta ...func(nntppool.YEncMeta)) (*nntppool.ArticleBody, error)
+	Fetch(ctx context.Context, r nntppool.Req) (*nntppool.ArticleBody, error)
 }
 
 // ConnBudget bounds how many article fetches the repair keeps on the wire at
@@ -125,6 +126,25 @@ type PoolFetcher struct {
 	// retryDelay is the base backoff between transient-failure retries,
 	// doubled per attempt. Shrunk in tests.
 	retryDelay time.Duration
+
+	// articleDate is when the release under repair was posted, forwarded to
+	// the pool so a provider whose retention does not reach back that far is
+	// tried last or not at all. Zero applies no policy. Set per release via
+	// ForArticleDate, never mutated: one PoolFetcher is shared by every job.
+	articleDate time.Time
+}
+
+// ForArticleDate returns a copy of the fetcher bound to one release's article
+// date. The service calls it per job, so the shared fetcher itself is never
+// mutated and concurrent repairs of different releases cannot see each
+// other's date.
+func (p *PoolFetcher) ForArticleDate(at time.Time) ArticleFetcher {
+	if at.IsZero() {
+		return p
+	}
+	bound := *p
+	bound.articleDate = at
+	return &bound
 }
 
 // NewPoolFetcher builds a fetcher over a lazily-resolved pool client
@@ -160,7 +180,7 @@ type ArticleStater interface {
 // statManyClient is the stat surface PoolFetcher probes its pool client for
 // (satisfied by *nntppool.Client and pool.NntpClient implementations).
 type statManyClient interface {
-	StatMany(ctx context.Context, messageIDs []string, opts nntppool.StatManyOptions) <-chan nntppool.StatManyResult
+	ExistsMany(ctx context.Context, messageIDs []string, opts nntppool.ManyOptions) <-chan nntppool.ExistsResult
 }
 
 // statPerItemBudget bounds a liveness sweep: STATs are single-line round
@@ -276,7 +296,11 @@ func (p *PoolFetcher) statOnce(
 	}
 	resolved := make(map[string]bool, len(ids))
 	var firstErr error
-	for r := range sc.StatMany(statCtx, ids, nntppool.StatManyOptions{Concurrency: conc, Background: true}) {
+	for r := range sc.ExistsMany(statCtx, ids, nntppool.ManyOptions{
+		Concurrency: conc,
+		Lane:        nntppool.LaneBackground,
+		ArticleDate: p.articleDate,
+	}) {
 		switch {
 		case errors.Is(r.Err, nntppool.ErrArticleNotFound):
 			missing[r.MessageID] = true
@@ -359,7 +383,11 @@ func (p *PoolFetcher) fetchOnce(ctx context.Context, messageID string) ([]byte, 
 		return nil, fmt.Errorf("par2repair: nntp pool unavailable: %w", err)
 	}
 	// nntppool adds the angle brackets itself; message IDs here are bare.
-	body, err := client.BodyBackground(ctx, messageID)
+	body, err := client.Fetch(ctx, nntppool.Req{
+		MessageID:   messageID,
+		Lane:        nntppool.LaneBackground,
+		ArticleDate: p.articleDate,
+	})
 	if err != nil {
 		return nil, err
 	}

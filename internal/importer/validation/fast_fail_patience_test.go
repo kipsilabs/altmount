@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/javi11/nntppool/v4"
+	"github.com/javi11/nntppool/v5"
 )
 
 // transientFor builds a STAT script that fails n times with a retryable error
@@ -36,7 +36,7 @@ func TestFastFailReleaseProbeKeepsRetryingWhileSweepConverges(t *testing.T) {
 	// up at the old hard cap of three.
 	client := newScriptedStatClient(convergingScript(40, 4))
 
-	missing, err := FastFailReleaseProbe(context.Background(), probeFile(40), fastFailPoolManager{client: client}, 100, 64, 30*time.Second, nil)
+	missing, err := FastFailReleaseProbe(context.Background(), probeFile(40), fastFailPoolManager{client: client}, 100, 64, 30*time.Second, nil, time.Time{})
 	if err != nil {
 		t.Fatalf("FastFailReleaseProbe error = %v, want nil: the sweep was converging", err)
 	}
@@ -56,7 +56,7 @@ func TestFastFailReleaseProbeStopsOnceSweepStallsAfterMinimumAttempts(t *testing
 	}
 	client := newScriptedStatClient(outcomes)
 
-	_, err := FastFailReleaseProbe(context.Background(), probeFile(30), fastFailPoolManager{client: client}, 100, 64, 30*time.Second, nil)
+	_, err := FastFailReleaseProbe(context.Background(), probeFile(30), fastFailPoolManager{client: client}, 100, 64, 30*time.Second, nil, time.Time{})
 	if !errors.Is(err, ErrFastFailInconclusive) {
 		t.Fatalf("FastFailReleaseProbe error = %v, want ErrFastFailInconclusive once progress stops", err)
 	}
@@ -73,7 +73,7 @@ func TestFastFailReleaseProbeConvergenceIsBoundedByTotalBudget(t *testing.T) {
 	client := newScriptedStatClient(convergingScript(60, 5))
 
 	start := time.Now()
-	_, err := FastFailReleaseProbe(context.Background(), probeFile(60), fastFailPoolManager{client: client}, 100, 64, 30*time.Second, nil)
+	_, err := FastFailReleaseProbe(context.Background(), probeFile(60), fastFailPoolManager{client: client}, 100, 64, 30*time.Second, nil, time.Time{})
 	elapsed := time.Since(start)
 	if !errors.Is(err, ErrFastFailInconclusive) {
 		t.Fatalf("FastFailReleaseProbe error = %v, want ErrFastFailInconclusive when the budget runs out", err)

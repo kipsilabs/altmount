@@ -555,13 +555,36 @@ func (s *Service) executeJob(ctx context.Context, job *database.Par2RepairJob) e
 	caps := cfg.caps()
 	defer s.clearProgress(job.ID)
 	progress := s.jobProgress(job.ID)
-	res, err := Resolve(ctx, fm, store, deadIDs, s.fetcher, caps, s.log, progress)
+	fetch := s.fetcherFor(metaArticleDate(fm))
+	res, err := Resolve(ctx, fm, store, deadIDs, fetch, caps, s.log, progress)
 	if err != nil {
 		return err
 	}
-	return RunJob(ctx, res.Plan, res.Index, res.Par2Files, s.fetcher, s.store, s.log,
+	return RunJob(ctx, res.Plan, res.Index, res.Par2Files, fetch, s.store, s.log,
 		WithProgress(progress), WithLiveConcurrency(func() int { return s.cfg().MaxConnections }),
 		WithYieldToStreams(s.streamsActive))
+}
+
+// ReleaseBinder is an optional ArticleFetcher capability: returning a fetcher
+// bound to one release's article date, so the pool can apply per-provider
+// retention limits (see nntppool Provider.MaxArticleAge). A fetcher that does
+// not implement it is used unchanged, which applies no retention policy.
+type ReleaseBinder interface {
+	ForArticleDate(at time.Time) ArticleFetcher
+}
+
+// fetcherFor binds the shared fetcher to one release's article date when it
+// supports that, so a repair does not hand a short-retention provider ids it
+// cannot hold.
+func (s *Service) fetcherFor(at time.Time) ArticleFetcher {
+	if at.IsZero() {
+		return s.fetcher
+	}
+	binder, ok := s.fetcher.(ReleaseBinder)
+	if !ok {
+		return s.fetcher
+	}
+	return binder.ForArticleDate(at)
 }
 
 // jobProgress returns the JobProgress callback that publishes a job's live
@@ -772,4 +795,15 @@ func (s *Service) sweepArtifacts(ctx context.Context) {
 	if err := s.store.SweepTempFiles(); err != nil {
 		s.log.ErrorContext(ctx, "Failed to sweep par2 repair temp files", "error", err)
 	}
+}
+
+// metaArticleDate reads a file's Usenet post date from its metadata, for the
+// pool's per-provider retention limits. Metadata written before release_date
+// existed carries 0, which yields the zero time: no retention policy is
+// applied, rather than an age guessed from nothing.
+func metaArticleDate(fm *metapb.FileMetadata) time.Time {
+	if fm == nil || fm.GetReleaseDate() <= 0 {
+		return time.Time{}
+	}
+	return time.Unix(fm.GetReleaseDate(), 0)
 }

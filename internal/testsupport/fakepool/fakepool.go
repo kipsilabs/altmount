@@ -46,7 +46,7 @@ import (
 	"time"
 
 	"github.com/kipsilabs/altmount/internal/pool"
-	"github.com/javi11/nntppool/v4"
+	"github.com/javi11/nntppool/v5"
 )
 
 // compile-time assertion: Client must satisfy the narrow interface.
@@ -133,6 +133,12 @@ type Client struct {
 	// Per-message-ID body call counts, excluding existence checks, so a STAT
 	// alongside a fetch does not read as a retry.
 	perIDBodyCalls sync.Map
+
+	// Per-message-ID article dates (string → time.Time) as passed in
+	// nntppool.Req.ArticleDate. Tests asserting that a call site forwards the
+	// post date it holds — the whole point of the retention feature — read
+	// this via ArticleDateFor.
+	perIDArticleDate sync.Map
 }
 
 // New returns a fake client. Without further configuration it returns an
@@ -215,6 +221,23 @@ func (c *Client) StatCalls() int64 { return c.statCalls.Load() }
 // StatPriorityCalls reports existence checks made on the priority lane.
 // StatCalls counts those too, so "no STAT at all" assertions keep working.
 func (c *Client) StatPriorityCalls() int64 { return c.statPriCalls.Load() }
+
+// recordArticleDate remembers the most recent ArticleDate seen for a
+// message-ID. A zero date is recorded as such: "this call site forwarded no
+// date" is exactly what a test may need to catch.
+func (c *Client) recordArticleDate(messageID string, at time.Time) {
+	c.perIDArticleDate.Store(messageID, at)
+}
+
+// ArticleDateFor returns the ArticleDate last passed for the given
+// message-ID, and whether it was requested at all.
+func (c *Client) ArticleDateFor(messageID string) (time.Time, bool) {
+	v, ok := c.perIDArticleDate.Load(messageID)
+	if !ok {
+		return time.Time{}, false
+	}
+	return v.(time.Time), true
+}
 
 // PerMessageCalls returns how many times the given message-ID was requested
 // across all method types (Body / BodyPriority / BodyAsync / Stat).
@@ -339,92 +362,75 @@ func waitOrCancel(ctx context.Context, d time.Duration) error {
 	}
 }
 
-// Body satisfies pool.NntpClient. Returns either the configured error or an
-// ArticleBody filled with the configured Bytes after the configured latency.
-func (c *Client) Body(ctx context.Context, messageID string, onMeta ...func(nntppool.YEncMeta)) (*nntppool.ArticleBody, error) {
-	c.bodyCalls.Add(1)
-	c.countBodyMessage(messageID)
+// Fetch satisfies pool.NntpClient. It returns either the configured error or
+// an ArticleBody filled with the configured Bytes after the configured
+// latency, and when r.Writer is set writes the payload to it in ChunkSize
+// pieces (one write when zero), pausing on TailGate after the first chunk when
+// set and failing after the first chunk on the first call when
+// FailAfterFirstChunk is set.
+//
+// nntppool v5 folded lane and delivery mode into Req, so one method now covers
+// what used to be Body, BodyPriority, BodyBackground, and
+// BodyStreamPriority. The per-lane counters are kept and derived from the Req
+// instead, so assertions that distinguish playback from import from repair
+// traffic keep working.
+func (c *Client) Fetch(ctx context.Context, r nntppool.Req) (*nntppool.ArticleBody, error) {
+	switch {
+	case r.Lane == nntppool.LaneBackground:
+		c.bodyBgCalls.Add(1)
+	case r.Lane == nntppool.LanePriority && r.Writer != nil:
+		c.bodyStreamPriCalls.Add(1)
+	case r.Lane == nntppool.LanePriority:
+		c.bodyPriCalls.Add(1)
+	default:
+		c.bodyCalls.Add(1)
+	}
+	c.countBodyMessage(r.MessageID)
+	c.recordArticleDate(r.MessageID, r.ArticleDate)
 	defer c.enter()()
-	return c.serveBody(ctx, messageID, nil, onMeta...)
+	return c.serveBodyReq(ctx, r)
 }
 
-// BodyPriority is identical to Body but counted separately so tests can
-// distinguish streaming from importer traffic.
-func (c *Client) BodyPriority(ctx context.Context, messageID string, onMeta ...func(nntppool.YEncMeta)) (*nntppool.ArticleBody, error) {
-	c.bodyPriCalls.Add(1)
-	c.countBodyMessage(messageID)
-	defer c.enter()()
-	return c.serveBody(ctx, messageID, nil, onMeta...)
-}
-
-// BodyBackground is identical to Body but counted separately so tests can
-// distinguish repair traffic from importer traffic.
-func (c *Client) BodyBackground(ctx context.Context, messageID string, onMeta ...func(nntppool.YEncMeta)) (*nntppool.ArticleBody, error) {
-	c.bodyBgCalls.Add(1)
-	c.countBodyMessage(messageID)
-	defer c.enter()()
-	return c.serveBody(ctx, messageID, nil, onMeta...)
-}
-
-// BodyStreamPriority satisfies pool.NntpClient. The payload is written to w
-// in ChunkSize pieces (one write when zero), pausing on TailGate after the
-// first chunk when set, and failing after the first chunk on the first call
-// when FailAfterFirstChunk is set.
-func (c *Client) BodyStreamPriority(ctx context.Context, messageID string, w io.Writer, onMeta ...func(nntppool.YEncMeta)) (*nntppool.ArticleBody, error) {
-	c.bodyStreamPriCalls.Add(1)
-	c.countBodyMessage(messageID)
-	defer c.enter()()
-	return c.serveBody(ctx, messageID, w, onMeta...)
-}
-
-// BodyAsync streams the configured Bytes (or error) to w and yields a
-// BodyResult on the returned channel.
-func (c *Client) BodyAsync(ctx context.Context, messageID string, w io.Writer, onMeta ...func(nntppool.YEncMeta)) <-chan nntppool.BodyResult {
+// FetchAsync mirrors Fetch on its own goroutine, yielding one BodyResult.
+func (c *Client) FetchAsync(ctx context.Context, r nntppool.Req) <-chan nntppool.BodyResult {
 	c.bodyAsyncCalls.Add(1)
-	c.countBodyMessage(messageID)
+	c.countBodyMessage(r.MessageID)
+	c.recordArticleDate(r.MessageID, r.ArticleDate)
 	ch := make(chan nntppool.BodyResult, 1)
 	go func() {
 		defer c.enter()()
-		body, err := c.serveBody(ctx, messageID, w)
+		body, err := c.serveBodyReq(ctx, r)
 		ch <- nntppool.BodyResult{Body: body, Err: err}
 		close(ch)
 	}()
 	return ch
 }
 
-// Stat returns a StatResult with the message-ID echoed, after the
-// configured latency. If the behavior has Err set, it is returned.
-func (c *Client) Stat(ctx context.Context, messageID string) (*nntppool.StatResult, error) {
-	c.statCalls.Add(1)
-	return c.serveStat(ctx, messageID)
-}
-
-// StatPriority mirrors Stat on the priority lane, counting toward StatCalls
-// too so "no existence check happened" assertions hold for either lane.
-func (c *Client) StatPriority(ctx context.Context, messageID string) (*nntppool.StatResult, error) {
-	c.statCalls.Add(1)
-	c.statPriCalls.Add(1)
-	return c.serveStat(ctx, messageID)
-}
-
-func (c *Client) serveStat(ctx context.Context, messageID string) (*nntppool.StatResult, error) {
-	c.countMessage(messageID)
-	defer c.enter()()
-	b := c.behaviorFor(messageID)
-	if err := waitOrCancel(ctx, b.Latency); err != nil {
-		return nil, err
+func (c *Client) serveBodyReq(ctx context.Context, r nntppool.Req) (*nntppool.ArticleBody, error) {
+	if r.OnMeta != nil {
+		return c.serveBody(ctx, r.MessageID, r.Writer, r.OnMeta)
 	}
-	if b.Err != nil {
-		return nil, b.Err
-	}
-	return &nntppool.StatResult{MessageID: messageID}, nil
+	return c.serveBody(ctx, r.MessageID, r.Writer)
 }
 
-// StatMany satisfies pool.NntpClient by fanning Stat out across up to
-// opts.Concurrency goroutines, mirroring nntppool's StatMany semantics: results
-// stream out of order, the channel closes once every dispatched check reports,
-// and ctx cancellation stops dispatch and lets in-flight sends bail out.
-func (c *Client) StatMany(ctx context.Context, messageIDs []string, opts nntppool.StatManyOptions) <-chan nntppool.StatManyResult {
+// Exists returns a StatResult with the message-ID echoed, after the configured
+// latency. If the behavior has Err set, it is returned. A priority-lane check
+// counts toward both StatCalls and StatPriorityCalls, so "no existence check
+// happened" assertions hold for either lane.
+func (c *Client) Exists(ctx context.Context, r nntppool.Req) (*nntppool.StatResult, error) {
+	c.statCalls.Add(1)
+	if r.Lane == nntppool.LanePriority {
+		c.statPriCalls.Add(1)
+	}
+	c.recordArticleDate(r.MessageID, r.ArticleDate)
+	return c.serveStat(ctx, r.MessageID)
+}
+
+// ExistsMany satisfies pool.NntpClient by fanning Exists out across up to
+// opts.Concurrency goroutines, mirroring nntppool's semantics: results stream
+// out of order, the channel closes once every dispatched check reports, and
+// ctx cancellation stops dispatch and lets in-flight sends bail out.
+func (c *Client) ExistsMany(ctx context.Context, messageIDs []string, opts nntppool.ManyOptions) <-chan nntppool.ExistsResult {
 	conc := opts.Concurrency
 	if conc <= 0 {
 		conc = 64
@@ -433,7 +439,7 @@ func (c *Client) StatMany(ctx context.Context, messageIDs []string, opts nntppoo
 		conc = len(messageIDs)
 	}
 
-	out := make(chan nntppool.StatManyResult, max(conc, 1))
+	out := make(chan nntppool.ExistsResult, max(conc, 1))
 	go func() {
 		defer close(out)
 		sem := make(chan struct{}, conc)
@@ -450,9 +456,13 @@ func (c *Client) StatMany(ctx context.Context, messageIDs []string, opts nntppoo
 			go func(id string) {
 				defer wg.Done()
 				defer func() { <-sem }()
-				res, err := c.Stat(ctx, id)
+				res, err := c.Exists(ctx, nntppool.Req{
+					MessageID:   id,
+					Lane:        opts.Lane,
+					ArticleDate: opts.ArticleDate,
+				})
 				select {
-				case out <- nntppool.StatManyResult{MessageID: id, Result: res, Err: err}:
+				case out <- nntppool.ExistsResult{MessageID: id, Result: res, Err: err}:
 				case <-ctx.Done():
 				}
 			}(id)
@@ -460,6 +470,19 @@ func (c *Client) StatMany(ctx context.Context, messageIDs []string, opts nntppoo
 		wg.Wait()
 	}()
 	return out
+}
+
+func (c *Client) serveStat(ctx context.Context, messageID string) (*nntppool.StatResult, error) {
+	c.countMessage(messageID)
+	defer c.enter()()
+	b := c.behaviorFor(messageID)
+	if err := waitOrCancel(ctx, b.Latency); err != nil {
+		return nil, err
+	}
+	if b.Err != nil {
+		return nil, b.Err
+	}
+	return &nntppool.StatResult{MessageID: messageID}, nil
 }
 
 // Stats returns the configured stats or a zero value.

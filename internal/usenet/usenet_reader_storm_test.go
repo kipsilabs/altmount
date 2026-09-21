@@ -11,7 +11,7 @@ import (
 
 	"github.com/kipsilabs/altmount/internal/testsupport/fakepool"
 	"github.com/kipsilabs/altmount/internal/testsupport/segments"
-	"github.com/javi11/nntppool/v4"
+	"github.com/javi11/nntppool/v5"
 )
 
 // usenet_reader_storm_test.go documents connection-storm conditions the
@@ -152,18 +152,11 @@ type multiRecordingClient struct {
 	mu       *sync.Mutex
 }
 
-func (r *multiRecordingClient) BodyPriority(ctx context.Context, messageID string, onMeta ...func(nntppool.YEncMeta)) (*nntppool.ArticleBody, error) {
+func (r *multiRecordingClient) Fetch(ctx context.Context, req nntppool.Req) (*nntppool.ArticleBody, error) {
 	r.mu.Lock()
-	r.arrivals[messageID] = append(r.arrivals[messageID], time.Now())
+	r.arrivals[req.MessageID] = append(r.arrivals[req.MessageID], time.Now())
 	r.mu.Unlock()
-	return r.Client.BodyPriority(ctx, messageID, onMeta...)
-}
-
-func (r *multiRecordingClient) BodyStreamPriority(ctx context.Context, messageID string, w io.Writer, onMeta ...func(nntppool.YEncMeta)) (*nntppool.ArticleBody, error) {
-	r.mu.Lock()
-	r.arrivals[messageID] = append(r.arrivals[messageID], time.Now())
-	r.mu.Unlock()
-	return r.Client.BodyStreamPriority(ctx, messageID, w, onMeta...)
+	return r.Client.Fetch(ctx, req)
 }
 
 func meanStdev(xs []float64) (float64, float64) {

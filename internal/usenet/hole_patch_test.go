@@ -10,7 +10,7 @@ import (
 	"github.com/kipsilabs/altmount/internal/holes"
 	"github.com/kipsilabs/altmount/internal/testsupport/fakepool"
 	"github.com/kipsilabs/altmount/internal/testsupport/segments"
-	"github.com/javi11/nntppool/v4"
+	"github.com/javi11/nntppool/v5"
 )
 
 // A confirmed-missing segment with a patch serves the patched bytes and never

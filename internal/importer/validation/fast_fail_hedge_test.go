@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/javi11/nntppool/v4"
+	"github.com/javi11/nntppool/v5"
 )
 
 // delayedStatClient answers every STAT with the configured outcome after a
@@ -30,8 +30,8 @@ func newDelayedStatClient(outcomes map[string][]error, firstDelay map[string]tim
 	}
 }
 
-func (c *delayedStatClient) StatMany(ctx context.Context, ids []string, _ nntppool.StatManyOptions) <-chan nntppool.StatManyResult {
-	out := make(chan nntppool.StatManyResult, len(ids))
+func (c *delayedStatClient) ExistsMany(ctx context.Context, ids []string, _ nntppool.ManyOptions) <-chan nntppool.ExistsResult {
+	out := make(chan nntppool.ExistsResult, len(ids))
 	c.mu.Lock()
 	c.sweeps++
 	c.mu.Unlock()
@@ -63,7 +63,7 @@ func (c *delayedStatClient) StatMany(ctx context.Context, ids []string, _ nntppo
 				case <-timer.C:
 				}
 			}
-			result := nntppool.StatManyResult{MessageID: id, Err: err}
+			result := nntppool.ExistsResult{MessageID: id, Err: err}
 			if err == nil {
 				result.Result = &nntppool.StatResult{MessageID: id}
 			}
@@ -95,7 +95,7 @@ func TestFastFailReleaseProbeHedgesStragglerStat(t *testing.T) {
 	client := newDelayedStatClient(nil, map[string]time.Duration{straggler: 5 * time.Second})
 
 	start := time.Now()
-	missing, err := FastFailReleaseProbe(context.Background(), probeFile(64), fastFailPoolManager{client: client}, 100, 64, 30*time.Second, nil)
+	missing, err := FastFailReleaseProbe(context.Background(), probeFile(64), fastFailPoolManager{client: client}, 100, 64, 30*time.Second, nil, time.Time{})
 	elapsed := time.Since(start)
 
 	if err != nil {
@@ -122,7 +122,7 @@ func TestFastFailReleaseProbeDoesNotHedgeUniformlySlowSweep(t *testing.T) {
 	}
 	client := newDelayedStatClient(nil, delays)
 
-	missing, err := FastFailReleaseProbe(context.Background(), probeFile(64), fastFailPoolManager{client: client}, 100, 64, 30*time.Second, nil)
+	missing, err := FastFailReleaseProbe(context.Background(), probeFile(64), fastFailPoolManager{client: client}, 100, 64, 30*time.Second, nil, time.Time{})
 	if err != nil {
 		t.Fatalf("FastFailReleaseProbe error = %v, want nil", err)
 	}
@@ -142,7 +142,7 @@ func TestFastFailReleaseProbeHedgedMissIsDefinitive(t *testing.T) {
 	)
 
 	start := time.Now()
-	missing, err := FastFailReleaseProbe(context.Background(), probeFile(64), fastFailPoolManager{client: client}, 100, 64, 30*time.Second, nil)
+	missing, err := FastFailReleaseProbe(context.Background(), probeFile(64), fastFailPoolManager{client: client}, 100, 64, 30*time.Second, nil, time.Time{})
 	if err != nil {
 		t.Fatalf("FastFailReleaseProbe error = %v, want nil for definitive miss", err)
 	}
@@ -161,7 +161,7 @@ func TestFastFailReleaseProbeHedgeRespectsCancellation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 
-	_, err := FastFailReleaseProbe(ctx, probeFile(64), fastFailPoolManager{client: client}, 100, 64, 30*time.Second, nil)
+	_, err := FastFailReleaseProbe(ctx, probeFile(64), fastFailPoolManager{client: client}, 100, 64, 30*time.Second, nil, time.Time{})
 	if err == nil {
 		t.Fatal("FastFailReleaseProbe error = nil, want caller cancellation to surface")
 	}
@@ -171,14 +171,14 @@ func TestFastFailReleaseProbeHedgeRespectsCancellation(t *testing.T) {
 type optionsRecordingClient struct {
 	*delayedStatClient
 	mu   sync.Mutex
-	opts []nntppool.StatManyOptions
+	opts []nntppool.ManyOptions
 }
 
-func (c *optionsRecordingClient) StatMany(ctx context.Context, ids []string, opts nntppool.StatManyOptions) <-chan nntppool.StatManyResult {
+func (c *optionsRecordingClient) ExistsMany(ctx context.Context, ids []string, opts nntppool.ManyOptions) <-chan nntppool.ExistsResult {
 	c.mu.Lock()
 	c.opts = append(c.opts, opts)
 	c.mu.Unlock()
-	return c.delayedStatClient.StatMany(ctx, ids, opts)
+	return c.delayedStatClient.ExistsMany(ctx, ids, opts)
 }
 
 // Nine of sixty-four STATs queued behind other traffic is the shape seen on a
@@ -192,7 +192,7 @@ func TestFastFailReleaseProbeHedgesLargerStragglerTailOnPriorityLane(t *testing.
 	client := &optionsRecordingClient{delayedStatClient: newDelayedStatClient(nil, delays)}
 
 	start := time.Now()
-	missing, err := FastFailReleaseProbe(context.Background(), probeFile(64), fastFailPoolManager{client: client}, 100, 64, 30*time.Second, nil)
+	missing, err := FastFailReleaseProbe(context.Background(), probeFile(64), fastFailPoolManager{client: client}, 100, 64, 30*time.Second, nil, time.Time{})
 	if err != nil || missing {
 		t.Fatalf("FastFailReleaseProbe = (%v, %v), want (false, nil)", missing, err)
 	}
@@ -202,13 +202,13 @@ func TestFastFailReleaseProbeHedgesLargerStragglerTailOnPriorityLane(t *testing.
 	client.mu.Lock()
 	defer client.mu.Unlock()
 	if len(client.opts) != 3 {
-		t.Fatalf("StatMany sweeps = %d, want 3 (first wave, rest, hedge)", len(client.opts))
+		t.Fatalf("ExistsMany sweeps = %d, want 3 (first wave, rest, hedge)", len(client.opts))
 	}
-	if client.opts[0].Priority || client.opts[1].Priority {
+	if client.opts[0].Lane != nntppool.LaneNormal || client.opts[1].Lane != nntppool.LaneNormal {
 		t.Fatal("probe sweeps must stay on the normal lane")
 	}
-	if !client.opts[2].Priority {
-		t.Fatal("hedge sweep must use the priority lane")
+	if client.opts[2].Lane != nntppool.LanePriority {
+		t.Fatalf("hedge sweep lane = %v, want priority", client.opts[2].Lane)
 	}
 }
 
@@ -224,7 +224,7 @@ func TestFastFailReleaseProbeHedgesWhenArrivalsStall(t *testing.T) {
 	client := newDelayedStatClient(nil, delays)
 
 	start := time.Now()
-	missing, err := FastFailReleaseProbe(context.Background(), probeFile(64), fastFailPoolManager{client: client}, 100, 64, 30*time.Second, nil)
+	missing, err := FastFailReleaseProbe(context.Background(), probeFile(64), fastFailPoolManager{client: client}, 100, 64, 30*time.Second, nil, time.Time{})
 	if err != nil || missing {
 		t.Fatalf("FastFailReleaseProbe = (%v, %v), want (false, nil)", missing, err)
 	}
@@ -247,7 +247,7 @@ func TestFastFailReleaseProbeToleratesAFewUnverifiedStragglers(t *testing.T) {
 	client.alwaysDelay = map[string]time.Duration{"seg-40": 10 * time.Second}
 
 	start := time.Now()
-	missing, err := FastFailReleaseProbe(context.Background(), probeFile(64), fastFailPoolManager{client: client}, 100, 64, 30*time.Second, nil)
+	missing, err := FastFailReleaseProbe(context.Background(), probeFile(64), fastFailPoolManager{client: client}, 100, 64, 30*time.Second, nil, time.Time{})
 	elapsed := time.Since(start)
 	if err != nil || missing {
 		t.Fatalf("FastFailReleaseProbe = (%v, %v), want (false, nil): 63 of 64 answered healthy", missing, err)
@@ -270,7 +270,7 @@ func TestFastFailReleaseProbeDoesNotTolerateManyUnverified(t *testing.T) {
 	fastFailStatBudget = 3 * time.Second
 	t.Cleanup(func() { fastFailStatBudget = prev })
 
-	_, err := FastFailReleaseProbe(context.Background(), probeFile(64), fastFailPoolManager{client: client}, 100, 64, 30*time.Second, nil)
+	_, err := FastFailReleaseProbe(context.Background(), probeFile(64), fastFailPoolManager{client: client}, 100, 64, 30*time.Second, nil, time.Time{})
 	if !errors.Is(err, ErrFastFailInconclusive) {
 		t.Fatalf("FastFailReleaseProbe error = %v, want ErrFastFailInconclusive: four unanswered is not a tolerable tail", err)
 	}
