@@ -635,3 +635,125 @@ func TestAsyncReadBuffer_WaitWithoutSourceCloseHitsSafetyNet(t *testing.T) {
 		t.Fatal("expected timeout warning when the source read is wedged")
 	}
 }
+
+// TestAsyncReadBuffer_FrontierReadHonorsCallerDeadlineWhileFillBlocked covers
+// the reported stall (issue #948): a read waiting at the fill frontier slept in
+// sync.Cond.Wait, which cancellation does not wake, so the read never observed
+// its own deadline while the background fill was wedged.
+func TestAsyncReadBuffer_FrontierReadHonorsCallerDeadlineWhileFillBlocked(t *testing.T) {
+	SetAsyncBufferBudget(0)
+
+	data := testData(4 * 1024 * 1024)
+	src := newBlockingSource(data, 4096)
+	a := NewAsyncReadBuffer(context.Background(), src, 256*1024, int64(len(data)), nil)
+	defer a.Close()
+	defer src.interrupt()
+
+	promoteBlockingSource(t, a, src)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		// Exactly at the current fill frontier.
+		_, err := a.ReadAtContext(ctx, make([]byte, 1024), int64(armThreshold*1024))
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("ReadAtContext returned %v, want context deadline exceeded", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("frontier read ignored its context deadline while waiting on sync.Cond")
+	}
+}
+
+// TestAsyncReadBuffer_FrontierReadSurvivesConcurrentDemote verifies that a read
+// parked at the frontier wakes and completes when another concurrent read
+// demotes the buffer. Nothing broadcasts the cond again after a demote, so a
+// wait loop that only watched filled/srcDone slept forever.
+func TestAsyncReadBuffer_FrontierReadSurvivesConcurrentDemote(t *testing.T) {
+	SetAsyncBufferBudget(0)
+
+	// Large enough that the seek below lands outside nearFrontierWindow, so it
+	// demotes immediately instead of waiting at the frontier itself.
+	data := testData(16 * 1024 * 1024)
+	src := newBlockingSource(data, 4096)
+	a := NewAsyncReadBuffer(context.Background(), src, 256*1024, int64(len(data)), nil)
+	defer a.Close()
+	defer src.interrupt()
+
+	promoteBlockingSource(t, a, src)
+
+	frontier := int64(armThreshold * 1024)
+	type result struct {
+		n   int
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		p := make([]byte, 1024)
+		n, err := a.ReadAtContext(context.Background(), p, frontier)
+		done <- result{n: n, err: err}
+	}()
+
+	// Let the frontier read park on the cond, then seek far away so the other
+	// read demotes read-ahead out from under it.
+	time.Sleep(100 * time.Millisecond)
+	if _, err := a.ReadAtContext(context.Background(), make([]byte, 1024), 12*1024*1024); err != nil {
+		t.Fatalf("seek read: %v", err)
+	}
+
+	select {
+	case res := <-done:
+		if res.err != nil {
+			t.Fatalf("frontier read after demote: %v", res.err)
+		}
+		if res.n != 1024 {
+			t.Fatalf("frontier read returned %d bytes, want 1024", res.n)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("frontier read hung after a concurrent demote")
+	}
+}
+
+// TestAsyncReadBuffer_FrontierWaitFallsBackWhenFillStalls verifies that a
+// foreground read is never left unanswered by a wedged background fill: once
+// the frontier wait budget expires the read falls back to a direct source read.
+func TestAsyncReadBuffer_FrontierWaitFallsBackWhenFillStalls(t *testing.T) {
+	SetAsyncBufferBudget(0)
+	prev := frontierWaitTimeout
+	frontierWaitTimeout = 100 * time.Millisecond
+	defer func() { frontierWaitTimeout = prev }()
+
+	data := testData(4 * 1024 * 1024)
+	src := newBlockingSource(data, 4096)
+	a := NewAsyncReadBuffer(context.Background(), src, 256*1024, int64(len(data)), nil)
+	defer a.Close()
+	defer src.interrupt()
+
+	promoteBlockingSource(t, a, src)
+
+	frontier := int64(armThreshold * 1024)
+	done := make(chan error, 1)
+	go func() {
+		p := make([]byte, 1024)
+		n, err := a.ReadAtContext(context.Background(), p, frontier)
+		if err == nil && !bytes.Equal(p[:n], data[frontier:frontier+int64(n)]) {
+			err = errors.New("fallback read returned wrong data")
+		}
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("frontier read fallback: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("frontier read never gave up on the wedged fill")
+	}
+}
