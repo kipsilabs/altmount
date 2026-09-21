@@ -636,10 +636,8 @@ func TestAsyncReadBuffer_WaitWithoutSourceCloseHitsSafetyNet(t *testing.T) {
 	}
 }
 
-// TestAsyncReadBuffer_FrontierReadHonorsCallerDeadlineWhileFillBlocked covers
-// the reported stall (issue #948): a read waiting at the fill frontier slept in
-// sync.Cond.Wait, which cancellation does not wake, so the read never observed
-// its own deadline while the background fill was wedged.
+// A read waiting at the fill frontier must return when its context deadline
+// passes, even though nothing else broadcasts the cond (issue #948).
 func TestAsyncReadBuffer_FrontierReadHonorsCallerDeadlineWhileFillBlocked(t *testing.T) {
 	SetAsyncBufferBudget(0)
 
@@ -671,10 +669,8 @@ func TestAsyncReadBuffer_FrontierReadHonorsCallerDeadlineWhileFillBlocked(t *tes
 	}
 }
 
-// TestAsyncReadBuffer_FrontierReadSurvivesConcurrentDemote verifies that a read
-// parked at the frontier wakes and completes when another concurrent read
-// demotes the buffer. Nothing broadcasts the cond again after a demote, so a
-// wait loop that only watched filled/srcDone slept forever.
+// A read parked at the frontier must wake and complete when a concurrent read
+// demotes the buffer out from under it.
 func TestAsyncReadBuffer_FrontierReadSurvivesConcurrentDemote(t *testing.T) {
 	SetAsyncBufferBudget(0)
 
@@ -720,9 +716,9 @@ func TestAsyncReadBuffer_FrontierReadSurvivesConcurrentDemote(t *testing.T) {
 	}
 }
 
-// TestAsyncReadBuffer_FrontierWaitFallsBackWhenFillStalls verifies that a
-// foreground read is never left unanswered by a wedged background fill: once
-// the frontier wait budget expires the read falls back to a direct source read.
+// A wedged background fill must not leave a foreground read unanswered: once
+// frontierWaitTimeout expires the read falls back to a direct source read. The
+// elapsed-time bound also guards against waiting the budget twice.
 func TestAsyncReadBuffer_FrontierWaitFallsBackWhenFillStalls(t *testing.T) {
 	SetAsyncBufferBudget(0)
 	prev := frontierWaitTimeout
@@ -739,6 +735,7 @@ func TestAsyncReadBuffer_FrontierWaitFallsBackWhenFillStalls(t *testing.T) {
 
 	frontier := int64(armThreshold * 1024)
 	done := make(chan error, 1)
+	start := time.Now()
 	go func() {
 		p := make([]byte, 1024)
 		n, err := a.ReadAtContext(context.Background(), p, frontier)
@@ -752,6 +749,9 @@ func TestAsyncReadBuffer_FrontierWaitFallsBackWhenFillStalls(t *testing.T) {
 	case err := <-done:
 		if err != nil {
 			t.Fatalf("frontier read fallback: %v", err)
+		}
+		if elapsed := time.Since(start); elapsed >= 2*frontierWaitTimeout {
+			t.Fatalf("fallback took %v, want under 2x frontierWaitTimeout (%v)", elapsed, frontierWaitTimeout)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("frontier read never gave up on the wedged fill")
