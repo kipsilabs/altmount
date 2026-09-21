@@ -42,6 +42,12 @@ const (
 // shorten it.
 var closeDrainTimeout = 5 * time.Second
 
+// frontierWaitTimeout bounds how long a foreground read waits for the fill
+// goroutine to reach its offset before falling back to a direct source read,
+// so a wedged fill never leaves a FUSE request unanswered. It is a var (not a
+// const) so tests can shorten it.
+var frontierWaitTimeout = 30 * time.Second
+
 // readAtContexter matches nzbfilesystem.MetadataVirtualFile.ReadAtContext.
 type readAtContexter interface {
 	ReadAtContext(ctx context.Context, p []byte, off int64) (n int, err error)
@@ -201,63 +207,51 @@ func (a *AsyncReadBuffer) ReadAtContext(ctx context.Context, p []byte, off int64
 
 		// Sequential read at the buffer frontier — wait for the fill goroutine.
 		if off == bufEnd && off == a.expectedNext {
-			for a.baseOff+int64(a.filled) <= off && !a.srcDone && !a.closed && ctx.Err() == nil {
-				a.cond.Wait()
-			}
+			gen := a.gen
+			a.waitForFillLocked(ctx, gen, func() bool { return a.baseOff+int64(a.filled) > off })
 			if ctx.Err() != nil {
 				a.mu.Unlock()
 				return 0, ctx.Err()
 			}
-			if !a.closed && off >= a.baseOff && off < a.baseOff+int64(a.filled) {
+			if a.servableLocked(gen, off) {
 				n := a.copyFromBuffer(p, off)
 				a.expectedNext = off + int64(n)
 				a.mu.Unlock()
 				return n, nil
 			}
-			if a.srcDone {
+			if a.currentGenLocked(gen) && a.srcDone {
 				err := a.srcErr
 				a.mu.Unlock()
 				return 0, err
 			}
-			// Closed while waiting — fall through to passthrough.
-		}
-
-		// Near-frontier: this read is just ahead of the fill frontier — likely a
-		// kernel readahead parallel read, not a genuine seek. Wait for the fill
-		// goroutine to reach this offset rather than demoting.
-		if off >= bufEnd && off < bufEnd+nearFrontierWindow {
-			for !a.srcDone && !a.closed && ctx.Err() == nil {
-				if a.baseOff+int64(a.filled) > off {
-					break
-				}
-				// If the buffer is full the fill goroutine is blocked waiting for
-				// consumers to drain it — waiting here would deadlock, so give up
-				// and fall through to demote instead.
-				if a.filled >= a.bufSize {
-					// Buffer full — fill goroutine cannot advance; demote rather than deadlock.
-					goto demote
-				}
-				a.cond.Wait()
-			}
+		} else if off >= bufEnd && off < bufEnd+nearFrontierWindow {
+			// Near-frontier: this read is just ahead of the fill frontier —
+			// likely a kernel readahead parallel read, not a genuine seek. Wait
+			// for the fill goroutine to reach this offset rather than demoting.
+			// A full buffer ends the wait: the fill goroutine is then blocked
+			// waiting for consumers to drain it, so waiting would deadlock.
+			gen := a.gen
+			a.waitForFillLocked(ctx, gen, func() bool {
+				return a.baseOff+int64(a.filled) > off || a.filled >= a.bufSize
+			})
 			if ctx.Err() != nil {
 				a.mu.Unlock()
 				return 0, ctx.Err()
 			}
-			if !a.closed && off >= a.baseOff && off < a.baseOff+int64(a.filled) {
+			if a.servableLocked(gen, off) {
 				n := a.copyFromBuffer(p, off)
 				a.expectedNext = off + int64(n)
 				a.mu.Unlock()
 				return n, nil
 			}
-			if a.srcDone {
+			if a.currentGenLocked(gen) && a.srcDone {
 				err := a.srcErr
 				a.mu.Unlock()
 				return 0, err
 			}
-			// Closed while waiting or off fell outside buffer — fall through to demote.
 		}
-		// Non-sequential read (seek) while streaming → demote to probing.
-	demote:
+		// Seek, closed, demoted, buffer full or wait budget expired → demote to
+		// probing and serve the read directly.
 		a.demoteLocked()
 	}
 
@@ -284,6 +278,64 @@ func (a *AsyncReadBuffer) ReadAtContext(ctx context.Context, p []byte, off int64
 	}
 	a.mu.Unlock()
 	return n, err
+}
+
+// currentGenLocked reports whether the buffer is still streaming the same
+// read-ahead generation a waiter started in. A concurrent read may have
+// demoted (or demoted and re-promoted) the buffer while this read slept, in
+// which case its frontier bookkeeping is stale. Caller must hold a.mu.
+func (a *AsyncReadBuffer) currentGenLocked(gen uint64) bool {
+	return !a.closed && a.streaming && a.gen == gen
+}
+
+// servableLocked reports whether off can be served from the ring buffer within
+// the waiter's own generation. Caller must hold a.mu.
+func (a *AsyncReadBuffer) servableLocked(gen uint64, off int64) bool {
+	return a.currentGenLocked(gen) && off >= a.baseOff && off < a.baseOff+int64(a.filled)
+}
+
+// waitForFillLocked blocks until ready() is satisfied, the read-ahead
+// generation ends (source done, demote, close), the caller's context is done,
+// or frontierWaitTimeout expires. Callers re-check state afterwards.
+//
+// sync.Cond.Wait is not woken by context cancellation, so a watchdog goroutine
+// broadcasts the cond when the wait context finishes. It is only started when a
+// wait is actually required. Caller must hold a.mu; it is held again on return.
+func (a *AsyncReadBuffer) waitForFillLocked(ctx context.Context, gen uint64, ready func() bool) {
+	if a.waitDoneLocked(ctx, gen, ready) {
+		return
+	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, frontierWaitTimeout)
+	defer cancel()
+	defer a.wakeOnDone(waitCtx)()
+
+	for !a.waitDoneLocked(waitCtx, gen, ready) {
+		a.cond.Wait()
+	}
+}
+
+// waitDoneLocked reports whether a frontier wait should stop. Caller must hold
+// a.mu.
+func (a *AsyncReadBuffer) waitDoneLocked(ctx context.Context, gen uint64, ready func() bool) bool {
+	return ready() || a.srcDone || !a.currentGenLocked(gen) || ctx.Err() != nil
+}
+
+// wakeOnDone broadcasts the cond once ctx is done, so waiters parked in
+// sync.Cond.Wait re-evaluate their exit conditions. The returned stop function
+// releases the watchdog goroutine; it is safe to call while holding a.mu.
+func (a *AsyncReadBuffer) wakeOnDone(ctx context.Context) (stop func()) {
+	stopped := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			a.mu.Lock()
+			a.cond.Broadcast()
+			a.mu.Unlock()
+		case <-stopped:
+		}
+	}()
+	return func() { close(stopped) }
 }
 
 // promoteLocked allocates the ring buffer and (re)starts read-ahead from
