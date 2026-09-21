@@ -2,6 +2,7 @@ package metadata
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -109,4 +110,47 @@ func TestMigrationWorker_RejectsConcurrentRuns(t *testing.T) {
 
 	_, dryErr := w.DryRun(context.Background())
 	require.Error(t, dryErr)
+}
+
+// seedLargeLegacyRelease writes a release whose metas carry enough inline
+// segments that the shared store measurably shrinks the library.
+func seedLargeLegacyRelease(t *testing.T, ms *MetadataService) {
+	t.Helper()
+	for _, name := range []string{"A.mkv", "B.mkv"} {
+		segs := make([]*metapb.SegmentData, 0, 400)
+		for i := range 400 {
+			segs = append(segs, &metapb.SegmentData{
+				Id: fmt.Sprintf("%032x@%s", i, name), SegmentSize: 700000, EndOffset: 699999,
+			})
+		}
+		require.NoError(t, ms.WriteFileMetadata(filepath.Join("movies", name), &metapb.FileMetadata{
+			FileSize: 400 * 700000, SourceNzbPath: "/nzbs/rel.nzb", SegmentData: segs,
+		}))
+	}
+}
+
+// A dry run converts into a throwaway root, so its projected size must be
+// measured there. Measuring the untouched legacy metas instead reports the
+// legacy bytes plus the new store, which can never be smaller than "before".
+func TestMigrationWorker_DryRunProjectsRealMigrationSize(t *testing.T) {
+	real := NewMetadataService(t.TempDir())
+	seedLargeLegacyRelease(t, real)
+	realWorker := NewMigrationWorker(real, testConfigGetter(t))
+	require.NoError(t, realWorker.Start(context.Background()))
+	require.Eventually(t, func() bool {
+		return !realWorker.GetStatus().IsRunning && realWorker.GetStatus().LastResult != nil
+	}, 10*time.Second, 20*time.Millisecond)
+	realRes := realWorker.GetStatus().LastResult
+
+	dry := NewMetadataService(t.TempDir())
+	seedLargeLegacyRelease(t, dry)
+	dryRes, err := NewMigrationWorker(dry, testConfigGetter(t)).DryRun(context.Background())
+	require.NoError(t, err)
+
+	assert.Equal(t, realRes.BytesBefore, dryRes.BytesBefore)
+	assert.Less(t, dryRes.BytesAfter, dryRes.BytesBefore, "moving segments into one store must project a shrink")
+	// The v3 meta embeds its store path, whose length differs between the real
+	// config dir and the dry-run temp root; allow that much slack and no more.
+	assert.InDelta(t, realRes.BytesAfter, dryRes.BytesAfter, 1024,
+		"dry run must measure the converted metas, not the legacy ones")
 }

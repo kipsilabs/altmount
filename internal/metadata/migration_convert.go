@@ -118,7 +118,10 @@ func (ms *MetadataService) MigrateGroup(ctx context.Context, g LegacyGroup, stor
 		}
 
 		res.FilesMigrated++
-		if info, statErr := os.Stat(lm.MetaPath); statErr == nil {
+		// Measure the meta this service just wrote, not lm.MetaPath: a dry run
+		// converts into a throwaway root while lm.MetaPath still names the
+		// untouched legacy file, which would project "before + store".
+		if info, statErr := os.Stat(ms.metaFilePath(lm.VirtualPath)); statErr == nil {
 			res.BytesAfter += info.Size()
 		}
 	}
