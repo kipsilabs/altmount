@@ -21,7 +21,7 @@ require (
 	github.com/hanwen/go-fuse/v2 v2.9.0
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/jackc/pgx/v5 v5.8.0
-	github.com/javi11/gopar-turbo v0.2.1
+	github.com/javi11/gopar-turbo v0.3.0
 	github.com/javi11/nntppool/v4 v4.23.0
 	github.com/javi11/nxg v0.1.0
 	github.com/javi11/nzbparser v0.5.5
