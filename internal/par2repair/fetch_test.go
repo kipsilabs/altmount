@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/javi11/nntppool/v4"
+	"github.com/javi11/nntppool/v5"
 )
 
 // fakeStatClient satisfies BodyClient plus the stat surface PoolFetcher
@@ -18,22 +18,23 @@ type fakeStatClient struct {
 	articles map[string]bool
 }
 
-func (c *fakeStatClient) BodyBackground(_ context.Context, messageID string, _ ...func(nntppool.YEncMeta)) (*nntppool.ArticleBody, error) {
+func (c *fakeStatClient) Fetch(_ context.Context, r nntppool.Req) (*nntppool.ArticleBody, error) {
+	messageID := r.MessageID
 	if !c.articles[messageID] {
 		return nil, nntppool.ErrArticleNotFound
 	}
 	return &nntppool.ArticleBody{}, nil
 }
 
-func (c *fakeStatClient) StatMany(_ context.Context, messageIDs []string, _ nntppool.StatManyOptions) <-chan nntppool.StatManyResult {
-	out := make(chan nntppool.StatManyResult, len(messageIDs))
+func (c *fakeStatClient) ExistsMany(_ context.Context, messageIDs []string, _ nntppool.ManyOptions) <-chan nntppool.ExistsResult {
+	out := make(chan nntppool.ExistsResult, len(messageIDs))
 	go func() {
 		defer close(out)
 		for _, id := range messageIDs {
 			if c.articles[id] {
-				out <- nntppool.StatManyResult{MessageID: id, Result: &nntppool.StatResult{MessageID: id}}
+				out <- nntppool.ExistsResult{MessageID: id, Result: &nntppool.StatResult{MessageID: id}}
 			} else {
-				out <- nntppool.StatManyResult{MessageID: id, Err: nntppool.ErrArticleNotFound}
+				out <- nntppool.ExistsResult{MessageID: id, Err: nntppool.ErrArticleNotFound}
 			}
 		}
 	}()
@@ -62,15 +63,16 @@ type flakyStatClient struct {
 	calls    map[string]int
 }
 
-func (c *flakyStatClient) BodyBackground(_ context.Context, messageID string, _ ...func(nntppool.YEncMeta)) (*nntppool.ArticleBody, error) {
+func (c *flakyStatClient) Fetch(_ context.Context, r nntppool.Req) (*nntppool.ArticleBody, error) {
+	messageID := r.MessageID
 	if !c.articles[messageID] {
 		return nil, nntppool.ErrArticleNotFound
 	}
 	return &nntppool.ArticleBody{}, nil
 }
 
-func (c *flakyStatClient) StatMany(_ context.Context, messageIDs []string, _ nntppool.StatManyOptions) <-chan nntppool.StatManyResult {
-	out := make(chan nntppool.StatManyResult, len(messageIDs))
+func (c *flakyStatClient) ExistsMany(_ context.Context, messageIDs []string, _ nntppool.ManyOptions) <-chan nntppool.ExistsResult {
+	out := make(chan nntppool.ExistsResult, len(messageIDs))
 	go func() {
 		defer close(out)
 		for _, id := range messageIDs {
@@ -86,11 +88,11 @@ func (c *flakyStatClient) StatMany(_ context.Context, messageIDs []string, _ nnt
 			c.mu.Unlock()
 			switch {
 			case transient:
-				out <- nntppool.StatManyResult{MessageID: id, Err: errors.New("nntp: all providers exhausted: connection died")}
+				out <- nntppool.ExistsResult{MessageID: id, Err: errors.New("nntp: all providers exhausted: connection died")}
 			case c.articles[id]:
-				out <- nntppool.StatManyResult{MessageID: id, Result: &nntppool.StatResult{MessageID: id}}
+				out <- nntppool.ExistsResult{MessageID: id, Result: &nntppool.StatResult{MessageID: id}}
 			default:
-				out <- nntppool.StatManyResult{MessageID: id, Err: nntppool.ErrArticleNotFound}
+				out <- nntppool.ExistsResult{MessageID: id, Err: nntppool.ErrArticleNotFound}
 			}
 		}
 	}()
@@ -171,14 +173,14 @@ func TestPoolFetcherStatIDsFailsWhenUnresolvedDominates(t *testing.T) {
 type concurrencyRecordingStatClient struct {
 	fakeStatClient
 	mu   sync.Mutex
-	opts []nntppool.StatManyOptions
+	opts []nntppool.ManyOptions
 }
 
-func (c *concurrencyRecordingStatClient) StatMany(ctx context.Context, messageIDs []string, opts nntppool.StatManyOptions) <-chan nntppool.StatManyResult {
+func (c *concurrencyRecordingStatClient) ExistsMany(ctx context.Context, messageIDs []string, opts nntppool.ManyOptions) <-chan nntppool.ExistsResult {
 	c.mu.Lock()
 	c.opts = append(c.opts, opts)
 	c.mu.Unlock()
-	return c.fakeStatClient.StatMany(ctx, messageIDs, opts)
+	return c.fakeStatClient.ExistsMany(ctx, messageIDs, opts)
 }
 
 // An unbounded sweep lets the pool derive concurrency from its aggregate STAT
@@ -252,13 +254,15 @@ type laneRecordingClient struct {
 	normal, background atomic.Int32
 }
 
-func (c *laneRecordingClient) Body(_ context.Context, _ string, _ ...func(nntppool.YEncMeta)) (*nntppool.ArticleBody, error) {
-	c.normal.Add(1)
-	return &nntppool.ArticleBody{Bytes: []byte("payload")}, nil
-}
-
-func (c *laneRecordingClient) BodyBackground(_ context.Context, _ string, _ ...func(nntppool.YEncMeta)) (*nntppool.ArticleBody, error) {
-	c.background.Add(1)
+// Fetch records the lane the request declared. In v5 there is one method and
+// the lane is a field, so this counts Req.Lane rather than which method the
+// fetcher reached for.
+func (c *laneRecordingClient) Fetch(_ context.Context, r nntppool.Req) (*nntppool.ArticleBody, error) {
+	if r.Lane == nntppool.LaneBackground {
+		c.background.Add(1)
+	} else {
+		c.normal.Add(1)
+	}
 	return &nntppool.ArticleBody{Bytes: []byte("payload")}, nil
 }
 
@@ -290,11 +294,11 @@ func TestPoolFetcherStatIDsUsesBackgroundLane(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(client.opts) == 0 {
-		t.Fatal("StatMany never called")
+		t.Fatal("ExistsMany never called")
 	}
 	for _, o := range client.opts {
-		if !o.Background {
-			t.Fatal("StatMany called without Background: census must ride the background lane")
+		if o.Lane != nntppool.LaneBackground {
+			t.Fatalf("ExistsMany called on lane %v: census must ride the background lane", o.Lane)
 		}
 	}
 }
@@ -302,7 +306,7 @@ func TestPoolFetcherStatIDsUsesBackgroundLane(t *testing.T) {
 // bodyOnlyClient has no stat surface; StatIDs must degrade to a no-op.
 type bodyOnlyClient struct{}
 
-func (bodyOnlyClient) BodyBackground(_ context.Context, _ string, _ ...func(nntppool.YEncMeta)) (*nntppool.ArticleBody, error) {
+func (bodyOnlyClient) Fetch(_ context.Context, _ nntppool.Req) (*nntppool.ArticleBody, error) {
 	return &nntppool.ArticleBody{}, nil
 }
 
@@ -327,7 +331,8 @@ type flakyBodyClient struct {
 	err      error
 }
 
-func (c *flakyBodyClient) BodyBackground(_ context.Context, messageID string, _ ...func(nntppool.YEncMeta)) (*nntppool.ArticleBody, error) {
+func (c *flakyBodyClient) Fetch(_ context.Context, r nntppool.Req) (*nntppool.ArticleBody, error) {
+	messageID := r.MessageID
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.calls == nil {

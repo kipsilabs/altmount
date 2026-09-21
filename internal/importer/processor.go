@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/javi11/nntppool/v4"
+	"github.com/javi11/nntppool/v5"
 	"github.com/javi11/nzbparser"
 
 	"github.com/kipsilabs/altmount/internal/config"
@@ -419,6 +419,13 @@ func (proc *Processor) preParseFastFail(ctx context.Context, n *nzbparser.Nzb, c
 		}
 	}
 
+	// One article date for the whole release, forwarded to the pool so a
+	// provider whose retention does not reach back that far is not swept with
+	// ids it cannot hold. The oldest file's date is the conservative pick; a
+	// release with no dates in its NZB yields the zero time, which applies no
+	// retention policy at all.
+	releaseDate := releaseArticleDate(n.Files)
+
 	// Stat is a cheap single round-trip on the pool's normal lane; excess
 	// requests queue and yield to streaming (priority lane). Size the sweep by
 	// the providers' STAT pipeline depth, not their connection count — STAT is
@@ -440,6 +447,7 @@ func (proc *Processor) preParseFastFail(ctx context.Context, n *nzbparser.Nzb, c
 		concurrency,
 		proc.validationTimeout,
 		proc.patchIndex,
+		releaseDate,
 	)
 	if err != nil {
 		return nil, nil, nil, err
@@ -519,6 +527,7 @@ func (proc *Processor) preParseFastFail(ctx context.Context, n *nzbparser.Nzb, c
 			fastFailTracker,
 			proc.patchIndex,
 			acceptableMissingPercent == 0,
+			releaseDate,
 		)
 		if err != nil {
 			return nil, nil, nil, err
@@ -1786,4 +1795,24 @@ func normalizeSingleFileVirtualDir(virtualDir, releaseName, filename string) str
 	}
 
 	return strings.ReplaceAll(cleanDir, string(filepath.Separator), "/")
+}
+
+// releaseArticleDate returns one article date for a release: the oldest of its
+// files' post dates. Files in a release are posted within minutes of each
+// other, so the choice rarely matters; when it does, the oldest is the
+// conservative one — a provider whose retention stops short of it is demoted
+// for the sweep rather than swept with ids it may no longer hold. A release
+// whose NZB carries no dates yields the zero time, which applies no policy.
+func releaseArticleDate(files []nzbparser.NzbFile) time.Time {
+	var oldest time.Time
+	for _, f := range files {
+		if f.Date <= 0 {
+			continue
+		}
+		at := time.Unix(int64(f.Date), 0)
+		if oldest.IsZero() || at.Before(oldest) {
+			oldest = at
+		}
+	}
+	return oldest
 }

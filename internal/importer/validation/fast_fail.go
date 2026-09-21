@@ -12,7 +12,7 @@ import (
 	metapb "github.com/kipsilabs/altmount/internal/metadata/proto"
 	"github.com/kipsilabs/altmount/internal/pool"
 	"github.com/kipsilabs/altmount/internal/progress"
-	"github.com/javi11/nntppool/v4"
+	"github.com/javi11/nntppool/v5"
 )
 
 const (
@@ -54,6 +54,7 @@ func statIDsWithBoundedRetries(
 	timeout time.Duration,
 	stopOnMissing bool,
 	patchIdx PatchIndex,
+	articleDate time.Time,
 ) (missing map[string]error, unverified []string, err error) {
 	remaining := make([]string, 0, len(ids))
 	seen := make(map[string]struct{}, len(ids))
@@ -76,7 +77,7 @@ func statIDsWithBoundedRetries(
 		definitive := 0
 		deadEarly := false
 
-		for result := range hedgedStatMany(statCtx, client, remaining, maxConnections) {
+		for result := range hedgedStatMany(statCtx, client, remaining, maxConnections, articleDate) {
 			if _, wanted := seen[result.MessageID]; !wanted {
 				continue
 			}
@@ -379,8 +380,9 @@ func FastFailReleaseProbe(
 	maxConnections int,
 	timeout time.Duration,
 	patchIdx PatchIndex,
+	articleDate time.Time,
 ) (bool, error) {
-	v, err := FastFailReleaseProbeVerdict(ctx, files, poolManager, segmentSamplePercentage, maxConnections, timeout, patchIdx)
+	v, err := FastFailReleaseProbeVerdict(ctx, files, poolManager, segmentSamplePercentage, maxConnections, timeout, patchIdx, articleDate)
 	return v.Missing, err
 }
 
@@ -424,6 +426,7 @@ func FastFailCheckFiles(
 	progressTracker progress.ProgressTracker,
 	patchIdx PatchIndex,
 	stopFileOnFirstMiss bool,
+	articleDate time.Time,
 ) ([]FastFailFileResult, error) {
 	if !poolManager.HasPool() {
 		return nil, fmt.Errorf("cannot fast-fail import: usenet connection pool is nil")
@@ -576,7 +579,7 @@ func FastFailCheckFiles(
 			ids[i] = job.segID
 		}
 
-		missingByID, unverified, err := statIDsWithBoundedRetries(ctx, usenetPool, ids, maxConnections, timeout, false, patchIdx)
+		missingByID, unverified, err := statIDsWithBoundedRetries(ctx, usenetPool, ids, maxConnections, timeout, false, patchIdx, articleDate)
 		if err != nil && !errors.Is(err, ErrFastFailInconclusive) {
 			return nil, err
 		}

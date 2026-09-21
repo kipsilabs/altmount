@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/javi11/nntppool/v4"
+	"github.com/javi11/nntppool/v5"
 )
 
 // TestFake_BasicBodyReturnsPayload pins the simplest contract: a configured
@@ -19,7 +19,7 @@ func TestFake_BasicBodyReturnsPayload(t *testing.T) {
 	c := New()
 	c.SetBehavior("seg-1", SegmentBehavior{Bytes: []byte("hello")})
 
-	body, err := c.BodyPriority(context.Background(), "seg-1")
+	body, err := c.Fetch(context.Background(), nntppool.Req{MessageID: "seg-1", Lane: nntppool.LanePriority})
 	if err != nil {
 		t.Fatalf("BodyPriority error: %v", err)
 	}
@@ -40,7 +40,7 @@ func TestFake_DefaultBehaviorAppliesWhenNoOverride(t *testing.T) {
 	t.Parallel()
 	c := New()
 	c.SetDefaultBehavior(SegmentBehavior{Bytes: []byte("default")})
-	body, err := c.Body(context.Background(), "any-id")
+	body, err := c.Fetch(context.Background(), nntppool.Req{MessageID: "any-id"})
 	if err != nil {
 		t.Fatalf("Body error: %v", err)
 	}
@@ -56,7 +56,7 @@ func TestFake_ErrorPropagates(t *testing.T) {
 	t.Parallel()
 	c := New()
 	c.SetBehavior("missing", SegmentBehavior{Err: nntppool.ErrArticleNotFound})
-	_, err := c.BodyPriority(context.Background(), "missing")
+	_, err := c.Fetch(context.Background(), nntppool.Req{MessageID: "missing", Lane: nntppool.LanePriority})
 	if !errors.Is(err, nntppool.ErrArticleNotFound) {
 		t.Errorf("err = %v, want ErrArticleNotFound", err)
 	}
@@ -77,7 +77,7 @@ func TestFake_ContextCancellationDuringLatencyShortCircuits(t *testing.T) {
 	}()
 
 	start := time.Now()
-	_, err := c.BodyPriority(ctx, "x")
+	_, err := c.Fetch(ctx, nntppool.Req{MessageID: "x", Lane: nntppool.LanePriority})
 	elapsed := time.Since(start)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v, want context.Canceled", err)
@@ -105,7 +105,7 @@ func TestFake_InFlightCounterTracksConcurrency(t *testing.T) {
 	for i := 0; i < N; i++ {
 		go func() {
 			defer wg.Done()
-			_, _ = c.BodyPriority(context.Background(), "seg")
+			_, _ = c.Fetch(context.Background(), nntppool.Req{MessageID: "seg", Lane: nntppool.LanePriority})
 		}()
 	}
 
@@ -141,7 +141,7 @@ func TestFake_BodyAsyncWritesToWriter(t *testing.T) {
 	defer pr.Close()
 	defer pw.Close()
 
-	ch := c.BodyAsync(context.Background(), "a", pw)
+	ch := c.FetchAsync(context.Background(), nntppool.Req{MessageID: "a", Writer: pw})
 
 	buf := make([]byte, 7)
 	if _, err := io.ReadFull(pr, buf); err != nil {

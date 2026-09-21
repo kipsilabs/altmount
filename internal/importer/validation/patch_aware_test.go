@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"github.com/kipsilabs/altmount/internal/testsupport/fakepool"
-	"github.com/javi11/nntppool/v4"
+	"github.com/javi11/nntppool/v5"
 )
 
 // fakePatchIndex reports locally repaired articles.
@@ -28,7 +28,7 @@ func TestReleaseProbeTreatsPatchedSegmentAsAvailable(t *testing.T) {
 
 	// Without a patch index: the probe reports damage.
 	missing, err := FastFailReleaseProbe(context.Background(), files,
-		fastFailPoolManager{client: client}, 100, 1, time.Second, nil)
+		fastFailPoolManager{client: client}, 100, 1, time.Second, nil, time.Time{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -39,7 +39,7 @@ func TestReleaseProbeTreatsPatchedSegmentAsAvailable(t *testing.T) {
 	// With the article in the patch store: the probe reports healthy.
 	missing, err = FastFailReleaseProbe(context.Background(), files,
 		fastFailPoolManager{client: client}, 100, 1, time.Second,
-		fakePatchIndex{have: map[string]bool{dead: true}})
+		fakePatchIndex{have: map[string]bool{dead: true}}, time.Time{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,7 +59,7 @@ func TestCheckFilesTreatsPatchedSegmentAsAvailable(t *testing.T) {
 
 	results, err := FastFailCheckFiles(context.Background(), files,
 		fastFailPoolManager{client: client}, 100, 1, time.Second, nil,
-		fakePatchIndex{have: map[string]bool{dead: true}}, false)
+		fakePatchIndex{have: map[string]bool{dead: true}}, false, time.Time{})
 	if err != nil {
 		t.Fatal(err)
 	}

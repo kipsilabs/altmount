@@ -8,7 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/javi11/nntppool/v4"
+	"github.com/javi11/nntppool/v5"
 	"github.com/kipsilabs/altmount/internal/pool"
 )
 
@@ -121,7 +121,12 @@ func (b *UsenetReader) streamArticle(ctx context.Context, cp pool.NntpClient, se
 	run := func(w *articleWriter) {
 		go func() {
 			start := time.Now()
-			body, err := cp.BodyStreamPriority(ctx, seg.Id, w)
+			body, err := cp.Fetch(ctx, nntppool.Req{
+				MessageID:   seg.Id,
+				Lane:        nntppool.LanePriority,
+				Writer:      w,
+				ArticleDate: b.articleDate,
+			})
 			results <- streamResult{w: w, body: body, err: err, dur: time.Since(start)}
 		}()
 	}

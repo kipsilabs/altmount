@@ -4468,6 +4468,12 @@ components:
           type: integer
         proxy_url:
           type: string
+        max_article_age_days:
+          description: >-
+            How far back this provider's retention reaches, in days. Articles
+            older than this are fetched from it only after every provider that
+            does reach back that far. 0 means no limit.
+          type: integer
         quota_bytes:
           type: integer
         quota_period_hours:
@@ -4478,6 +4484,12 @@ components:
           type: integer
         storage_group:
           type: string
+        strict_max_article_age:
+          description: >-
+            Makes max_article_age_days binding rather than an ordering
+            preference: the provider is not contacted at all for an article
+            older than its retention.
+          type: boolean
         tls:
           type: boolean
         user_agent:
@@ -5903,6 +5915,12 @@ components:
           type: integer
         proxy_url:
           type: string
+        max_article_age_days:
+          description: >-
+            How far back this provider's retention reaches, in days. Articles
+            older than this are fetched from it only after every provider that
+            does reach back that far. 0 means no limit.
+          type: integer
         quota_bytes:
           type: integer
         quota_period_hours:
@@ -5922,6 +5940,12 @@ components:
           type: integer
         storage_group:
           type: string
+        strict_max_article_age:
+          description: >-
+            Makes max_article_age_days binding rather than an ordering
+            preference: the provider is not contacted at all for an article
+            older than its retention.
+          type: boolean
         stream_inflight_requests:
           description: >-
             StreamInflightRequests caps streaming (priority-lane) bodies in

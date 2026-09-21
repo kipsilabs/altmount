@@ -43,6 +43,7 @@ func FastFailReleaseProbeVerdict(
 	maxConnections int,
 	timeout time.Duration,
 	patchIdx PatchIndex,
+	articleDate time.Time,
 ) (ProbeVerdict, error) {
 	var segments []*metapb.SegmentData
 	for _, file := range files {
@@ -91,7 +92,7 @@ func FastFailReleaseProbeVerdict(
 
 	// The first wave is swept to completion, not cancelled on the first miss:
 	// its misses are counted to tell a dead post from a damaged one.
-	missing, unverified, err := statIDsWithBoundedRetries(ctx, usenetPool, first, maxConnections, probeTimeout, false, patchIdx)
+	missing, unverified, err := statIDsWithBoundedRetries(ctx, usenetPool, first, maxConnections, probeTimeout, false, patchIdx, articleDate)
 	if err != nil && len(missing) == 0 {
 		return ProbeVerdict{}, err
 	}
@@ -109,7 +110,7 @@ func FastFailReleaseProbeVerdict(
 		return ProbeVerdict{}, nil
 	}
 
-	missing, _, err = statIDsWithBoundedRetries(ctx, usenetPool, rest, maxConnections, probeTimeout, true, patchIdx)
+	missing, _, err = statIDsWithBoundedRetries(ctx, usenetPool, rest, maxConnections, probeTimeout, true, patchIdx, articleDate)
 	if err != nil {
 		if len(missing) > 0 {
 			// A definitive miss before running out of patience for the rest;

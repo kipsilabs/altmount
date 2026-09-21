@@ -66,6 +66,8 @@ const defaultFormData: ProviderFormData = {
 	user_agent: "",
 	quota_bytes: 0,
 	quota_period_hours: 0,
+	max_article_age_days: 0,
+	strict_max_article_age: false,
 	account_expiration_date: "",
 };
 
@@ -86,6 +88,7 @@ export function ProviderModal({
 	} | null>(null);
 	const [canSave, setCanSave] = useState(false);
 	const [quotaEnabled, setQuotaEnabled] = useState(false);
+	const [retentionEnabled, setRetentionEnabled] = useState(false);
 	const [quotaGbInput, setQuotaGbInput] = useState("");
 	const [backboneHint, setBackboneHint] = useState<string | null>(null);
 
@@ -129,10 +132,13 @@ export function ProviderModal({
 				user_agent: provider.user_agent ?? "",
 				quota_bytes: provider.quota_bytes ?? 0,
 				quota_period_hours: provider.quota_period_hours ?? 0,
+				max_article_age_days: provider.max_article_age_days ?? 0,
+				strict_max_article_age: provider.strict_max_article_age ?? false,
 				account_expiration_date: provider.account_expiration_date ?? "",
 			});
 			const qb = provider.quota_bytes ?? 0;
 			setQuotaEnabled(qb > 0);
+			setRetentionEnabled((provider.max_article_age_days ?? 0) > 0);
 			setQuotaGbInput(qb > 0 ? String(Math.round((qb / BYTES_PER_GB) * 100) / 100) : "1");
 			// For edit mode, allow saving without testing if only non-connection fields change
 			setCanSave(true);
@@ -143,6 +149,7 @@ export function ProviderModal({
 				user_agent: defaultUserAgent,
 			});
 			setQuotaEnabled(false);
+			setRetentionEnabled(false);
 			setQuotaGbInput("1");
 			setCanSave(false);
 		}
@@ -262,6 +269,10 @@ export function ProviderModal({
 					updateData.quota_bytes = formData.quota_bytes;
 				if (formData.quota_period_hours !== (provider.quota_period_hours ?? 0))
 					updateData.quota_period_hours = formData.quota_period_hours;
+				if (formData.max_article_age_days !== (provider.max_article_age_days ?? 0))
+					updateData.max_article_age_days = formData.max_article_age_days;
+				if (formData.strict_max_article_age !== (provider.strict_max_article_age ?? false))
+					updateData.strict_max_article_age = formData.strict_max_article_age;
 
 				await updateProvider.mutateAsync({
 					id: provider.id,
@@ -696,6 +707,79 @@ export function ProviderModal({
 										<option value={168}>Weekly (7d)</option>
 										<option value={720}>Monthly (30d)</option>
 									</select>
+								</fieldset>
+							</div>
+						)}
+					</div>
+
+					{/* Article Retention */}
+					<div className="space-y-4 rounded-2xl border-2 border-base-300/80 bg-base-200/60 p-5">
+						<label
+							htmlFor="retention_enabled"
+							className="label w-full min-w-0 cursor-pointer items-start justify-start gap-3"
+						>
+							<input
+								id="retention_enabled"
+								type="checkbox"
+								className="checkbox checkbox-primary checkbox-sm mt-0.5 shrink-0"
+								checked={retentionEnabled}
+								onChange={(e) => {
+									setRetentionEnabled(e.target.checked);
+									if (e.target.checked) {
+										handleInputChange("max_article_age_days", 1000);
+									} else {
+										handleInputChange("max_article_age_days", 0);
+										handleInputChange("strict_max_article_age", false);
+									}
+								}}
+							/>
+							<div className="min-w-0 flex-1">
+								<span className="label-text font-bold text-xs">Limited Retention</span>
+								<span className="block break-words text-base-content/70 text-xs">
+									Set this when the provider only keeps recent posts. Newer articles are fetched
+									from it first, leaving providers with deeper retention free for older ones.
+								</span>
+							</div>
+						</label>
+
+						{retentionEnabled && (
+							<div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+								<fieldset className="fieldset">
+									<legend className="fieldset-legend font-bold">Retention (days)</legend>
+									<input
+										id="max_article_age_days"
+										type="number"
+										className="input input-bordered w-full font-mono text-sm"
+										value={formData.max_article_age_days}
+										onChange={(e) =>
+											handleInputChange(
+												"max_article_age_days",
+												Number.parseInt(e.target.value, 10) || 0,
+											)
+										}
+										min={1}
+										step={1}
+									/>
+									<p className="label">How far back this provider's retention reaches.</p>
+								</fieldset>
+
+								<fieldset className="fieldset">
+									<legend className="fieldset-legend font-bold">Older Articles</legend>
+									<select
+										id="strict_max_article_age"
+										className="select select-bordered w-full font-mono text-sm"
+										value={formData.strict_max_article_age ? "skip" : "last"}
+										onChange={(e) =>
+											handleInputChange("strict_max_article_age", e.target.value === "skip")
+										}
+									>
+										<option value="last">Try this provider last</option>
+										<option value="skip">Never ask this provider</option>
+									</select>
+									<p className="label">
+										"Try last" still reaches the provider if others miss, so a wrong date cannot
+										make a file unplayable.
+									</p>
 								</fieldset>
 							</div>
 						)}

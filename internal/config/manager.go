@@ -14,9 +14,9 @@ import (
 	"unicode"
 
 	"github.com/go-viper/mapstructure/v2"
-	"github.com/kipsilabs/altmount/internal/utils"
-	"github.com/javi11/nntppool/v4"
+	"github.com/javi11/nntppool/v5"
 	"github.com/jinzhu/copier"
+	"github.com/kipsilabs/altmount/internal/utils"
 	"github.com/robfig/cron/v3"
 	"github.com/spf13/viper"
 	"gopkg.in/yaml.v3"
@@ -814,23 +814,35 @@ type ProviderConfig struct {
 	// per connection, so a playback read never queues behind a connection's
 	// worth of read-ahead. 0 defaults to 4; values above inflight_requests
 	// are capped to it.
-	StreamInflightRequests   int        `yaml:"stream_inflight_requests" mapstructure:"stream_inflight_requests" json:"stream_inflight_requests,omitempty"`
-	TLS                      bool       `yaml:"tls" mapstructure:"tls" json:"tls"`
-	InsecureTLS              bool       `yaml:"insecure_tls" mapstructure:"insecure_tls" json:"insecure_tls"`
-	ProxyURL                 string     `yaml:"proxy_url" mapstructure:"proxy_url" json:"proxy_url,omitempty"`
-	Enabled                  *bool      `yaml:"enabled" mapstructure:"enabled" json:"enabled,omitempty"`
-	IsBackupProvider         *bool      `yaml:"is_backup_provider" mapstructure:"is_backup_provider" json:"is_backup_provider,omitempty"`
-	StorageGroup             string     `yaml:"storage_group" mapstructure:"storage_group" json:"storage_group,omitempty"`
-	SkipPing                 bool       `yaml:"skip_ping" mapstructure:"skip_ping" json:"skip_ping,omitempty"`
-	KeepaliveIntervalSeconds int        `yaml:"keepalive_interval_seconds" mapstructure:"keepalive_interval_seconds" json:"keepalive_interval_seconds,omitempty"`
-	KeepaliveCommand         string     `yaml:"keepalive_command" mapstructure:"keepalive_command" json:"keepalive_command,omitempty"`
-	UserAgent                string     `yaml:"user_agent" mapstructure:"user_agent" json:"user_agent,omitempty"`
-	QuotaBytes               int64      `yaml:"quota_bytes" mapstructure:"quota_bytes" json:"quota_bytes,omitempty"`
-	QuotaPeriodHours         int        `yaml:"quota_period_hours" mapstructure:"quota_period_hours" json:"quota_period_hours,omitempty"`
-	LastRTTMs                int64      `yaml:"last_rtt_ms" mapstructure:"last_rtt_ms" json:"last_rtt_ms,omitempty"`
-	LastSpeedTestMbps        float64    `yaml:"last_speed_test_mbps" mapstructure:"last_speed_test_mbps" json:"last_speed_test_mbps,omitempty"`
-	LastSpeedTestTime        *time.Time `yaml:"last_speed_test_time" mapstructure:"last_speed_test_time" json:"last_speed_test_time,omitempty"`
-	AccountExpirationDate    string     `yaml:"account_expiration_date" mapstructure:"account_expiration_date" json:"account_expiration_date,omitempty"`
+	StreamInflightRequests   int    `yaml:"stream_inflight_requests" mapstructure:"stream_inflight_requests" json:"stream_inflight_requests,omitempty"`
+	TLS                      bool   `yaml:"tls" mapstructure:"tls" json:"tls"`
+	InsecureTLS              bool   `yaml:"insecure_tls" mapstructure:"insecure_tls" json:"insecure_tls"`
+	ProxyURL                 string `yaml:"proxy_url" mapstructure:"proxy_url" json:"proxy_url,omitempty"`
+	Enabled                  *bool  `yaml:"enabled" mapstructure:"enabled" json:"enabled,omitempty"`
+	IsBackupProvider         *bool  `yaml:"is_backup_provider" mapstructure:"is_backup_provider" json:"is_backup_provider,omitempty"`
+	StorageGroup             string `yaml:"storage_group" mapstructure:"storage_group" json:"storage_group,omitempty"`
+	SkipPing                 bool   `yaml:"skip_ping" mapstructure:"skip_ping" json:"skip_ping,omitempty"`
+	KeepaliveIntervalSeconds int    `yaml:"keepalive_interval_seconds" mapstructure:"keepalive_interval_seconds" json:"keepalive_interval_seconds,omitempty"`
+	KeepaliveCommand         string `yaml:"keepalive_command" mapstructure:"keepalive_command" json:"keepalive_command,omitempty"`
+	UserAgent                string `yaml:"user_agent" mapstructure:"user_agent" json:"user_agent,omitempty"`
+	// MaxArticleAgeDays is how far back this provider's retention reaches.
+	// Articles older than this are fetched from it only after every provider
+	// that does reach back that far has been tried, so a short-retention
+	// provider absorbs recent posts and leaves the deep-retention providers'
+	// connections and quota for the articles that have nowhere else to go.
+	// 0 (the default) declares no limit.
+	MaxArticleAgeDays int `yaml:"max_article_age_days" mapstructure:"max_article_age_days" json:"max_article_age_days,omitempty"`
+	// StrictMaxArticleAge makes MaxArticleAgeDays binding rather than an
+	// ordering preference: the provider is not contacted at all for an
+	// article older than its retention. For a metered account whose capacity
+	// should not be spent on a request that will almost certainly 430.
+	StrictMaxArticleAge   bool       `yaml:"strict_max_article_age" mapstructure:"strict_max_article_age" json:"strict_max_article_age,omitempty"`
+	QuotaBytes            int64      `yaml:"quota_bytes" mapstructure:"quota_bytes" json:"quota_bytes,omitempty"`
+	QuotaPeriodHours      int        `yaml:"quota_period_hours" mapstructure:"quota_period_hours" json:"quota_period_hours,omitempty"`
+	LastRTTMs             int64      `yaml:"last_rtt_ms" mapstructure:"last_rtt_ms" json:"last_rtt_ms,omitempty"`
+	LastSpeedTestMbps     float64    `yaml:"last_speed_test_mbps" mapstructure:"last_speed_test_mbps" json:"last_speed_test_mbps,omitempty"`
+	LastSpeedTestTime     *time.Time `yaml:"last_speed_test_time" mapstructure:"last_speed_test_time" json:"last_speed_test_time,omitempty"`
+	AccountExpirationDate string     `yaml:"account_expiration_date" mapstructure:"account_expiration_date" json:"account_expiration_date,omitempty"`
 }
 
 // SABnzbdConfig represents SABnzbd-compatible API configuration
@@ -1652,6 +1664,8 @@ func (p *ProviderConfig) ToNNTPProvider() nntppool.Provider {
 		UserAgent:         p.UserAgent,
 		QuotaBytes:        p.QuotaBytes,
 		QuotaPeriod:       time.Duration(p.QuotaPeriodHours) * time.Hour,
+		MaxArticleAge:     time.Duration(max(p.MaxArticleAgeDays, 0)) * 24 * time.Hour,
+		StrictMaxAge:      p.StrictMaxArticleAge,
 	}
 }
 
@@ -1732,6 +1746,8 @@ func providersFieldsEqual(a, b ProviderConfig) bool {
 		a.UserAgent == b.UserAgent &&
 		a.QuotaBytes == b.QuotaBytes &&
 		a.QuotaPeriodHours == b.QuotaPeriodHours &&
+		a.MaxArticleAgeDays == b.MaxArticleAgeDays &&
+		a.StrictMaxArticleAge == b.StrictMaxArticleAge &&
 		a.StorageGroup == b.StorageGroup &&
 		boolPtrEqual(a.Enabled, b.Enabled) &&
 		boolPtrEqual(a.IsBackupProvider, b.IsBackupProvider)

@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/javi11/nntppool/v4"
+	"github.com/javi11/nntppool/v5"
 	"github.com/kipsilabs/altmount/internal/pool"
 )
 
@@ -32,8 +32,8 @@ const (
 // re-issue picked up by an idle connection answers in tens of milliseconds.
 // Each id is reported at most once, whichever sweep answers first; both sweeps
 // are cancelled as soon as every id has reported.
-func hedgedStatMany(ctx context.Context, client pool.NntpClient, ids []string, concurrency int) <-chan nntppool.StatManyResult {
-	out := make(chan nntppool.StatManyResult, len(ids))
+func hedgedStatMany(ctx context.Context, client pool.NntpClient, ids []string, concurrency int, articleDate time.Time) <-chan nntppool.ExistsResult {
+	out := make(chan nntppool.ExistsResult, len(ids))
 	go func() {
 		defer close(out)
 		sweepCtx, cancel := context.WithCancel(ctx)
@@ -44,13 +44,16 @@ func hedgedStatMany(ctx context.Context, client pool.NntpClient, ids []string, c
 		reported := make(map[string]struct{}, len(ids))
 		latencies := make([]time.Duration, 0, len(ids))
 
-		primary := client.StatMany(sweepCtx, ids, nntppool.StatManyOptions{Concurrency: concurrency})
-		var hedge <-chan nntppool.StatManyResult
+		primary := client.ExistsMany(sweepCtx, ids, nntppool.ManyOptions{
+			Concurrency: concurrency,
+			ArticleDate: articleDate,
+		})
+		var hedge <-chan nntppool.ExistsResult
 		lull := time.NewTimer(time.Hour)
 		lull.Stop()
 		defer lull.Stop()
 
-		deliver := func(r nntppool.StatManyResult, fromHedge bool) {
+		deliver := func(r nntppool.ExistsResult, fromHedge bool) {
 			mu.Lock()
 			if _, dup := reported[r.MessageID]; dup {
 				mu.Unlock()
@@ -114,9 +117,10 @@ func hedgedStatMany(ctx context.Context, client pool.NntpClient, ids []string, c
 				// a hedge on the same lane would join the queue. The priority
 				// lane lets an idle connection pick these bodyless requests up
 				// ahead of it.
-				hedge = client.StatMany(sweepCtx, stragglers, nntppool.StatManyOptions{
+				hedge = client.ExistsMany(sweepCtx, stragglers, nntppool.ManyOptions{
 					Concurrency: len(stragglers),
-					Priority:    true,
+					Lane:        nntppool.LanePriority,
+					ArticleDate: articleDate,
 					Skip: func(id string) bool {
 						mu.Lock()
 						defer mu.Unlock()

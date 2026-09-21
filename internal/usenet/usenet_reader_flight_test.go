@@ -13,7 +13,7 @@ import (
 	"github.com/kipsilabs/altmount/internal/pool"
 	"github.com/kipsilabs/altmount/internal/testsupport/fakepool"
 	"github.com/kipsilabs/altmount/internal/testsupport/segments"
-	"github.com/javi11/nntppool/v4"
+	"github.com/javi11/nntppool/v5"
 )
 
 func newFlightReader(t *testing.T, ctx context.Context, fp *fakepool.Client, fm *flightMap, n, segSize int, opts ...ReaderOption) *UsenetReader {

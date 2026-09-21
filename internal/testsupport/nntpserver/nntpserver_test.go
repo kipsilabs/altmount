@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/kipsilabs/altmount/internal/testsupport/segments"
-	"github.com/javi11/nntppool/v4"
+	"github.com/javi11/nntppool/v5"
 )
 
 const testArticleSize = 64 * 1024
@@ -53,10 +53,10 @@ func TestStatHitAndMiss(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if _, err := client.Stat(ctx, segments.MessageID(1)); err != nil {
+	if _, err := client.Exists(ctx, nntppool.Req{MessageID: segments.MessageID(1)}); err != nil {
 		t.Fatalf("Stat hit: %v", err)
 	}
-	if _, err := client.Stat(ctx, missing); !errors.Is(err, nntppool.ErrArticleNotFound) {
+	if _, err := client.Exists(ctx, nntppool.Req{MessageID: missing}); !errors.Is(err, nntppool.ErrArticleNotFound) {
 		t.Fatalf("Stat miss: got %v, want ErrArticleNotFound", err)
 	}
 
@@ -75,7 +75,7 @@ func TestBodyRoundTrip(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	body, err := client.Body(ctx, segments.MessageID(1))
+	body, err := client.Fetch(ctx, nntppool.Req{MessageID: segments.MessageID(1)})
 	if err != nil {
 		t.Fatalf("Body: %v", err)
 	}
@@ -114,7 +114,7 @@ func TestPipelinedRepliesStayOrdered(t *testing.T) {
 	defer cancel()
 
 	seen := make(map[string]bool, n)
-	for res := range client.StatMany(ctx, ids, nntppool.StatManyOptions{Concurrency: 128}) {
+	for res := range client.ExistsMany(ctx, ids, nntppool.ManyOptions{Concurrency: 128}) {
 		if seen[res.MessageID] {
 			t.Fatalf("duplicate result for %s", res.MessageID)
 		}
@@ -150,12 +150,12 @@ func TestBandwidthThrottleIsHonoured(t *testing.T) {
 	defer cancel()
 
 	// Warm the connection so dial/auth is not counted.
-	if _, err := client.Body(ctx, segments.MessageID(0)); err != nil {
+	if _, err := client.Fetch(ctx, nntppool.Req{MessageID: segments.MessageID(0)}); err != nil {
 		t.Fatalf("warmup Body: %v", err)
 	}
 
 	start := time.Now()
-	if _, err := client.Body(ctx, segments.MessageID(1)); err != nil {
+	if _, err := client.Fetch(ctx, nntppool.Req{MessageID: segments.MessageID(1)}); err != nil {
 		t.Fatalf("Body: %v", err)
 	}
 	elapsed := time.Since(start)
@@ -199,7 +199,7 @@ func TestAggregateBandwidthCaps(t *testing.T) {
 	defer cancel()
 
 	// Warm the connections so dial/auth is outside the measurement.
-	if _, err := client.Body(ctx, segments.MessageID(0)); err != nil {
+	if _, err := client.Fetch(ctx, nntppool.Req{MessageID: segments.MessageID(0)}); err != nil {
 		t.Fatalf("warmup: %v", err)
 	}
 
@@ -208,7 +208,7 @@ func TestAggregateBandwidthCaps(t *testing.T) {
 	errs := make(chan error, fetches)
 	for i := range fetches {
 		go func() {
-			_, err := client.Body(ctx, segments.MessageID(i+1))
+			_, err := client.Fetch(ctx, nntppool.Req{MessageID: segments.MessageID(i + 1)})
 			errs <- err
 		}()
 	}

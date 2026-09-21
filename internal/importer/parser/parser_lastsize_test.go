@@ -3,6 +3,7 @@ package parser
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/kipsilabs/altmount/internal/testsupport/fakepool"
 	"github.com/javi11/nzbparser"
@@ -101,7 +102,7 @@ func TestNormalizeSegmentSizes_DerivesLastWithoutFetch(t *testing.T) {
 	segs := normalizeSegs(4)
 	first := firstSegmentYencInfo{PartSize: 700000, FileSize: 700000*3 + 120000}
 
-	err := p.normalizeSegmentSizesWithYenc(context.Background(), segs, first, 700000, nil)
+	err := p.normalizeSegmentSizesWithYenc(context.Background(), segs, first, 700000, nil, time.Time{})
 	if err != nil {
 		t.Fatalf("normalize returned error: %v", err)
 	}
@@ -124,7 +125,7 @@ func TestNormalizeSegmentSizes_TwoSegmentDerive(t *testing.T) {
 	segs := normalizeSegs(2)
 	first := firstSegmentYencInfo{PartSize: 700000, FileSize: 700000 + 50000}
 
-	err := p.normalizeSegmentSizesWithYenc(context.Background(), segs, first, 0, nil)
+	err := p.normalizeSegmentSizesWithYenc(context.Background(), segs, first, 0, nil, time.Time{})
 	if err != nil {
 		t.Fatalf("normalize returned error: %v", err)
 	}
@@ -146,7 +147,7 @@ func TestNormalizeSegmentSizes_FallsBackToFetchWhenFileSizeUnknown(t *testing.T)
 
 	// The fake pool yields no yEnc headers, so the fetch attempt fails — what
 	// matters here is that the fetch WAS attempted (BodyAsync issued).
-	_ = p.normalizeSegmentSizesWithYenc(context.Background(), segs, first, 700000, nil)
+	_ = p.normalizeSegmentSizesWithYenc(context.Background(), segs, first, 700000, nil, time.Time{})
 	if got := fp.BodyAsyncCalls(); got == 0 {
 		t.Fatal("BodyAsyncCalls = 0, want a last-segment fetch fallback when FileSize is unknown")
 	}
@@ -161,7 +162,7 @@ func TestNormalizeSegmentSizes_FallsBackToFetchOnInsaneDerivation(t *testing.T) 
 	// FileSize wildly larger than the parts can account for → derivation rejected.
 	first := firstSegmentYencInfo{PartSize: 700000, FileSize: 700000 * 100}
 
-	_ = p.normalizeSegmentSizesWithYenc(context.Background(), segs, first, 700000, nil)
+	_ = p.normalizeSegmentSizesWithYenc(context.Background(), segs, first, 700000, nil, time.Time{})
 	if got := fp.BodyAsyncCalls(); got == 0 {
 		t.Fatal("BodyAsyncCalls = 0, want a last-segment fetch fallback on insane derivation")
 	}

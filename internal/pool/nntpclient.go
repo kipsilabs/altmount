@@ -2,9 +2,8 @@ package pool
 
 import (
 	"context"
-	"io"
 
-	"github.com/javi11/nntppool/v4"
+	"github.com/javi11/nntppool/v5"
 )
 
 // NntpClient is the narrow surface of the underlying nntppool.Client that the
@@ -19,48 +18,35 @@ import (
 // adapter.
 //
 // Keep this interface small. Anything that needs a behavior not listed here
-// should add the method explicitly so callers stay observable.
+// should add the method explicitly so callers stay observable. Note that what
+// used to be eight methods is five: nntppool v5 moved lane selection and
+// buffered-vs-streamed delivery into fields on nntppool.Req, so a new
+// combination of those needs no new method here.
 type NntpClient interface {
-	// Body fetches an article body via the default (non-priority) lane.
-	// Used by the importer to download NZB segments during scanning.
-	Body(ctx context.Context, messageID string, onMeta ...func(nntppool.YEncMeta)) (*nntppool.ArticleBody, error)
+	// Fetch downloads and decodes an article body. Req.Lane selects the queue
+	// (normal for imports, priority for playback reads, background for PAR2
+	// repair), and Req.Writer streams the decoded bytes instead of buffering
+	// them. A streamed fetch that has delivered bytes is not failed over, so
+	// callers retrying it must supply a fresh writer.
+	Fetch(ctx context.Context, r nntppool.Req) (*nntppool.ArticleBody, error)
 
-	// BodyAsync fetches an article body asynchronously, streaming the decoded
-	// payload to w. The returned channel yields exactly one BodyResult.
-	BodyAsync(ctx context.Context, messageID string, w io.Writer, onMeta ...func(nntppool.YEncMeta)) <-chan nntppool.BodyResult
+	// FetchAsync is Fetch on its own goroutine; the returned channel yields
+	// exactly one BodyResult. The importer uses it to overlap a segment
+	// download with its own bookkeeping.
+	FetchAsync(ctx context.Context, r nntppool.Req) <-chan nntppool.BodyResult
 
-	// BodyPriority fetches an article body via the priority lane. Streaming
-	// reads use this so live playback isn't queued behind a background import.
-	BodyPriority(ctx context.Context, messageID string, onMeta ...func(nntppool.YEncMeta)) (*nntppool.ArticleBody, error)
+	// Exists checks whether an article is retrievable from at least one
+	// provider without downloading the body. Used by health checks, import
+	// validation, and the mid-stream miss re-check (which passes
+	// LanePriority, since a playback read is blocked on the answer and on the
+	// normal lane could spend its whole budget queued behind a large body).
+	Exists(ctx context.Context, r nntppool.Req) (*nntppool.StatResult, error)
 
-	// BodyBackground fetches an article body via the background lane: served
-	// only when nothing priority or normal is queued and capped per provider
-	// while foreground traffic is recent. PAR2 repair reads whole releases
-	// through it so playback and imports stay ahead of it.
-	BodyBackground(ctx context.Context, messageID string, onMeta ...func(nntppool.YEncMeta)) (*nntppool.ArticleBody, error)
-
-	// BodyStreamPriority fetches an article on the priority lane, writing
-	// decoded bytes to w as each wire read is decoded so a reader can serve
-	// the head of an article before its tail arrives. Bytes on the result is
-	// nil. After partial delivery the pool does not fail over to another
-	// provider; callers retry with a fresh writer.
-	BodyStreamPriority(ctx context.Context, messageID string, w io.Writer, onMeta ...func(nntppool.YEncMeta)) (*nntppool.ArticleBody, error)
-
-	// Stat checks whether an article exists on at least one provider without
-	// downloading the body. Used by health checks and validation.
-	Stat(ctx context.Context, messageID string) (*nntppool.StatResult, error)
-
-	// StatPriority is Stat on the priority lane, for an existence check with a
-	// playback read blocked on its result: on the normal lane it could spend
-	// its whole budget queued behind a large BODY rather than awaiting an
-	// answer. Used by the mid-stream miss re-check.
-	StatPriority(ctx context.Context, messageID string) (*nntppool.StatResult, error)
-
-	// StatMany checks the existence of many articles concurrently, streaming a
-	// result per message-id as each completes. Used by health checks and
-	// fast-fail import validation to batch existence sweeps instead of
-	// issuing one Stat per segment.
-	StatMany(ctx context.Context, messageIDs []string, opts nntppool.StatManyOptions) <-chan nntppool.StatManyResult
+	// ExistsMany checks many articles concurrently, streaming a result per
+	// message-id as each completes. Used by health checks and fast-fail import
+	// validation to batch existence sweeps instead of issuing one Exists per
+	// segment.
+	ExistsMany(ctx context.Context, messageIDs []string, opts nntppool.ManyOptions) <-chan nntppool.ExistsResult
 
 	// Stats returns a snapshot of pool/provider statistics used by the metrics
 	// tracker and the system handlers.

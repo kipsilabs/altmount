@@ -16,7 +16,7 @@ import (
 	"github.com/kipsilabs/altmount/internal/holes"
 	"github.com/kipsilabs/altmount/internal/pool"
 	"github.com/kipsilabs/altmount/internal/slogutil"
-	"github.com/javi11/nntppool/v4"
+	"github.com/javi11/nntppool/v5"
 )
 
 const (
@@ -101,6 +101,17 @@ type ReaderOption func(*UsenetReader)
 func WithHoleHooks(h *HoleHooks) ReaderOption {
 	return func(r *UsenetReader) {
 		r.holeHooks = h
+	}
+}
+
+// WithArticleDate tells the pool when this file's articles were posted, so a
+// provider whose retention does not reach back that far is tried last or not
+// at all (see nntppool Provider.MaxArticleAge). The date comes from the file's
+// metadata release_date; a zero time means it is unknown, which applies no
+// retention policy rather than assuming the articles are old.
+func WithArticleDate(at time.Time) ReaderOption {
+	return func(r *UsenetReader) {
+		r.articleDate = at
 	}
 }
 
@@ -292,6 +303,10 @@ type UsenetReader struct {
 
 	// hedger decides when a slow demand-position fetch gets a second request.
 	hedger hedgePolicy
+
+	// articleDate is when this file's articles were posted, forwarded to the
+	// pool so per-provider retention limits apply. Zero = unknown.
+	articleDate time.Time
 
 	mu sync.Mutex
 }
@@ -790,7 +805,11 @@ func (b *UsenetReader) recheckMiss(ctx context.Context, cp pool.NntpClient, seg 
 	statCtx, cancel := context.WithTimeout(ctx, MissRecheckTimeout)
 	defer cancel()
 
-	switch _, err := cp.StatPriority(statCtx, seg.Id); {
+	switch _, err := cp.Exists(statCtx, nntppool.Req{
+		MessageID:   seg.Id,
+		Lane:        nntppool.LanePriority,
+		ArticleDate: b.articleDate,
+	}); {
 	case err == nil:
 		return true, MissUnverified
 	case errors.Is(err, nntppool.ErrArticleNotFound):
@@ -823,7 +842,10 @@ func (b *UsenetReader) fetchAttempts(ctx context.Context, cp pool.NntpClient, se
 				w, result, err = b.streamArticle(attemptCtx, cp, seg, segIdx, art)
 			} else {
 				// Import: normal lane, buffered — always yields to streaming reads.
-				result, err = cp.Body(attemptCtx, seg.Id)
+				result, err = cp.Fetch(attemptCtx, nntppool.Req{
+					MessageID:   seg.Id,
+					ArticleDate: b.articleDate,
+				})
 			}
 			fetchDur := time.Since(fetchStart)
 			if err != nil {

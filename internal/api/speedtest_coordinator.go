@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/kipsilabs/altmount/internal/config"
-	"github.com/javi11/nntppool/v4"
+	"github.com/javi11/nntppool/v5"
 	"golang.org/x/sync/singleflight"
 )
 

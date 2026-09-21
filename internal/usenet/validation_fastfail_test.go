@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/kipsilabs/altmount/internal/testsupport/fakepool"
-	"github.com/javi11/nntppool/v4"
+	"github.com/javi11/nntppool/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -184,11 +184,11 @@ type chunkRecorder struct {
 	chunks []int
 }
 
-func (c *chunkRecorder) StatMany(ctx context.Context, ids []string, opts nntppool.StatManyOptions) <-chan nntppool.StatManyResult {
+func (c *chunkRecorder) ExistsMany(ctx context.Context, ids []string, opts nntppool.ManyOptions) <-chan nntppool.ExistsResult {
 	c.mu.Lock()
 	c.chunks = append(c.chunks, len(ids))
 	c.mu.Unlock()
-	return c.Client.StatMany(ctx, ids, opts)
+	return c.Client.ExistsMany(ctx, ids, opts)
 }
 
 func (c *chunkRecorder) sizes() []int {

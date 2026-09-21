@@ -14,7 +14,7 @@ import (
 
 	"github.com/kipsilabs/altmount/internal/testsupport/nntpserver"
 	"github.com/kipsilabs/altmount/internal/testsupport/segments"
-	"github.com/javi11/nntppool/v4"
+	"github.com/javi11/nntppool/v5"
 )
 
 // The provider model. A premium provider reached over TLS from the same
@@ -224,7 +224,7 @@ func (h *harness) warmUp(tb testing.TB) {
 	for i := range ids {
 		ids[i] = segments.MessageID(i)
 	}
-	for res := range h.client.StatMany(ctx, ids, nntppool.StatManyOptions{Concurrency: benchConns}) {
+	for res := range h.client.ExistsMany(ctx, ids, nntppool.ManyOptions{Concurrency: benchConns}) {
 		if res.Err != nil {
 			tb.Fatalf("warmup stat %s: %v", res.MessageID, res.Err)
 		}
@@ -262,7 +262,7 @@ func (h *harness) runStream(ctx context.Context, wg *sync.WaitGroup) {
 			for ctx.Err() == nil {
 				id := segments.MessageID(int(next.Add(1)))
 				start := time.Now()
-				body, err := h.client.BodyPriority(ctx, id)
+				body, err := h.client.Fetch(ctx, nntppool.Req{MessageID: id, Lane: nntppool.LanePriority})
 				if ctx.Err() != nil {
 					return
 				}
@@ -292,7 +292,7 @@ func (h *harness) runImportBodies(ctx context.Context, wg *sync.WaitGroup) {
 					return
 				}
 				id := segments.MessageID(int(next.Add(1)) + 1_000_000)
-				body, err := h.client.Body(ctx, id)
+				body, err := h.client.Fetch(ctx, nntppool.Req{MessageID: id})
 				release()
 				if ctx.Err() != nil {
 					return
@@ -327,7 +327,7 @@ func (h *harness) runSweep(ctx context.Context, wg *sync.WaitGroup, idBase int, 
 			}
 
 			chunkCtx, cancel := context.WithTimeout(ctx, StatManyTimeout(len(ids), conc, 30*time.Second))
-			for res := range h.client.StatMany(chunkCtx, ids, nntppool.StatManyOptions{Concurrency: conc}) {
+			for res := range h.client.ExistsMany(chunkCtx, ids, nntppool.ManyOptions{Concurrency: conc}) {
 				if ctx.Err() != nil {
 					continue
 				}

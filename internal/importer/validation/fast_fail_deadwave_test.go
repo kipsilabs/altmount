@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/javi11/nntppool/v4"
+	"github.com/javi11/nntppool/v5"
 )
 
 // A dead post used to be STAT-ed 64 times, three attempts over, then swept per
@@ -20,7 +20,7 @@ func TestFastFailReleaseProbeVerdictJudgesDeadPostFromFirstWave(t *testing.T) {
 	}
 	client := newScriptedStatClient(outcomes)
 
-	v, err := FastFailReleaseProbeVerdict(context.Background(), probeFile(64), fastFailPoolManager{client: client}, 100, 64, 30*time.Second, nil)
+	v, err := FastFailReleaseProbeVerdict(context.Background(), probeFile(64), fastFailPoolManager{client: client}, 100, 64, 30*time.Second, nil, time.Time{})
 	if err != nil {
 		t.Fatalf("FastFailReleaseProbeVerdict error = %v", err)
 	}
@@ -42,7 +42,7 @@ func TestFastFailReleaseProbeVerdictJudgesDeadPostFromFirstWave(t *testing.T) {
 func TestFastFailReleaseProbeVerdictHealthyPostChecksWholeSample(t *testing.T) {
 	client := newScriptedStatClient(nil)
 
-	v, err := FastFailReleaseProbeVerdict(context.Background(), probeFile(64), fastFailPoolManager{client: client}, 100, 64, 30*time.Second, nil)
+	v, err := FastFailReleaseProbeVerdict(context.Background(), probeFile(64), fastFailPoolManager{client: client}, 100, 64, 30*time.Second, nil, time.Time{})
 	if err != nil || v.Missing || v.Dead {
 		t.Fatalf("verdict = %+v, err = %v, want healthy", v, err)
 	}
@@ -58,7 +58,7 @@ func TestFastFailReleaseProbeVerdictHealthyPostChecksWholeSample(t *testing.T) {
 func TestFastFailReleaseProbeVerdictPartialDamageIsNotDead(t *testing.T) {
 	client := newScriptedStatClient(map[string][]error{"seg-1": {nntppool.ErrArticleNotFound}})
 
-	v, err := FastFailReleaseProbeVerdict(context.Background(), probeFile(64), fastFailPoolManager{client: client}, 100, 64, 30*time.Second, nil)
+	v, err := FastFailReleaseProbeVerdict(context.Background(), probeFile(64), fastFailPoolManager{client: client}, 100, 64, 30*time.Second, nil, time.Time{})
 	if err != nil {
 		t.Fatalf("FastFailReleaseProbeVerdict error = %v", err)
 	}
@@ -113,7 +113,7 @@ func TestFastFailCheckFilesEndsAttemptOnceReleaseIsDead(t *testing.T) {
 	client.alwaysDelay = slow
 
 	start := time.Now()
-	results, err := FastFailCheckFiles(context.Background(), files, fastFailPoolManager{client: client}, 100, 64, 30*time.Second, nil, nil, false)
+	results, err := FastFailCheckFiles(context.Background(), files, fastFailPoolManager{client: client}, 100, 64, 30*time.Second, nil, nil, false, time.Time{})
 	elapsed := time.Since(start)
 	if err != nil {
 		t.Fatalf("FastFailCheckFiles error = %v, want the dead-release verdict", err)
