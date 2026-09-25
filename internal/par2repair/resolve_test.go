@@ -386,6 +386,35 @@ func TestResolveNoPar2Files(t *testing.T) {
 	}
 }
 
+func TestResolvePar2FromStoreRepairsEndToEnd(t *testing.T) {
+	n, fetch, contents, deadID := mkEncodedNzbFixture(t, 700, true)
+	store := &metapb.NzbStore{}
+	for _, f := range n.Files {
+		entry := &metapb.NzbFileEntry{Subject: f.Subject}
+		for _, s := range f.Segments {
+			entry.Segments = append(entry.Segments, &metapb.NzbSeg{
+				Id: s.ID, Number: int32(s.Number), Bytes: int64(s.Bytes),
+			})
+		}
+		store.Files = append(store.Files, entry)
+	}
+	// Archive imports record no PAR2 references; the release store retains them.
+	fm := &metapb.FileMetadata{}
+	res, err := Resolve(context.Background(), fm, store, []string{deadID}, fetch,
+		Caps{MaxRepairRatio: 0.5, MaxMemoryBytes: 64 << 20}, testLogger(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ps := NewPatchStore(t.TempDir())
+	if err := RunJob(context.Background(), res.Plan, res.Index, res.Par2Files, fetch, ps, testLogger()); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := ps.Get(normalizeMsgID(deadID))
+	if !ok || !bytes.Equal(got, contents["a.rar"][2048:4096]) {
+		t.Fatal("store-based repair did not reproduce the dead article byte-exactly")
+	}
+}
+
 // sweepStater is a stat-only fetcher recording each StatIDs call, answering
 // liveness from its missing set.
 type sweepStater struct {
