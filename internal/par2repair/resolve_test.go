@@ -378,10 +378,11 @@ func TestArticleCacheEvictsOldestBeyondCap(t *testing.T) {
 
 func TestResolveNoPar2Files(t *testing.T) {
 	_, store, fetch, _, _ := mkResolveFixture(t, false)
+	store.Files = store.Files[:2] // legacy stores may contain only content entries
 	fm := &metapb.FileMetadata{}
 	_, err := Resolve(context.Background(), fm, store, nil, fetch, Caps{}, testLogger(), nil)
-	if err == nil {
-		t.Fatal("want error without par2 files")
+	if !errors.Is(err, ErrUnrepairable) || !strings.Contains(err.Error(), "no PAR2 files") {
+		t.Fatalf("want missing PAR2 error, got %v", err)
 	}
 }
 
