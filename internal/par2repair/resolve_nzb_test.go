@@ -11,6 +11,7 @@ import (
 
 	"github.com/javi11/nzbparser"
 
+	"github.com/kipsilabs/altmount/internal/metadata"
 	metapb "github.com/kipsilabs/altmount/internal/metadata/proto"
 	"github.com/kipsilabs/altmount/internal/testsupport/par2gen"
 )
@@ -324,5 +325,33 @@ func TestResolveFromNzbWithoutPar2Files(t *testing.T) {
 	_, err := ResolveFromNzb(context.Background(), n, nil, fetch, Caps{}, testLogger(), nil)
 	if err == nil {
 		t.Fatal("want error when the NZB carries no PAR2 files")
+	}
+}
+
+// Stored NZB entries retain encoded sizes, including for multipart PAR2 volumes.
+// Archive metadata can omit Par2Files even though these entries are available.
+func TestResolveFallsBackToStoredNzb(t *testing.T) {
+	for _, packed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("packed=%v", packed), func(t *testing.T) {
+			n, fetch, contents, deadID := mkEncodedNzbFixture(t, 700, packed)
+			store, _ := metadata.BuildStore(n)
+			fm := &metapb.FileMetadata{}
+			res, err := Resolve(context.Background(), fm, store, []string{deadID}, fetch,
+				Caps{MaxRepairRatio: 0.5, MaxMemoryBytes: 64 << 20}, testLogger(), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ps := NewPatchStore(t.TempDir())
+			if err := RunJob(context.Background(), res.Plan, res.Index, res.Par2Files, fetch, ps, testLogger()); err != nil {
+				t.Fatal(err)
+			}
+			got, ok := ps.Get(normalizeMsgID(deadID))
+			if !ok || string(got) != string(contents["a.rar"][2048:4096]) {
+				t.Fatal("stored-NZB repair did not reproduce the dead article byte-exactly")
+			}
+			if len(fm.Par2Files) != 0 {
+				t.Fatal("fallback mutated metadata")
+			}
+		})
 	}
 }
