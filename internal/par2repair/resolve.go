@@ -30,9 +30,8 @@ type Resolution struct {
 
 // Resolve turns a damaged file's metadata into a repair plan:
 //
-//  1. Parse the PAR2 set from the metadata's Par2Files segments, falling back
-//     to NzbStore entries when absent (recovery payloads are located, not
-//     downloaded, via seek-aware lazy readers).
+//  1. Parse the PAR2 set from metadata references or stored NZB entries (recovery
+//     payloads are located, not downloaded, via seek-aware lazy readers).
 //  2. Match every recovery-set member (RAR volume / content file) to its
 //     NzbStore entry — by filename in the subject first, then by Hash16k of
 //     the file's first bytes.
@@ -94,6 +93,31 @@ func Resolve(
 		return nil, fmt.Errorf("%w: no PAR2 files recorded for this release", ErrUnrepairable)
 	}
 
+	// Archive and older metadata may omit PAR2 references even though the
+	// original NZB store retains them. Its sizes are encoded, so probe the
+	// decoded layout after the liveness sweep and before parsing packets.
+	fromStore := len(fm.Par2Files) == 0
+	if fromStore {
+		for _, entry := range store.Files {
+			if !isPar2Filename(subjectFilename(entry.Subject)) || len(entry.Segments) == 0 {
+				continue
+			}
+			sf := SetFile{}
+			for _, seg := range entry.Segments {
+				sf.Articles = append(sf.Articles, Article{
+					MessageID: normalizeMsgID(seg.Id),
+					Size:      seg.Bytes,
+				})
+				sf.Length += uint64(seg.Bytes)
+			}
+			par2Files = append(par2Files, sf)
+		}
+		sort.Slice(par2Files, func(i, j int) bool { return par2Files[i].Length < par2Files[j].Length })
+	}
+	if len(par2Files) == 0 {
+		return nil, fmt.Errorf("%w: no PAR2 files recorded in metadata or NZB store for this release", ErrUnrepairable)
+	}
+
 	dead := map[string]bool{}
 	for _, id := range deadSegmentIDs {
 		if id != "" {
@@ -119,6 +143,12 @@ func Resolve(
 	if fromStore {
 		// NZB byte counts include yEnc overhead. Probe decoded sizes before
 		// parsing so multi-article PAR2 packet offsets remain byte-exact.
+		if err := sizePar2SetFiles(ctx, fetch, par2Files, dead, cache, log); err != nil {
+			return nil, err
+		}
+	}
+
+	if fromStore {
 		if err := sizePar2SetFiles(ctx, fetch, par2Files, dead, cache, log); err != nil {
 			return nil, err
 		}
