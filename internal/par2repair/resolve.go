@@ -75,7 +75,7 @@ func Resolve(
 	fromStore := len(par2Refs) == 0
 	if fromStore {
 		for _, entry := range store.Files {
-			if !isPar2Filename(subjectFilename(entry.Subject)) {
+			if !isPar2Filename(subjectFilename(entry.Subject)) || len(entry.Segments) == 0 {
 				continue
 			}
 			sf := SetFile{}
@@ -91,31 +91,6 @@ func Resolve(
 	}
 	if len(par2Files) == 0 {
 		return nil, fmt.Errorf("%w: no PAR2 files recorded for this release", ErrUnrepairable)
-	}
-
-	// Archive and older metadata may omit PAR2 references even though the
-	// original NZB store retains them. Its sizes are encoded, so probe the
-	// decoded layout after the liveness sweep and before parsing packets.
-	fromStore := len(fm.Par2Files) == 0
-	if fromStore {
-		for _, entry := range store.Files {
-			if !isPar2Filename(subjectFilename(entry.Subject)) || len(entry.Segments) == 0 {
-				continue
-			}
-			sf := SetFile{}
-			for _, seg := range entry.Segments {
-				sf.Articles = append(sf.Articles, Article{
-					MessageID: normalizeMsgID(seg.Id),
-					Size:      seg.Bytes,
-				})
-				sf.Length += uint64(seg.Bytes)
-			}
-			par2Files = append(par2Files, sf)
-		}
-		sort.Slice(par2Files, func(i, j int) bool { return par2Files[i].Length < par2Files[j].Length })
-	}
-	if len(par2Files) == 0 {
-		return nil, fmt.Errorf("%w: no PAR2 files recorded in metadata or NZB store for this release", ErrUnrepairable)
 	}
 
 	dead := map[string]bool{}
@@ -143,12 +118,6 @@ func Resolve(
 	if fromStore {
 		// NZB byte counts include yEnc overhead. Probe decoded sizes before
 		// parsing so multi-article PAR2 packet offsets remain byte-exact.
-		if err := sizePar2SetFiles(ctx, fetch, par2Files, dead, cache, log); err != nil {
-			return nil, err
-		}
-	}
-
-	if fromStore {
 		if err := sizePar2SetFiles(ctx, fetch, par2Files, dead, cache, log); err != nil {
 			return nil, err
 		}
