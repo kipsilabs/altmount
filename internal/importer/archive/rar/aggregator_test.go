@@ -146,6 +146,19 @@ func TestProcessArchiveAllGroupsFailedReturnsError(t *testing.T) {
 	require.ErrorIs(t, err, sentinel, "joined error must preserve errors.Is on the original")
 }
 
+func TestProcessArchiveNoAllowedFilesPreservesSentinel(t *testing.T) {
+	proc := &mockRarProcessor{contents: []Content{{InternalPath: "cover.jpg", Filename: "cover.jpg", Size: 100}}}
+	err := ProcessArchive(context.Background(), ProcessArchiveOptions{
+		VirtualDir:            "movies/Release",
+		ArchiveFiles:          []parser.ParsedFile{{Filename: "extras.rar"}},
+		NzbPath:               "movies/Release.nzb",
+		Processor:             proc,
+		MetadataService:       metadata.NewMetadataService(t.TempDir()),
+		AllowedFileExtensions: []string{".mp4"},
+	})
+	require.ErrorIs(t, err, ErrNoAllowedFiles)
+}
+
 func TestProcessArchiveContextCancelledNotIsolated(t *testing.T) {
 	proc := &scriptedRarProcessor{behavior: map[string]groupBehavior{
 		"seta": {err: context.Canceled},

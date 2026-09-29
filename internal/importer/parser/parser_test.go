@@ -7,12 +7,12 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/javi11/nntppool/v5"
+	"github.com/javi11/nzbparser"
 	"github.com/kipsilabs/altmount/internal/config"
 	"github.com/kipsilabs/altmount/internal/pool"
 	"github.com/kipsilabs/altmount/internal/testsupport/fakepool"
 	"github.com/kipsilabs/altmount/internal/testsupport/segments"
-	"github.com/javi11/nntppool/v5"
-	"github.com/javi11/nzbparser"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 )
@@ -341,4 +341,27 @@ func TestPropagateArchiveType_NumericExtensions(t *testing.T) {
 	assert.True(t, parsed.Files[2].IsRarArchive, ".193 must be propagated to IsRarArchive=true")
 	assert.False(t, parsed.Files[3].IsRarArchive, ".nfo must NOT be IsRarArchive")
 	assert.False(t, parsed.Files[4].IsRarArchive, ".par2 must NOT be IsRarArchive")
+}
+
+func TestPropagateArchiveType_KeepsDirectMediaOutsideRar(t *testing.T) {
+	parsed := &ParsedNzb{
+		Type: NzbTypeRarArchive,
+		Files: []ParsedFile{
+			{Filename: "extras.rar", IsRarArchive: true},
+			{Filename: "extras.r00"},
+			{Filename: "release.part.4.mp4"},
+			{Filename: "other.mkv"},
+			{Filename: "sample.mp4"},
+			{Filename: "real-rar-named-video.mp4", IsRarArchive: true},
+		},
+	}
+
+	(&Parser{}).propagateArchiveType(parsed)
+
+	assert.True(t, parsed.Files[0].IsRarArchive)
+	assert.True(t, parsed.Files[1].IsRarArchive, "RAR continuation must still be analyzed")
+	assert.False(t, parsed.Files[2].IsRarArchive, "direct MP4 must be imported as a regular file")
+	assert.False(t, parsed.Files[3].IsRarArchive, "direct MKV must be imported as a regular file")
+	assert.False(t, parsed.Files[4].IsRarArchive, "a sample MP4 is still direct media")
+	assert.True(t, parsed.Files[5].IsRarArchive, "RAR magic must take priority over a misleading media extension")
 }

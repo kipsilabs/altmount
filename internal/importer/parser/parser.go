@@ -19,6 +19,8 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
+	"github.com/javi11/nntppool/v5"
+	"github.com/javi11/nzbparser"
 	"github.com/kipsilabs/altmount/internal/config"
 	"github.com/kipsilabs/altmount/internal/encryption"
 	"github.com/kipsilabs/altmount/internal/encryption/rclone"
@@ -31,11 +33,9 @@ import (
 	"github.com/kipsilabs/altmount/internal/metadata"
 	metapb "github.com/kipsilabs/altmount/internal/metadata/proto"
 	"github.com/kipsilabs/altmount/internal/pool"
-	"github.com/kipsilabs/altmount/internal/usenet"
 	"github.com/kipsilabs/altmount/internal/progress"
 	"github.com/kipsilabs/altmount/internal/slogutil"
-	"github.com/javi11/nntppool/v5"
-	"github.com/javi11/nzbparser"
+	"github.com/kipsilabs/altmount/internal/usenet"
 	concpool "github.com/sourcegraph/conc/pool"
 )
 
@@ -466,8 +466,8 @@ func (p *Parser) ParseNzb(ctx context.Context, n *nzbparser.Nzb, nzbPath string,
 	// For split archives only the first volume contains the magic-byte header, so
 	// Is7zArchive / IsRarArchive may be false on subsequent parts even though they
 	// are archive parts. Correct that now that we know the NZB type.
-	// Propagation is gated on existing detection (magic bytes or extension) so that
-	// non-archive sidecars (.txt, .nfo, etc.) are never wrongly classified.
+	// Keep known media and sidecars as regular files; a positive archive detection
+	// still wins when an archive carries a misleading media extension.
 	p.propagateArchiveType(parsed)
 
 	return parsed, nil
@@ -1916,7 +1916,7 @@ func extractNzbPassword(n *nzbparser.Nzb, nzbPath string) string {
 
 // propagateArchiveType sets the archive-type flag on non-PAR2 files that are
 // archive parts (including split continuation volumes with numeric or extensionless names).
-// Non-archive sidecars (.txt, .nfo, .sfv, etc.) are excluded so they are processed as regular files.
+// Known media and sidecars are excluded unless already detected as archive parts.
 func (p *Parser) propagateArchiveType(parsed *ParsedNzb) {
 	switch parsed.Type {
 	case NzbType7zArchive:
@@ -1929,7 +1929,8 @@ func (p *Parser) propagateArchiveType(parsed *ParsedNzb) {
 	case NzbTypeRarArchive:
 		for i := range parsed.Files {
 			f := &parsed.Files[i]
-			if !f.IsPar2Archive && !fileinfo.IsPar2File(f.Filename) && !isPar2SidecarExtension(f.Filename) {
+			if !f.IsPar2Archive && !fileinfo.IsPar2File(f.Filename) && !isPar2SidecarExtension(f.Filename) &&
+				(f.IsRarArchive || !fileinfo.IsKnownMediaExtension(f.Filename)) {
 				f.IsRarArchive = true
 			}
 		}

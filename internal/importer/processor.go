@@ -1496,6 +1496,7 @@ func (proc *Processor) processRarArchive(
 	// Once the nzbFolder is created, track it for cleanup on failure.
 	// "DIR:" prefix signals handleProcessingFailure to delete the whole directory.
 	writtenPaths := []string{"DIR:" + nzbFolder}
+	regularFilesProcessed := false
 
 	// Process regular files first if any
 	if len(regularFiles) > 0 {
@@ -1521,6 +1522,8 @@ func (proc *Processor) processRarArchive(
 		writtenPaths = append(writtenPaths, regularWritten...)
 		if err != nil {
 			slog.DebugContext(ctx, "Failed to process regular files", "error", err)
+		} else {
+			regularFilesProcessed = len(regularWritten) > 0
 		}
 	}
 
@@ -1561,7 +1564,10 @@ func (proc *Processor) processRarArchive(
 			SegmentIndex:           storeIndex,
 			StoreRef:               storeRef,
 		})
-		if err != nil {
+		if errors.Is(err, rar.ErrNoAllowedFiles) && regularFilesProcessed {
+			proc.log.InfoContext(ctx, "RAR archive has no allowed files; keeping imported regular files",
+				"nzb", parsed.Path, "regular_files", len(regularFiles))
+		} else if err != nil {
 			return nzbFolder, writtenPaths, err
 		}
 	}

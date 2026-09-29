@@ -119,6 +119,16 @@ var verifiableVideoExtensions = map[string]bool{
 	".m2ts": true, ".mpg": true, ".mpeg": true, ".vob": true,
 }
 
+// IsKnownMediaExtension identifies clear media filenames without reading content.
+// It excludes ambiguous extensions such as .bin and .dat that may name archive parts.
+func IsKnownMediaExtension(filename string) bool {
+	if filename == "" {
+		return false
+	}
+	ext := strings.ToLower(filepath.Ext(filename))
+	return verifiableVideoExtensions[ext] || audioExtensions[ext]
+}
+
 // samplePattern matches scene-release sample/proof clips, which are
 // legitimately short and would false-positive as truncated/invalid content.
 // Matched only against the base filename — a directory named e.g.
@@ -136,8 +146,7 @@ func IsVerifiableMediaFile(filename string) bool {
 	if samplePattern.MatchString(filepath.Base(filename)) {
 		return false
 	}
-	ext := strings.ToLower(filepath.Ext(filename))
-	return verifiableVideoExtensions[ext] || audioExtensions[ext]
+	return IsKnownMediaExtension(filename)
 }
 
 // HasValidExtensionLength checks if the extension length is between 2 and 4 characters

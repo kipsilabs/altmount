@@ -63,7 +63,7 @@ func newErrNoAllowedFiles(rarContents []Content, allowedExtensions []string) err
 	for ext := range extSet {
 		found = append(found, ext)
 	}
-	return fmt.Errorf("archive contains no files with allowed extensions (found: %v, allowed: %v)", found, allowedExtensions)
+	return fmt.Errorf("%w (found: %v, allowed: %v)", ErrNoAllowedFiles, found, allowedExtensions)
 }
 
 // hasAllowedFiles checks if any files within RAR archive contents match allowed extensions
