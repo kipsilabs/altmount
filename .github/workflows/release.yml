@@ -129,9 +129,9 @@ jobs:
             echo "Release $TAG already exists"
           else
             if [ "$GENERATE_NOTES" = "true" ]; then
-              gh release create "$TAG" --title "$TAG" --generate-notes
+              gh release create "$TAG" --title "$TAG" --generate-notes --latest=false
             else
-              gh release create "$TAG" --title "$TAG"
+              gh release create "$TAG" --title "$TAG" --latest=false
             fi
           fi
 
@@ -338,6 +338,7 @@ jobs:
           echo "major=$MAJOR" >> $GITHUB_OUTPUT
           echo "minor=$MINOR" >> $GITHUB_OUTPUT
 
+      # Maintenance releases publish exact and minor tags only; keep latest and major aliases on main.
       # Create and push multi-platform manifests using temporary tags
       - name: Create multi-platform manifest (GHCR)
         run: |
@@ -351,20 +352,11 @@ jobs:
           docker manifest create ${GHCR}:${{ steps.version.outputs.version }} $AMD64_IMAGE $ARM64_IMAGE
           docker manifest push ${GHCR}:${{ steps.version.outputs.version }}
 
-          docker manifest create ${GHCR}:v${{ steps.version.outputs.major }} $AMD64_IMAGE $ARM64_IMAGE
-          docker manifest push ${GHCR}:v${{ steps.version.outputs.major }}
-
-          docker manifest create ${GHCR}:${{ steps.version.outputs.major }} $AMD64_IMAGE $ARM64_IMAGE
-          docker manifest push ${GHCR}:${{ steps.version.outputs.major }}
-
           docker manifest create ${GHCR}:v${{ steps.version.outputs.major }}.${{ steps.version.outputs.minor }} $AMD64_IMAGE $ARM64_IMAGE
           docker manifest push ${GHCR}:v${{ steps.version.outputs.major }}.${{ steps.version.outputs.minor }}
 
           docker manifest create ${GHCR}:${{ steps.version.outputs.major }}.${{ steps.version.outputs.minor }} $AMD64_IMAGE $ARM64_IMAGE
           docker manifest push ${GHCR}:${{ steps.version.outputs.major }}.${{ steps.version.outputs.minor }}
-
-          docker manifest create ${GHCR}:latest $AMD64_IMAGE $ARM64_IMAGE
-          docker manifest push ${GHCR}:latest
 
       - name: Create multi-platform manifest (DockerHub)
         run: |
@@ -378,20 +370,11 @@ jobs:
           docker manifest create ${DH}:${{ steps.version.outputs.version }} $AMD64_IMAGE $ARM64_IMAGE
           docker manifest push ${DH}:${{ steps.version.outputs.version }}
 
-          docker manifest create ${DH}:v${{ steps.version.outputs.major }} $AMD64_IMAGE $ARM64_IMAGE
-          docker manifest push ${DH}:v${{ steps.version.outputs.major }}
-
-          docker manifest create ${DH}:${{ steps.version.outputs.major }} $AMD64_IMAGE $ARM64_IMAGE
-          docker manifest push ${DH}:${{ steps.version.outputs.major }}
-
           docker manifest create ${DH}:v${{ steps.version.outputs.major }}.${{ steps.version.outputs.minor }} $AMD64_IMAGE $ARM64_IMAGE
           docker manifest push ${DH}:v${{ steps.version.outputs.major }}.${{ steps.version.outputs.minor }}
 
           docker manifest create ${DH}:${{ steps.version.outputs.major }}.${{ steps.version.outputs.minor }} $AMD64_IMAGE $ARM64_IMAGE
           docker manifest push ${DH}:${{ steps.version.outputs.major }}.${{ steps.version.outputs.minor }}
-
-          docker manifest create ${DH}:latest $AMD64_IMAGE $ARM64_IMAGE
-          docker manifest push ${DH}:latest
 
       # Clean up temporary tags
       - name: Clean up temporary tags

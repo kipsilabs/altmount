@@ -217,6 +217,6 @@ jobs:
             artifacts/checksums-cli.txt
           draft: false
           prerelease: ${{ inputs.prerelease }}
-          make_latest: ${{ !inputs.prerelease }}
+          make_latest: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

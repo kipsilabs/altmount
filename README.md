@@ -14,6 +14,8 @@ A WebDAV server backed by NZB/Usenet that provides seamless access to Usenet con
 
 Complete setup guides, configuration options, API reference, and troubleshooting information.
 
+For legacy metadata installations, see the [v0.2.1 pre-V3 maintenance release and upgrade notes](docs/pre-v3-maintenance.md). Pin that version to receive the security backports without adopting the V3 metadata migration.
+
 ## Quick Start
 
 ### Docker (Recommended)
