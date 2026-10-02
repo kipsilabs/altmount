@@ -9,6 +9,7 @@ import (
 	"github.com/kipsilabs/altmount/internal/auth"
 	"github.com/kipsilabs/altmount/internal/config"
 	"github.com/kipsilabs/altmount/internal/database"
+	"github.com/kipsilabs/altmount/internal/health"
 )
 
 // nzbJobName returns the display name for an NZB job by stripping the .nzb or .nzb.gz
@@ -698,6 +699,7 @@ type QueueHistoricalStatsResponse struct {
 
 // HealthItemResponse represents a health record in API responses
 type HealthItemResponse struct {
+	CheckProgress    *health.CheckProgress   `json:"check_progress,omitempty"`
 	ID               int64                   `json:"id"`
 	FilePath         string                  `json:"file_path"`
 	LibraryPath      *string                 `json:"library_path,omitempty"`
