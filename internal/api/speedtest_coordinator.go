@@ -6,8 +6,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/kipsilabs/altmount/internal/config"
 	"github.com/javi11/nntppool/v5"
+	"github.com/kipsilabs/altmount/internal/config"
+	"github.com/kipsilabs/altmount/internal/pool"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -170,11 +171,7 @@ func (sc *speedtestCoordinator) getOrBuildClient(ctx context.Context, p *config.
 
 // buildAdHocClient dials a throwaway single-provider client; the caller owns Close.
 func buildAdHocClient(ctx context.Context, p *config.ProviderConfig, connections, inflight int) (*nntppool.Client, error) {
-	provider := p.ToNNTPProvider()
-	provider.Connections = connections
-	provider.Inflight = inflight
-	provider.IdleTimeout = 60 * time.Second
-	return nntppool.NewClient(ctx, []nntppool.Provider{provider})
+	return pool.NewAdHocClient(ctx, p.ToNNTPProvider(), connections, inflight)
 }
 
 // run executes fn under the singleflight key for the given provider,
