@@ -18,6 +18,7 @@ import {
 } from "../../../../lib/utils";
 import { type FileHealth, HealthPriority } from "../../../../types/api";
 import { parseRepairReason } from "../par2RepairReason";
+import { ArticleCheckProgress } from "./ArticleCheckProgress";
 import { ContentVerificationBadge } from "./ContentVerificationBadge";
 import { HealthItemActionsMenu } from "./HealthItemActionsMenu";
 import { PartialCheckBadge } from "./PartialCheckBadge";
@@ -144,6 +145,9 @@ export const HealthItemCard = memo(function HealthItemCard({
 							{playbackImpact && <PlaybackImpactBadge impact={playbackImpact} />}
 							{errorDetails && <PartialCheckBadge details={errorDetails} />}
 							{errorDetails && <ContentVerificationBadge details={errorDetails} />}
+							{item.status === "checking" && item.check_progress && (
+								<ArticleCheckProgress progress={item.check_progress} />
+							)}
 
 							<button
 								type="button"
