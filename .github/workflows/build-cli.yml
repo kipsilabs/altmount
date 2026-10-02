@@ -69,6 +69,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.release-tag || github.ref }}
           fetch-depth: 0
 
       - name: Download frontend build
@@ -137,6 +138,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.release-tag || github.ref }}
           fetch-depth: 0
 
       - name: Download darwin-amd64 binary
@@ -182,6 +184,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.release-tag || github.ref }}
           fetch-depth: 0
 
       - name: Download all CLI artifacts

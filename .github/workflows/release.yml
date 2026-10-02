@@ -27,6 +27,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
       - uses: ./.github/actions/test
   build-frontend:
@@ -37,6 +38,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
 
       # Install Bun for frontend build
@@ -102,6 +104,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
 
       - name: Extract version info
@@ -159,6 +162,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
 
       # Download frontend build
@@ -198,9 +202,10 @@ jobs:
           images: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LC }}
             ${{ env.DOCKERHUB_IMAGE }}
+          flavor: latest=false
           tags: |
-            type=ref,event=tag,suffix=-amd64-temp
-            type=semver,pattern={{version}},suffix=-amd64-temp
+            type=raw,value=${{ inputs.tag || github.ref_name }},suffix=-amd64-temp
+            type=semver,pattern={{version}},value=${{ inputs.tag || github.ref_name }},suffix=-amd64-temp
 
       # build and push amd64 image
       - name: Build and push AMD64 image
@@ -230,6 +235,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
 
       # Download frontend build
@@ -269,9 +275,10 @@ jobs:
           images: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LC }}
             ${{ env.DOCKERHUB_IMAGE }}
+          flavor: latest=false
           tags: |
-            type=ref,event=tag,suffix=-arm64-temp
-            type=semver,pattern={{version}},suffix=-arm64-temp
+            type=raw,value=${{ inputs.tag || github.ref_name }},suffix=-arm64-temp
+            type=semver,pattern={{version}},value=${{ inputs.tag || github.ref_name }},suffix=-arm64-temp
 
       # build and push arm64 image
       - name: Build and push ARM64 image
@@ -301,6 +308,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
 
       # Normalize image name to lowercase for GHCR (required)
