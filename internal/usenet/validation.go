@@ -98,6 +98,10 @@ type BatchOptions struct {
 	// Patched articles count as checked without querying the providers.
 	HasPatch func(messageID string) bool
 
+	// OnProgress receives a snapshot for each file touched by a completed chunk.
+	// Calls are serial and include unresolved attempts, but exclude skipped work.
+	OnProgress func(fileIdx int, result ValidationResult)
+
 	// MaxConnections bounds STATs in flight and also sets the chunk size the
 	// sweep dispatches in.
 	MaxConnections int
@@ -279,6 +283,16 @@ func ValidateSegmentAvailabilityBatch(
 				if res.Err == nil {
 					res.Err = statErr
 				}
+			}
+		}
+
+		if opts.OnProgress != nil {
+			touched := make(map[int]struct{}, len(chunkOwners))
+			for _, i := range chunkOwners {
+				touched[i] = struct{}{}
+			}
+			for i := range touched {
+				opts.OnProgress(i, results[i])
 			}
 		}
 

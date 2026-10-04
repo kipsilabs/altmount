@@ -50,9 +50,20 @@ type HealthEvent struct {
 	Classification *holes.Impact
 }
 
+// CheckProgress reports article-check work for one file. ArticlesChecked includes
+// completed attempts (including unresolved responses).
+// ArticlesToCheck is the selected sample; TotalArticles is the full file count.
+type CheckProgress struct {
+	TotalArticles   int `json:"total_articles"`
+	ArticlesToCheck int `json:"articles_to_check"`
+	ArticlesChecked int `json:"articles_checked"`
+}
+
 // CheckOptions defines options for health checking
 type CheckOptions struct {
 	ForceFullCheck bool
+	// OnProgress is called serially during the article sweep, including its initial state.
+	OnProgress func(filePath string, progress CheckProgress)
 	// CurrentStatus is the file's HealthStatus before this check started,
 	// used to gate content verification to first-time (Pending) checks.
 	// Set by the caller (HealthWorker), which already has the row loaded.
@@ -463,7 +474,7 @@ func (hc *HealthChecker) CheckFile(ctx context.Context, filePath string, opts ..
 		ctx,
 		[][]string{prep.sampledIDs},
 		hc.poolManager,
-		hc.batchOptions([]preparedCheck{prep}),
+		hc.batchOptions([]preparedCheck{prep}, opts...),
 	)
 
 	var result usenet.ValidationResult
@@ -500,15 +511,33 @@ func (hc *HealthChecker) statSweepConcurrency(cfg *config.Config) int {
 // classifies a transport failure as missing), and the file's full segment
 // count is the denominator, so the policy matches the one health.classifyHoles
 // applies to the final verdict.
-func (hc *HealthChecker) batchOptions(preps []preparedCheck) usenet.BatchOptions {
+func (hc *HealthChecker) batchOptions(preps []preparedCheck, opts ...CheckOptions) usenet.BatchOptions {
 	cfg := hc.configGetter()
 	acceptable := cfg.GetAcceptableMissingSegmentsPercentage()
+	var onProgress func(int, usenet.ValidationResult)
+	if len(opts) > 0 && opts[0].OnProgress != nil {
+		onProgress = func(i int, result usenet.ValidationResult) {
+			prep := preps[i]
+			if prep.earlyEvent != nil {
+				return
+			}
+			opts[0].OnProgress(prep.filePath, CheckProgress{
+				TotalArticles:   prep.totalSegments,
+				ArticlesToCheck: len(prep.sampledIDs),
+				ArticlesChecked: result.TotalChecked + result.UnresolvedCount,
+			})
+		}
+		for i := range preps {
+			onProgress(i, usenet.ValidationResult{})
+		}
+	}
 
 	return usenet.BatchOptions{
 		HasPatch:       hc.hasPatch,
 		MaxConnections: hc.statSweepConcurrency(cfg),
 		Timeout:        cfg.GetHealthReadTimeout(),
 		ArticleDate:    oldestReleaseDate(preps),
+		OnProgress:     onProgress,
 		ShouldStop: func(fileIdx int, result usenet.ValidationResult) bool {
 			if fileIdx >= len(preps) {
 				return false
@@ -573,7 +602,7 @@ func (hc *HealthChecker) CheckFilesBatch(ctx context.Context, filePaths []string
 		ctx,
 		perFileIDs,
 		hc.poolManager,
-		hc.batchOptions(preps),
+		hc.batchOptions(preps, opts...),
 	)
 
 	events := make([]HealthEvent, len(preps))

@@ -177,7 +177,9 @@ export const useHealth = (params?: {
 	return useQuery({
 		queryKey: ["health", params],
 		queryFn: () => apiClient.getHealth(params),
-		refetchInterval: false,
+		// Poll article progress only while visible records are being checked.
+		refetchInterval: (query) =>
+			query.state.data?.data?.some((item) => item.status === "checking") ? 1000 : false,
 	});
 };
 

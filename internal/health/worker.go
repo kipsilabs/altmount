@@ -61,7 +61,8 @@ type WorkerStats struct {
 // activeCheck is one in-flight health check. Registrations are compared by pointer so a
 // releasing owner never removes an entry another owner has since registered for the same path.
 type activeCheck struct {
-	cancel context.CancelFunc
+	cancel   context.CancelFunc
+	progress *CheckProgress
 }
 
 // HealthWorker manages continuous health monitoring and manual check requests
@@ -248,6 +249,30 @@ func (hw *HealthWorker) GetStats() WorkerStats {
 	defer hw.statsMu.RUnlock()
 
 	return hw.stats
+}
+
+// GetCheckProgress returns an independent snapshot of an active check.
+func (hw *HealthWorker) GetCheckProgress(filePath string) *CheckProgress {
+	hw.activeChecksMu.RLock()
+	defer hw.activeChecksMu.RUnlock()
+	entry := hw.activeChecks[filePath]
+	if entry == nil || entry.progress == nil {
+		return nil
+	}
+	snapshot := *entry.progress
+	return &snapshot
+}
+
+// progressReporter captures owners so a cancelled or replaced check cannot
+// update a newer registration for the same file.
+func (hw *HealthWorker) progressReporter(entries map[string]*activeCheck) func(string, CheckProgress) {
+	return func(path string, progress CheckProgress) {
+		hw.activeChecksMu.Lock()
+		defer hw.activeChecksMu.Unlock()
+		if entry := entries[path]; entry != nil && hw.activeChecks[path] == entry {
+			entry.progress = &progress
+		}
+	}
 }
 
 // CancelHealthCheck cancels an active health check for the specified file
@@ -829,8 +854,8 @@ func (hw *HealthWorker) prepareRepairNotificationUpdate(ctx context.Context, fh 
 // scheduled cycle is checking can be cancelled through CancelHealthCheck exactly like a manual
 // check-now. Each context is an independent child: cancelling one file neither aborts the shared
 // cross-file sweep nor disturbs the other files — the cancelled file's result is discarded
-// instead. Returns the per-file contexts and a release func that clears the registrations.
-func (hw *HealthWorker) beginBatchChecks(ctx context.Context, filePaths []string) (map[string]context.Context, func()) {
+// instead. Returns the per-file contexts, a release func, and an owner-bound progress callback.
+func (hw *HealthWorker) beginBatchChecks(ctx context.Context, filePaths []string) (map[string]context.Context, func(), func(string, CheckProgress)) {
 	fileCtxs := make(map[string]context.Context, len(filePaths))
 	entries := make(map[string]*activeCheck, len(filePaths))
 
@@ -859,7 +884,7 @@ func (hw *HealthWorker) beginBatchChecks(ctx context.Context, filePaths []string
 		for _, entry := range entries {
 			entry.cancel()
 		}
-	}
+	}, hw.progressReporter(entries)
 }
 
 // performDirectCheck performs a health check on a single file using the HealthChecker.
@@ -902,7 +927,7 @@ func (hw *HealthWorker) performDirectCheck(ctx context.Context, filePath string,
 		return fmt.Errorf("file health record not found: %s", filePath)
 	}
 
-	opts := CheckOptions{CurrentStatus: currentStatus, VerifyContentOverride: verifyContentOverride}
+	opts := CheckOptions{CurrentStatus: currentStatus, VerifyContentOverride: verifyContentOverride, OnProgress: hw.progressReporter(map[string]*activeCheck{filePath: entry})}
 	// Delegate to HealthChecker
 	event := hw.healthChecker.CheckFile(checkCtx, filePath, opts)
 
@@ -1039,8 +1064,10 @@ func (hw *HealthWorker) runHealthCheckCycle(ctx context.Context) error {
 	}
 
 	// Make every file of this batch cancellable for as long as it is 'checking'.
-	fileCtxs, releaseChecks := hw.beginBatchChecks(ctx, checkingPaths)
+	fileCtxs, releaseChecks, reportProgress := hw.beginBatchChecks(ctx, checkingPaths)
 	defer releaseChecks()
+	// Let an already-open Health page discover checking rows and start polling.
+	hw.broadcastHealthChanged()
 
 	// Process files in parallel with bounded concurrency
 	p := pool.New().WithMaxGoroutines(maxJobs)
@@ -1071,7 +1098,7 @@ func (hw *HealthWorker) runHealthCheckCycle(ctx context.Context) error {
 		paths[i] = fh.FilePath
 		statuses[i] = fh.Status
 	}
-	events := hw.healthChecker.CheckFilesBatch(ctx, paths, statuses)
+	events := hw.healthChecker.CheckFilesBatch(ctx, paths, statuses, CheckOptions{OnProgress: reportProgress})
 
 	// Phase B: per-file result handling (repair side effects, ARR API calls,
 	// VFS notifications), bounded by maxJobs.

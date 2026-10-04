@@ -188,7 +188,14 @@ export const HealthPriority = {
 
 export type HealthPriority = (typeof HealthPriority)[keyof typeof HealthPriority];
 
+export interface HealthCheckProgress {
+	total_articles: number;
+	articles_to_check: number;
+	articles_checked: number;
+}
+
 export interface FileHealth {
+	check_progress?: HealthCheckProgress;
 	id: number;
 	file_path: string;
 	status: HealthStatus;
