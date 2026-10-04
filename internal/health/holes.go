@@ -38,7 +38,22 @@ func (hc *HealthChecker) classifyHoles(
 	}
 
 	var acc holes.Accumulator
-	acc.Load(metadata.KnownHolesFromProto(input.knownHoles))
+	known := metadata.KnownHolesFromProto(input.knownHoles)
+	if hc.patchIndex == nil {
+		acc.Load(known)
+	} else {
+		// Keep the persisted provider-missing evidence, but repaired bytes
+		// are no longer holes while their local patches remain available.
+		for _, run := range known {
+			start := min(run.Start, len(input.segments))
+			end := start + min(run.Count, len(input.segments)-start)
+			for i := start; i < end; i++ {
+				if !hc.hasPatch(input.segments[i].Id) {
+					acc.Add(i)
+				}
+			}
+		}
+	}
 	priorTotal := acc.Total()
 	observed := missingRuns(input.segments, result.MissingIDs)
 	acc.Load(observed)

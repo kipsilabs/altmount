@@ -497,6 +497,7 @@ func startHealthWorker(
 	// arr_first (default on) it also picks up corrupted files the ARRs
 	// could not repair.
 	if par2RepairService != nil {
+		healthChecker.SetPatchIndex(par2RepairService.PatchStore())
 		healthWorker.SetPar2RepairEnqueuer(par2RepairService)
 	}
 

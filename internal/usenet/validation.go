@@ -8,10 +8,10 @@ import (
 	"math/rand"
 	"time"
 
+	"github.com/javi11/nntppool/v5"
 	"github.com/kipsilabs/altmount/internal/holes"
 	metapb "github.com/kipsilabs/altmount/internal/metadata/proto"
 	"github.com/kipsilabs/altmount/internal/pool"
-	"github.com/javi11/nntppool/v5"
 )
 
 var randPerm = rand.Perm
@@ -94,6 +94,10 @@ const maxTrackedMissingIDs = 50
 
 // BatchOptions tunes a cross-file STAT sweep.
 type BatchOptions struct {
+	// HasPatch reports whether an article is available locally after repair.
+	// Patched articles count as checked without querying the providers.
+	HasPatch func(messageID string) bool
+
 	// MaxConnections bounds STATs in flight and also sets the chunk size the
 	// sweep dispatches in.
 	MaxConnections int
@@ -152,14 +156,6 @@ func ValidateSegmentAvailabilityBatch(
 		return results, nil
 	}
 
-	usenetPool, err := poolManager.GetPool()
-	if err != nil {
-		return results, fmt.Errorf("cannot validate segments: usenet connection pool unavailable: %w", err)
-	}
-	if usenetPool == nil {
-		return results, fmt.Errorf("cannot validate segments: usenet connection pool is nil")
-	}
-
 	if opts.MaxConnections <= 0 {
 		opts.MaxConnections = 1
 	}
@@ -172,10 +168,27 @@ func ValidateSegmentAvailabilityBatch(
 	for round := 0; round < maxSamples; round++ {
 		for fileIdx, fileIDs := range perFileIDs {
 			if round < len(fileIDs) {
-				ids = append(ids, fileIDs[round])
+				id := fileIDs[round]
+				if opts.HasPatch != nil && opts.HasPatch(id) {
+					results[fileIdx].TotalChecked++
+					continue
+				}
+				ids = append(ids, id)
 				fileOf = append(fileOf, fileIdx)
 			}
 		}
+	}
+
+	if len(ids) == 0 {
+		return results, nil
+	}
+
+	usenetPool, err := poolManager.GetPool()
+	if err != nil {
+		return results, fmt.Errorf("cannot validate segments: usenet connection pool unavailable: %w", err)
+	}
+	if usenetPool == nil {
+		return results, fmt.Errorf("cannot validate segments: usenet connection pool is nil")
 	}
 
 	nonEmptyFiles := 0
@@ -233,6 +246,9 @@ func ValidateSegmentAvailabilityBatch(
 			res := &results[chunkOwners[i]]
 			statErr, reported := errByID[id]
 			switch {
+			// A repair can publish a patch while the provider sweep runs.
+			case (statErr != nil || !reported) && opts.HasPatch != nil && opts.HasPatch(id):
+				res.TotalChecked++
 			case !reported:
 				// The chunk deadline expired before this id was dispatched, so
 				// StatMany abandoned it. Reachability was never proven.
