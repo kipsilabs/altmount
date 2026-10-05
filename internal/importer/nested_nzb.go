@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -36,6 +37,11 @@ func (proc *Processor) resolveNestedNzb(ctx context.Context, parsed *parser.Pars
 	var archives []parser.ParsedFile
 	var total int64
 	for _, file := range parsed.Files {
+		// Respect an archive type already recognized by the existing detector,
+		// even when the poster's filename misleadingly ends in .zip.
+		if file.Is7zArchive {
+			return nil, nil
+		}
 		if file.IsRarArchive || strings.EqualFold(filepath.Ext(file.Filename), ".zip") {
 			archives = append(archives, file)
 			total += file.Size
@@ -80,8 +86,9 @@ func nestedNzbSidecar(name string) bool {
 // archive paths onto disk and refuses to choose between multiple NZBs.
 func readNestedNzb(ctx context.Context, source fs.FS, archives []parser.ParsedFile, password string) ([]byte, error) {
 	type candidate struct {
-		name string
-		open func() (io.ReadCloser, error)
+		name     string
+		open     func() (io.ReadCloser, error)
+		oversize bool
 	}
 	var candidates []candidate
 	var rarFiles []parser.ParsedFile
@@ -95,7 +102,7 @@ func readNestedNzb(ctx context.Context, source fs.FS, archives []parser.ParsedFi
 		}
 		f, err := source.Open(file.Filename)
 		if err != nil {
-			return nil, err
+			return nil, nestedProbeError(ctx, err)
 		}
 		defer f.Close()
 		ra, ok := f.(io.ReaderAt)
@@ -104,17 +111,14 @@ func readNestedNzb(ctx context.Context, source fs.FS, archives []parser.ParsedFi
 		}
 		zr, err := zip.NewReader(ra, file.Size)
 		if err != nil {
-			return nil, err
+			return nil, nestedProbeError(ctx, err)
 		}
 		for _, entry := range zr.File {
 			if entry.FileInfo().IsDir() {
 				continue
 			}
 			if nzbtrim.HasNzbExtension(entry.Name) {
-				if entry.UncompressedSize64 > maxNestedNzbSize {
-					return nil, NewNonRetryableError("embedded NZB exceeds size limit", nil)
-				}
-				candidates = append(candidates, candidate{entry.Name, entry.Open})
+				candidates = append(candidates, candidate{name: entry.Name, open: entry.Open, oversize: entry.UncompressedSize64 > maxNestedNzbSize})
 			} else if !nestedNzbSidecar(entry.Name) {
 				return nil, nil
 			}
@@ -140,24 +144,22 @@ func readNestedNzb(ctx context.Context, source fs.FS, archives []parser.ParsedFi
 			rardecode.TolerateVolumeTailError(usenet.IsArticleNotFound))
 		entries, err := rardecode.List(first, listOpts...)
 		if err != nil {
-			return nil, err
+			return nil, nestedProbeError(ctx, err)
 		}
 		for _, entry := range entries {
 			if entry.IsDir {
 				continue
 			}
 			if nzbtrim.HasNzbExtension(entry.Name) {
-				if entry.UnPackedSize > maxNestedNzbSize {
-					return nil, NewNonRetryableError("embedded NZB exceeds size limit", nil)
-				}
+				oversize := entry.UnPackedSize > maxNestedNzbSize
 				// Opening the indexed file follows its packed offsets across
 				// volumes. Solid entries need the preceding decoder state.
 				if !entry.Solid {
-					candidates = append(candidates, candidate{entry.Name, entry.Open})
+					candidates = append(candidates, candidate{name: entry.Name, open: entry.Open, oversize: oversize})
 					continue
 				}
 				name := entry.Name
-				candidates = append(candidates, candidate{name, func() (io.ReadCloser, error) {
+				candidates = append(candidates, candidate{name: name, oversize: oversize, open: func() (io.ReadCloser, error) {
 					r, err := rardecode.OpenReader(first, opts...)
 					if err != nil {
 						return nil, err
@@ -194,6 +196,11 @@ func readNestedNzb(ctx context.Context, source fs.FS, archives []parser.ParsedFi
 		return nil, NewNonRetryableError("archive contains multiple NZBs; cannot select a release", nil)
 	}
 	c := candidates[0]
+	// Validate payload limits only after all entries have confirmed this is
+	// an NZB wrapper, rather than an ordinary archive with an NZB sidecar.
+	if c.oversize {
+		return nil, NewNonRetryableError("embedded NZB exceeds size limit", nil)
+	}
 	r, err := c.open()
 	if err != nil {
 		return nil, err
@@ -222,6 +229,31 @@ func readNestedNzb(ctx context.Context, source fs.FS, archives []parser.ParsedFi
 		return nil, NewNonRetryableError("embedded NZB contains no files", nil)
 	}
 	return data, nil
+}
+
+// Conclusive format errors leave normal archive group isolation and repair
+// handling in charge. Transport failures must remain retryable: treating a
+// temporarily unreadable wrapper as media could permanently reject it.
+func nestedProbeError(ctx context.Context, err error) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if rar.IsCorruptionError(err) {
+		return nil
+	}
+	for _, structural := range []error{
+		zip.ErrFormat, fs.ErrNotExist, rardecode.ErrNoSig,
+		rardecode.ErrBadVolumeNumber, rardecode.ErrVerMismatch,
+		rardecode.ErrNoArchiveBlock, rardecode.ErrInvalidHeaderOff,
+		rardecode.ErrUnknownVersion, rardecode.ErrUnknownDecoder,
+		rardecode.ErrUnsupportedDecoder, rardecode.ErrBadPassword,
+		rardecode.ErrArchiveEncrypted,
+	} {
+		if errors.Is(err, structural) {
+			return nil
+		}
+	}
+	return err
 }
 
 func readNestedNzbBytes(r io.Reader) ([]byte, error) {

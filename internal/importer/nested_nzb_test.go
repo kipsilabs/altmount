@@ -5,7 +5,10 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/binary"
+	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"io/fs"
 	"os"
@@ -27,7 +30,13 @@ func nestedZip(t *testing.T, entries map[string][]byte) []byte {
 	t.Helper()
 	var buf bytes.Buffer
 	w := zip.NewWriter(&buf)
-	for name, data := range entries {
+	var names []string
+	for name := range entries {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		data := entries[name]
 		f, err := w.Create(name)
 		if err != nil {
 			t.Fatal(err)
@@ -143,6 +152,10 @@ func TestReadNestedNzbZip(t *testing.T) {
 		{"oversize", map[string][]byte{"release.nzb": bytes.Repeat([]byte("x"), maxNestedNzbSize+1)}, "size limit", false},
 		{"ordinary", map[string][]byte{"Movie.mkv": []byte("media")}, "", false},
 		{"mixed", map[string][]byte{"Movie.mkv": []byte("media"), "release.nzb": inner}, "", false},
+		{"mixed-invalid", map[string][]byte{"a.nzb": []byte("not XML"), "z.mkv": []byte("media")}, "", false},
+		{"mixed-oversize", map[string][]byte{"a.nzb": bytes.Repeat([]byte("x"), maxNestedNzbSize+1), "z.mkv": []byte("media")}, "", false},
+		{"sidecars-only", map[string][]byte{"release.nfo": []byte("info"), "release.txt": inner}, "", false},
+		{"misleading-name", map[string][]byte{"release.nzb.txt": inner}, "", false},
 		// The archive filename is read as data; it is never used as an output path.
 		{"path", map[string][]byte{"../../release.nzb": inner}, "", true},
 	} {
@@ -164,6 +177,154 @@ func TestReadNestedNzbZip(t *testing.T) {
 				t.Fatal("resolved NZB changed")
 			}
 		})
+	}
+}
+
+func TestNestedNzbProbePreservesHealthyRarWithCorruptSibling(t *testing.T) {
+	for _, extension := range []string{"rar", "zip"} {
+		t.Run(extension, func(t *testing.T) {
+			e := newBatteryEnv(t)
+			var files []nzbbuild.File
+			for _, tc := range []struct {
+				name string
+				data []byte
+			}{
+				{"z-healthy.rar", loadFixture(t, "rar_single/archive.rar")},
+				{"a-corrupt." + extension, []byte("not an archive")},
+			} {
+				files = append(files, nzbbuild.File{Subject: tc.name, Segments: e.registerContent(tc.name, tc.data, archivePartSize, 1, &nntppool.YEncMeta{FileName: tc.name, FileSize: int64(len(tc.data))})})
+			}
+			_, written, err := e.runImport(nzbbuild.Build(files...), "Healthy.Release")
+			if err != nil {
+				t.Fatalf("healthy RAR import was blocked by corrupt sibling: %v", err)
+			}
+			if len(filePaths(written)) != 1 {
+				t.Fatalf("written = %v", written)
+			}
+		})
+	}
+}
+
+func TestNestedNzbProbeSkipsOtherDetectors(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		files []parser.ParsedFile
+	}{
+		{"video", []parser.ParsedFile{{Filename: "Movie.mkv"}}},
+		{"audio", []parser.ParsedFile{{Filename: "Album.flac"}}},
+		{"iso", []parser.ParsedFile{{Filename: "Movie.iso"}}},
+		{"strm", []parser.ParsedFile{{Filename: "Movie.strm"}}},
+		{"7z", []parser.ParsedFile{{Filename: "release.7z", Is7zArchive: true}}},
+		{"7z-with-zip-name", []parser.ParsedFile{{Filename: "release.zip", Is7zArchive: true}}},
+		{"multipart-mkv", []parser.ParsedFile{{Filename: "Movie.mkv.001"}, {Filename: "Movie.mkv.002"}}},
+		{"direct-nzb", []parser.ParsedFile{{Filename: "release.nzb"}}},
+		{"mixed-post", []parser.ParsedFile{{Filename: "wrapper.zip"}, {Filename: "Movie.mkv"}}},
+		{"large-rar", []parser.ParsedFile{{Filename: "Movie.rar", IsRarArchive: true, Size: maxNestedArchiveSize + 1}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// No parser, configuration or provider is available: skipping another
+			// detector must require no archive or network work.
+			proc := &Processor{}
+			data, err := proc.resolveNestedNzb(context.Background(), &parser.ParsedNzb{Files: tc.files})
+			if err != nil || data != nil {
+				t.Fatalf("detector intercepted: data present = %v, error = %v", data != nil, err)
+			}
+		})
+	}
+}
+
+type nestedReadFailureFS struct {
+	dir string
+	err error
+}
+
+func (s nestedReadFailureFS) Open(name string) (fs.File, error) {
+	f, err := os.Open(filepath.Join(s.dir, name))
+	if err != nil {
+		return nil, err
+	}
+	return &nestedReadFailureFile{File: f, err: s.err}, nil
+}
+
+type nestedReadFailureFile struct {
+	*os.File
+	err error
+}
+
+func (f *nestedReadFailureFile) Read([]byte) (int, error)          { return 0, f.err }
+func (f *nestedReadFailureFile) ReadAt([]byte, int64) (int, error) { return 0, f.err }
+
+func TestNestedNzbProbePreservesTransientReadErrors(t *testing.T) {
+	for _, format := range []string{"rar", "zip"} {
+		for _, readErr := range []error{context.DeadlineExceeded, errors.New("temporary NNTP connection failure")} {
+			t.Run(format+"/"+readErr.Error(), func(t *testing.T) {
+				dir, name := "testdata/nested_nzb", "compressed.rar"
+				if format == "zip" {
+					dir, name = t.TempDir(), "wrapper.zip"
+					if err := os.WriteFile(filepath.Join(dir, name), nestedZip(t, map[string][]byte{"release.nzb": []byte("<nzb></nzb>")}), 0600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				st, err := os.Stat(filepath.Join(dir, name))
+				if err != nil {
+					t.Fatal(err)
+				}
+				data, err := readNestedNzb(context.Background(), nestedReadFailureFS{dir: dir, err: readErr}, []parser.ParsedFile{{Filename: name, Size: st.Size(), IsRarArchive: format == "rar"}}, "")
+				if !errors.Is(err, readErr) || data != nil || IsNonRetryable(err) {
+					t.Fatalf("transient error discarded or made permanent: %v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestNestedNzbProbePreservesMediaRarWithOversizedNzbSidecar(t *testing.T) {
+	e := newBatteryEnv(t)
+	// Build a stored RAR4 without an external RAR CLI. The NZB entry precedes
+	// media so a premature size check would reject the ordinary media archive.
+	var archive bytes.Buffer
+	archive.Write([]byte{'R', 'a', 'r', '!', 0x1a, 0x07, 0x00})
+	header := func(kind byte, flags uint16, body []byte) {
+		data := make([]byte, 7+len(body))
+		data[2] = kind
+		binary.LittleEndian.PutUint16(data[3:5], flags)
+		binary.LittleEndian.PutUint16(data[5:7], uint16(len(data)))
+		copy(data[7:], body)
+		binary.LittleEndian.PutUint16(data[:2], uint16(crc32.ChecksumIEEE(data[2:])))
+		archive.Write(data)
+	}
+	header(0x73, 0, make([]byte, 6))
+	for _, entry := range []struct {
+		name string
+		data []byte
+	}{
+		{"a.nzb", bytes.Repeat([]byte("x"), maxNestedNzbSize+1)},
+		{"z.mkv", bytes.Repeat([]byte("M"), 1024)},
+	} {
+		body := make([]byte, 25)
+		binary.LittleEndian.PutUint32(body[:4], uint32(len(entry.data)))
+		binary.LittleEndian.PutUint32(body[4:8], uint32(len(entry.data)))
+		body[8] = 3 // Unix
+		binary.LittleEndian.PutUint32(body[9:13], crc32.ChecksumIEEE(entry.data))
+		body[17], body[18] = 20, 0x30 // RAR 2.0, stored
+		binary.LittleEndian.PutUint16(body[19:21], uint16(len(entry.name)))
+		binary.LittleEndian.PutUint32(body[21:25], 0o100644)
+		header(0x74, 0x8000, append(body, entry.name...))
+		archive.Write(entry.data)
+	}
+	header(0x7b, 0, nil)
+	payload := archive.Bytes()
+	outer := nzbbuild.Build(nzbbuild.File{Subject: "mixed.rar", Segments: e.registerContent("mixed-media", payload, archivePartSize, 1, &nntppool.YEncMeta{FileName: "mixed.rar", FileSize: int64(len(payload))})})
+	_, written, err := e.runImport(outer, "Mixed.Release")
+	if err != nil {
+		t.Fatalf("media RAR mistaken for NZB wrapper: %v", err)
+	}
+	paths := filePaths(written)
+	if len(paths) != 1 || !strings.HasSuffix(paths[0], ".mkv") {
+		t.Fatalf("written = %v", written)
+	}
+	if m := e.readMeta(paths[0]); m.FileSize != 1024 {
+		t.Fatalf("media size = %d, want 1024", m.FileSize)
 	}
 }
 
