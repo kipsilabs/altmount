@@ -2,6 +2,7 @@ package validation
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -44,7 +45,7 @@ func FastFailReleaseProbeVerdict(
 	timeout time.Duration,
 	patchIdx PatchIndex,
 	articleDate time.Time,
-) (ProbeVerdict, error) {
+) (verdict ProbeVerdict, err error) {
 	var segments []*metapb.SegmentData
 	for _, file := range files {
 		for _, segment := range file.Segments {
@@ -77,9 +78,19 @@ func FastFailReleaseProbeVerdict(
 		maxConnections = 1
 	}
 
-	// Cap each attempt's probe timeout to 2 seconds per item so dead releases
-	// stay bounded.
+	// Keep the first attempt cheap, but let retries use the validation timeout
+	// so a slow provider miss can still fall through to a retained provider.
+	// Both waves share one wall-clock budget, including attempts and backoff.
 	probeTimeout := min(timeout, 2*time.Second)
+	probeCtx, cancelProbe := context.WithTimeout(ctx, fastFailStatBudget)
+	defer cancelProbe()
+	defer func() {
+		// Expiring our own budget is inconclusive; caller cancellation remains
+		// a caller error and must not be turned into an availability verdict.
+		if err != nil && ctx.Err() == nil && probeCtx.Err() != nil && !errors.Is(err, ErrFastFailInconclusive) {
+			err = fmt.Errorf("%w: %w", ErrFastFailInconclusive, err)
+		}
+	}()
 
 	ids := make([]string, len(selected))
 	for i, seg := range selected {
@@ -92,7 +103,7 @@ func FastFailReleaseProbeVerdict(
 
 	// The first wave is swept to completion, not cancelled on the first miss:
 	// its misses are counted to tell a dead post from a damaged one.
-	missing, unverified, err := statIDsWithBoundedRetries(ctx, usenetPool, first, maxConnections, probeTimeout, false, patchIdx, articleDate)
+	missing, unverified, err := statIDsWithBoundedRetries(probeCtx, usenetPool, first, maxConnections, timeout, probeTimeout, false, patchIdx, articleDate)
 	if err != nil && len(missing) == 0 {
 		return ProbeVerdict{}, err
 	}
@@ -110,7 +121,7 @@ func FastFailReleaseProbeVerdict(
 		return ProbeVerdict{}, nil
 	}
 
-	missing, _, err = statIDsWithBoundedRetries(ctx, usenetPool, rest, maxConnections, probeTimeout, true, patchIdx, articleDate)
+	missing, _, err = statIDsWithBoundedRetries(probeCtx, usenetPool, rest, maxConnections, timeout, probeTimeout, true, patchIdx, articleDate)
 	if err != nil {
 		if len(missing) > 0 {
 			// A definitive miss before running out of patience for the rest;

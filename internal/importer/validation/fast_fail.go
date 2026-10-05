@@ -8,11 +8,11 @@ import (
 	"math/rand"
 	"time"
 
+	"github.com/javi11/nntppool/v5"
 	"github.com/kipsilabs/altmount/internal/holes"
 	metapb "github.com/kipsilabs/altmount/internal/metadata/proto"
 	"github.com/kipsilabs/altmount/internal/pool"
 	"github.com/kipsilabs/altmount/internal/progress"
-	"github.com/javi11/nntppool/v5"
 )
 
 const (
@@ -46,12 +46,14 @@ func isDefinitiveFastFailMiss(err error) bool {
 // retried. The returned map
 // contains only definitive misses. When stopOnMissing is true the first such
 // miss ends the sweep, preserving the release probe's fast-fail behavior.
+// firstAttemptTimeout bounds the initial attempt; retries use timeout, with
+// every attempt and backoff bounded by the sweep's wall-clock budget.
 func statIDsWithBoundedRetries(
 	ctx context.Context,
 	client pool.NntpClient,
 	ids []string,
 	maxConnections int,
-	timeout time.Duration,
+	timeout, firstAttemptTimeout time.Duration,
 	stopOnMissing bool,
 	patchIdx PatchIndex,
 	articleDate time.Time,
@@ -70,8 +72,14 @@ func statIDsWithBoundedRetries(
 	var lastErr error
 
 	sweepStart := time.Now()
+	sweepCtx, cancelSweep := context.WithTimeout(ctx, fastFailStatBudget)
+	defer cancelSweep()
 	for attempt := 1; len(remaining) > 0; attempt++ {
-		statCtx, cancel := context.WithTimeout(ctx, pool.StatManyTimeout(len(remaining), maxConnections, timeout))
+		attemptTimeout := timeout
+		if attempt == 1 {
+			attemptTimeout = firstAttemptTimeout
+		}
+		statCtx, cancel := context.WithTimeout(sweepCtx, pool.StatManyTimeout(len(remaining), maxConnections, attemptTimeout))
 		reported := make(map[string]bool, len(remaining))
 		transient := make(map[string]error, len(remaining))
 		definitive := 0
@@ -153,7 +161,7 @@ func statIDsWithBoundedRetries(
 			return missing, remaining, fmt.Errorf("%w: %d segment(s) left unverified once %d misses condemned the release",
 				ErrFastFailInconclusive, len(remaining), len(missing))
 		}
-		if stopOnMissing && len(missing) == 0 && len(remaining) <= tolerableUnverified(len(ids)) {
+		if sweepCtx.Err() == nil && stopOnMissing && len(missing) == 0 && len(remaining) <= tolerableUnverified(len(ids)) {
 			// The release probe answers "is this post damaged?" from a
 			// sample. With everything else healthy, an article whose STAT
 			// neither the original request nor the priority hedge could get
@@ -173,7 +181,7 @@ func statIDsWithBoundedRetries(
 		// behind more 430s (each one costs the provider a slow spool lookup), so
 		// waiting them out adds tens of seconds and changes nothing.
 		stalled := attempt >= fastFailStatMaxAttempts && !converging
-		overBudget := time.Since(sweepStart)+delay >= fastFailStatBudget
+		overBudget := sweepCtx.Err() != nil || time.Since(sweepStart)+delay >= fastFailStatBudget
 		if stalled || overBudget || releaseLooksDead(len(missing), len(ids)-len(remaining)) {
 			return missing, remaining, fmt.Errorf("%w: %d segment(s) remained unverified after %d attempts: %w",
 				ErrFastFailInconclusive, len(remaining), attempt, lastErr)
@@ -187,9 +195,12 @@ func statIDsWithBoundedRetries(
 		)
 		timer := time.NewTimer(delay)
 		select {
-		case <-ctx.Done():
+		case <-sweepCtx.Done():
 			timer.Stop()
-			return nil, nil, ctx.Err()
+			if ctx.Err() != nil {
+				return nil, nil, ctx.Err()
+			}
+			return missing, remaining, fmt.Errorf("%w: %w", ErrFastFailInconclusive, sweepCtx.Err())
 		case <-timer.C:
 		}
 	}
@@ -579,7 +590,7 @@ func FastFailCheckFiles(
 			ids[i] = job.segID
 		}
 
-		missingByID, unverified, err := statIDsWithBoundedRetries(ctx, usenetPool, ids, maxConnections, timeout, false, patchIdx, articleDate)
+		missingByID, unverified, err := statIDsWithBoundedRetries(ctx, usenetPool, ids, maxConnections, timeout, timeout, false, patchIdx, articleDate)
 		if err != nil && !errors.Is(err, ErrFastFailInconclusive) {
 			return nil, err
 		}
