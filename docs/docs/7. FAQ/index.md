@@ -31,6 +31,14 @@ See the [Import Strategy Comparison](../3.%20Configuration/integration.md#import
 
 ## Troubleshooting
 
+### Can an NZB point to a compressed archive containing another NZB?
+
+Yes. AltMount automatically resolves RAR or ZIP wrapper posts containing one `.nzb` or `.nzb.gz`, then imports the release described by that NZB. The wrapper is read and decompressed during import; the final release uses normal streaming. The original queue item, category, and download ID are retained for Sonarr/Radarr.
+
+Wrapper posts may include `.nfo`, `.txt`, `.sfv`, `.srr`, or `.par2` sidecars. Archives containing media or other payloads use the normal import path. RAR passwords are read from the NZB's existing password metadata or filename conventions; encrypted ZIPs are unsupported.
+
+Automatic resolution is limited to 32 MiB of archive volumes per level, an 8 MiB extracted NZB, and four wrapper levels. Multiple embedded NZBs, invalid NZBs, and cycles fail the import. This feature does not enable streaming compressed media files.
+
 ### Why are my imports stuck in purple?
 
 Imports stuck in purple/processing state are usually caused by:

@@ -1,7 +1,9 @@
 package importer
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -940,65 +942,99 @@ func (proc *Processor) ProcessNzbFile(ctx context.Context, filePath, relativePat
 		if len(n.Files) == 0 {
 			return "", nil, NewNonRetryableError("NZB file contains no files", nil)
 		}
-
-		parser.SanitizeNzbFilenames(n)
-
-		// Articles the NZB never listed become sized placeholders, so later
-		// bytes keep their offsets and the gaps are served as holes. Done
-		// before the fast-fail sweep so those known misses count without a
-		// STAT and before the store is built so they hold a store index.
-		if gaps := parser.InsertSegmentGapPlaceholders(n); gaps > 0 && proc.log != nil {
-			proc.log.InfoContext(ctx, "NZB omits articles; inserted gap placeholders",
-				"placeholders", gaps, "file_path", filePath)
+		// Resolution atomically replaces this path; release the original handle
+		// first so the replacement works on Windows as well.
+		if err := file.Close(); err != nil {
+			return "", nil, fmt.Errorf("failed to close NZB file: %w", err)
 		}
 
-		// Pre-parse Stat check. The first-segment fetch the parse pass needs
-		// runs alongside it: on a healthy release, the common case, that
-		// hides the shorter of the two behind the longer; on a failed check
-		// the warm-up is cancelled and its cost is a few early 430s.
-		proc.updateProgressWithStage(queueID, 0, "Checking segment availability")
-		warmCtx, cancelWarm := context.WithCancel(ctx)
-		warmDone := make(chan struct{})
-		go func() {
-			defer close(warmDone)
-			proc.parser.WarmFirstSegments(warmCtx, n.Files)
-		}()
-		var fastFailErr error
-		brokenIdx, missingIDs, degradedFiles, fastFailErr = proc.preParseFastFail(ctx, n, cfg, queueID, category, downloadID)
-		if fastFailErr != nil {
+		seen := make(map[[32]byte]struct{})
+		for depth := 0; ; depth++ {
+			parser.SanitizeNzbFilenames(n)
+
+			// Articles the NZB never listed become sized placeholders, so later
+			// bytes keep their offsets and the gaps are served as holes. Done
+			// before the fast-fail sweep so those known misses count without a
+			// STAT and before the store is built so they hold a store index.
+			if gaps := parser.InsertSegmentGapPlaceholders(n); gaps > 0 && proc.log != nil {
+				proc.log.InfoContext(ctx, "NZB omits articles; inserted gap placeholders",
+					"placeholders", gaps, "file_path", filePath)
+			}
+
+			// Pre-parse Stat check. The first-segment fetch the parse pass needs
+			// runs alongside it: on a healthy release, the common case, that
+			// hides the shorter of the two behind the longer; on a failed check
+			// the warm-up is cancelled and its cost is a few early 430s.
+			proc.updateProgressWithStage(queueID, 0, "Checking segment availability")
+			warmCtx, cancelWarm := context.WithCancel(ctx)
+			warmDone := make(chan struct{})
+			go func() {
+				defer close(warmDone)
+				proc.parser.WarmFirstSegments(warmCtx, n.Files)
+			}()
+			var fastFailErr error
+			brokenIdx, missingIDs, degradedFiles, fastFailErr = proc.preParseFastFail(ctx, n, cfg, queueID, category, downloadID)
+			if fastFailErr != nil {
+				cancelWarm()
+			}
+			<-warmDone
 			cancelWarm()
-		}
-		<-warmDone
-		cancelWarm()
-		if fastFailErr != nil {
-			// A deferral is not a failure: propagate it so the service parks
-			// the queue item pending the repair. Checked before the
-			// inconclusive branch, which returns a hard error.
-			var deferred *DeferredRepairError
-			if errors.As(fastFailErr, &deferred) {
-				proc.queueNzbRepair(ctx, filePath, deferred.FirstMissingSegmentID)
-				return "", nil, fastFailErr
+			if fastFailErr != nil {
+				// A deferral is not a failure: propagate it so the service parks
+				// the queue item pending the repair. Checked before the
+				// inconclusive branch, which returns a hard error.
+				var deferred *DeferredRepairError
+				if errors.As(fastFailErr, &deferred) {
+					proc.queueNzbRepair(ctx, filePath, deferred.FirstMissingSegmentID)
+					return "", nil, fastFailErr
+				}
+				if errors.Is(fastFailErr, validation.ErrFastFailInconclusive) {
+					return "", nil, fmt.Errorf("fast-fail segment check inconclusive: %w", fastFailErr)
+				}
+				return "", nil, NewNonRetryableError("fast-fail segment check failed", fastFailErr)
 			}
-			if errors.Is(fastFailErr, validation.ErrFastFailInconclusive) {
-				return "", nil, fmt.Errorf("fast-fail segment check inconclusive: %w", fastFailErr)
+
+			parseTracker := progress.NewTracker(proc.broadcaster, queueID, 2, 10)
+			parsed, err = proc.parser.ParseNzb(ctx, n, filePath, parseTracker, parser.ParseOptions{
+				BrokenFileIndexes:      brokenIdx,
+				KnownMissingSegmentIDs: missingIDs,
+			})
+			if err != nil {
+				return "", nil, NewNonRetryableError("failed to parse NZB file", err)
 			}
-			return "", nil, NewNonRetryableError("fast-fail segment check failed", fastFailErr)
-		}
 
-		parseTracker := progress.NewTracker(proc.broadcaster, queueID, 2, 10)
-		parsed, err = proc.parser.ParseNzb(ctx, n, filePath, parseTracker, parser.ParseOptions{
-			BrokenFileIndexes:      brokenIdx,
-			KnownMissingSegmentIDs: missingIDs,
-		})
-		if err != nil {
-			return "", nil, NewNonRetryableError("failed to parse NZB file", err)
-		}
+			// Validate the parsed NZB
+			if err := proc.parser.ValidateNzb(parsed); err != nil {
+				return "", nil, NewNonRetryableError("NZB validation failed", err)
+			}
+			degradedFiles = mergeDegradedFiles(degradedFiles, parsed.DegradedFiles)
 
-		// Validate the parsed NZB
-		if err := proc.parser.ValidateNzb(parsed); err != nil {
-			return "", nil, NewNonRetryableError("NZB validation failed", err)
+			inner, resolveErr := proc.resolveNestedNzb(ctx, parsed)
+			if resolveErr != nil {
+				return "", nil, fmt.Errorf("failed to resolve embedded NZB: %w", resolveErr)
+			}
+			if inner == nil {
+				break
+			}
+			if depth >= maxNestedNzbDepth {
+				return "", nil, NewNonRetryableError("embedded NZB nesting limit exceeded", nil)
+			}
+			hash := sha256.Sum256(inner)
+			if _, exists := seen[hash]; exists {
+				return "", nil, NewNonRetryableError("embedded NZB cycle detected", nil)
+			}
+			seen[hash] = struct{}{}
+			n, err = nzbparser.Parse(bytes.NewReader(inner))
+			if err != nil {
+				return "", nil, NewNonRetryableError("failed to parse embedded NZB", err)
+			}
+			if err := persistNestedNzb(filePath, inner); err != nil {
+				return "", nil, fmt.Errorf("failed to persist embedded NZB: %w", err)
+			}
+			// Wrapper extraction metadata describes the wrapper, not the release.
+			extractedFiles = nil
+			proc.updateProgressWithStage(queueID, 0, "Resolving embedded NZB")
 		}
-		degradedFiles = mergeDegradedFiles(degradedFiles, parsed.DegradedFiles)
 	}
 
 	// Attach extracted files metadata if available (optimization)
