@@ -588,12 +588,8 @@ func (hw *HealthWorker) prepareUpdateForResult(ctx context.Context, fh *database
 				"total_missing", event.Classification.TotalMissing,
 				"longest_run", event.Classification.LongestRun,
 				"next_check", nextCheck)
-			// Degraded damage is exactly what background PAR2 repair exists
-			// for: attempt to restore the zero-filled bytes byte-exact. The
-			// repair queue dedups; ARR replacement stays out of the picture.
-			if hw.par2Repair != nil {
-				hw.par2Repair.Enqueue(ctx, fh.FilePath, "")
-			}
+			// PAR2 is queued after the degraded health update is committed,
+			// so a fast repair outcome cannot be overwritten by this cycle.
 			return hw.metadataService.UpdateFileStatus(fh.FilePath, metapb.FileStatus_FILE_STATUS_DEGRADED)
 		}
 		return update, sideEffect
@@ -966,6 +962,7 @@ func (hw *HealthWorker) performDirectCheck(ctx context.Context, filePath string,
 		if err := hw.healthRepo.UpdateHealthStatusBulk(ctx, []database.HealthStatusUpdate{*updatePtr}); err != nil {
 			return fmt.Errorf("failed to update health status: %w", err)
 		}
+		hw.enqueueDegradedRepair(ctx, *updatePtr)
 		hw.broadcastHealthChanged()
 	}
 
@@ -1219,6 +1216,10 @@ func (hw *HealthWorker) runHealthCheckCycle(ctx context.Context) error {
 	if len(results) > 0 {
 		if err := hw.healthRepo.UpdateHealthStatusBulk(ctx, results); err != nil {
 			slog.ErrorContext(ctx, "Failed to perform bulk health status update", "error", err)
+		} else {
+			for _, result := range results {
+				hw.enqueueDegradedRepair(ctx, result)
+			}
 		}
 		hw.broadcastHealthChanged()
 	}
@@ -1505,6 +1506,23 @@ func (hw *HealthWorker) retriggerFileRepair(ctx context.Context, item *database.
 
 	slog.InfoContext(ctx, "Successfully re-triggered ARR rescan", "file_path", filePath)
 	return repairOutcomeTriggered, nil
+}
+
+// enqueueDegradedRepair runs only after the health update is committed, so an
+// immediate PAR2 verdict cannot be overwritten by a stale degraded write.
+func (hw *HealthWorker) enqueueDegradedRepair(ctx context.Context, result database.HealthStatusUpdate) {
+	if hw.par2Repair == nil || result.Skip || result.Type != database.UpdateTypeDegraded {
+		return
+	}
+	// A guarded update may have skipped a concurrently rescued file.
+	latest, err := hw.healthRepo.GetFileHealth(ctx, result.FilePath)
+	if err != nil {
+		slog.ErrorContext(ctx, "Failed to read degraded file before PAR2 repair", "file_path", result.FilePath, "error", err)
+		return
+	}
+	if latest != nil && latest.Status == database.HealthStatusDegraded {
+		hw.par2Repair.Enqueue(ctx, result.FilePath, "")
+	}
 }
 
 // enqueuePar2Fallback queues a PAR2 repair for a file whose ARR repair came up

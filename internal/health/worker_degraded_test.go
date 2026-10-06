@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kipsilabs/altmount/internal/config"
 	"github.com/kipsilabs/altmount/internal/database"
 	"github.com/kipsilabs/altmount/internal/holes"
 	metapb "github.com/kipsilabs/altmount/internal/metadata/proto"
@@ -90,3 +91,43 @@ func TestPrepareUpdateForResultDegraded(t *testing.T) {
 		assert.Equal(t, database.UpdateTypeRetry, update.Type)
 	})
 }
+
+// A repair can fail immediately (e.g. no PAR2 files). Its verdict must land
+// after the health check's degraded write, so that write cannot undo it.
+func TestDegradedRepairEnqueuedAfterHealthUpdate(t *testing.T) {
+	for _, mode := range []string{"batch", "direct"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx := context.Background()
+			holesEnv := newHoleTestEnv(t, "movie.mp4", 128*1024, 1024)
+			holesEnv.cfg.Health.AcceptableMissingSegmentsPercentage = 2
+			holesEnv.markSegmentMissing(10)
+			env := newRepairTestEnv(t, t.TempDir(), nil)
+			env.hw.healthChecker = holesEnv.checker
+			env.hw.metadataService = holesEnv.ms
+			env.hw.configGetter = func() *config.Config { return holesEnv.cfg }
+			require.NoError(t, env.healthRepo.UpdateFileHealth(ctx, holesEnv.filePath, database.HealthStatusPending, nil, nil, nil, false))
+			called := false
+			env.hw.SetPar2RepairEnqueuer(par2EnqueueFunc(func(ctx context.Context, path, _ string) {
+				called = true
+				got, err := env.healthRepo.GetFileHealth(ctx, path)
+				require.NoError(t, err)
+				require.Equal(t, database.HealthStatusDegraded, got.Status, "persist degraded before PAR2 can finish")
+				reason := "no PAR2 files"
+				require.NoError(t, env.healthRepo.RecordPar2RepairFailure(ctx, path, reason, true))
+			}))
+			if mode == "direct" {
+				require.NoError(t, env.hw.performDirectCheck(ctx, holesEnv.filePath, database.HealthStatusPending, nil))
+			} else {
+				require.NoError(t, env.hw.runHealthCheckCycle(ctx))
+			}
+			require.True(t, called)
+			got, err := env.healthRepo.GetFileHealth(ctx, holesEnv.filePath)
+			require.NoError(t, err)
+			require.Equal(t, database.HealthStatusRepairTriggered, got.Status, "PAR2 failure must survive the health cycle")
+		})
+	}
+}
+
+type par2EnqueueFunc func(context.Context, string, string)
+
+func (f par2EnqueueFunc) Enqueue(ctx context.Context, path, segment string) { f(ctx, path, segment) }
