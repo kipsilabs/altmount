@@ -19,6 +19,7 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/kipsilabs/altmount/internal/auth"
 	"github.com/kipsilabs/altmount/internal/database"
+	"github.com/kipsilabs/altmount/internal/httpclient"
 	"github.com/kipsilabs/altmount/internal/importer/parser/fileinfo"
 	"github.com/kipsilabs/altmount/internal/importer/utils/nzbtrim"
 	"github.com/javi11/nzbparser"
@@ -158,7 +159,11 @@ func (s *Server) handleNzbStreams(c *fiber.Ctx) error {
 	if nzbURL != "" {
 		// Download NZB from the provided URL
 		const maxNzbFetchSize = 100 * 1024 * 1024 // 100 MB
-		resp, err := http.Get(nzbURL)             //nolint:gosec // URL is provided by an authenticated caller
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, nzbURL, nil)
+		if err != nil {
+			return RespondBadRequest(c, "Invalid nzb_url", err.Error())
+		}
+		resp, err := httpclient.NewForExternal(cfg.Network, httpclient.LongTimeout).Do(req) //nolint:gosec // URL is provided by an authenticated caller
 		if err != nil {
 			return RespondBadRequest(c, "Failed to fetch NZB from URL", err.Error())
 		}

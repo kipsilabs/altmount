@@ -458,8 +458,9 @@ func (s *Server) handleSABnzbdAddUrl(c *fiber.Ctx) error {
 	if err != nil {
 		return s.writeSABnzbdErrorFiber(c, "Failed to build NZB download request")
 	}
-	req.Header.Set("User-Agent", s.configManager.GetConfig().GetUserAgent())
-	resp, err := httpclient.NewLong().Do(req)
+	cfg := s.configManager.GetConfig()
+	req.Header.Set("User-Agent", cfg.GetUserAgent())
+	resp, err := httpclient.NewForExternal(cfg.Network, httpclient.LongTimeout).Do(req)
 	if err != nil {
 		return s.writeSABnzbdErrorFiber(c, "Failed to download NZB from URL")
 	}
