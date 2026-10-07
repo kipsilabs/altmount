@@ -12,8 +12,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// A terminal PAR2 failure must hand a degraded imported file to the ARR
-// notification queue, without resetting or consuming either retry budget.
+// A terminal PAR2 failure keeps a degraded imported file playable unless ARR
+// replacement is enabled, without resetting or consuming either retry budget.
 func TestServiceFailedRepairQueuesArrReplacement(t *testing.T) {
 	for _, failure := range []struct {
 		name     string
@@ -37,7 +37,7 @@ func TestServiceFailedRepairQueuesArrReplacement(t *testing.T) {
 				for _, status := range []database.HealthStatus{database.HealthStatusDegraded, database.HealthStatusCorrupted} {
 					path := string(status) + ".mkv"
 					require.NoError(t, health.UpdateFileHealth(ctx, path, status, nil, nil, nil, false))
-					_, err = db.Connection().Exec(`UPDATE file_health SET retry_count=1, repair_retry_count=1, error_details='missing segments', library_path='/library/movie.mkv' WHERE file_path=?`, path)
+					_, err = db.Connection().Exec(`UPDATE file_health SET retry_count=1, repair_retry_count=1, error_details='missing segments', library_path='/library/movie.mkv', scheduled_check_at='2099-01-01 00:00:00' WHERE file_path=?`, path)
 					require.NoError(t, err)
 					s.Enqueue(ctx, path, "")
 					job, err := repo.ClaimNext(ctx, time.Now().UTC())
@@ -48,24 +48,31 @@ func TestServiceFailedRepairQueuesArrReplacement(t *testing.T) {
 					got, err := health.GetFileHealth(ctx, path)
 					require.NoError(t, err)
 					want := database.HealthStatusCorrupted
-					if enabled && status == database.HealthStatusDegraded {
-						want = database.HealthStatusRepairTriggered
+					if status == database.HealthStatusDegraded {
+						want = database.HealthStatusDegraded
+						if enabled {
+							want = database.HealthStatusRepairTriggered
+						}
 					}
 					require.Equal(t, want, got.Status)
+					if want == database.HealthStatusDegraded {
+						var scheduled time.Time
+						require.NoError(t, db.Connection().QueryRow(`SELECT scheduled_check_at FROM file_health WHERE file_path=?`, path).Scan(&scheduled))
+						require.Equal(t, time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC), scheduled,
+							"keep periodic health checks after failed repair")
+					}
+					if status == database.HealthStatusDegraded {
+						// Repeated failures must not condemn the playable original.
+						s.markFileUnrepairable(ctx, path, failure.err.Error())
+						latest, err := health.GetFileHealth(ctx, path)
+						require.NoError(t, err)
+						require.Equal(t, want, latest.Status)
+					}
 					require.Equal(t, 1, got.RetryCount)
 					require.Equal(t, 1, got.RepairRetryCount)
 					require.NotNil(t, got.LastError)
 					require.Contains(t, *got.LastError, failure.err.Error())
 					require.Equal(t, "/library/movie.mkv", *got.LibraryPath)
-					if want == database.HealthStatusRepairTriggered {
-						// Playback may enqueue another PAR2 job before the ARR
-						// notification sweep runs. Its verdict must not cancel
-						// the already queued replacement.
-						s.markFileUnrepairable(ctx, path, failure.err.Error())
-						got, err = health.GetFileHealth(ctx, path)
-						require.NoError(t, err)
-						require.Equal(t, database.HealthStatusRepairTriggered, got.Status)
-					}
 				}
 				due, err := health.GetFilesForRepairNotification(ctx, 10)
 				require.NoError(t, err)

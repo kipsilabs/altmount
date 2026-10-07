@@ -128,6 +128,11 @@ type Par2RepairConfig struct {
 	// files, playback holes and repair-on-import still repair via PAR2
 	// directly).
 	ArrFirst *bool `yaml:"arr_first" mapstructure:"arr_first" json:"arr_first,omitempty"`
+	// ArrReplacementOnFailure opts degraded files into ARR replacement after a
+	// failed PAR2 repair. Off by default: keep the playable file degraded and
+	// visible. Requires health.repair.enabled; an accepted ARR request can hide
+	// the original before a replacement imports.
+	ArrReplacementOnFailure bool `yaml:"arr_replacement_on_failure" mapstructure:"arr_replacement_on_failure" json:"arr_replacement_on_failure"`
 	// RepairOnImport queues a repair as soon as an import completes with
 	// confirmed missing segments, instead of waiting for the first playback or
 	// a health check. Off by default: every repair costs one full release

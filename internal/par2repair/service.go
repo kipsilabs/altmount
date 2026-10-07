@@ -22,7 +22,8 @@ import (
 // hot-reloads apply to the next job without a restart).
 type Config struct {
 	Enabled bool
-	// ArrRepairEnabled allows failed degraded-file repairs to fall back to ARR.
+	// ArrRepairEnabled is true when degraded-file replacement is opted into
+	// and automatic ARR repair is enabled.
 	ArrRepairEnabled  bool
 	MaxRepairRatio    float64
 	MaxMemoryMB       int
@@ -494,7 +495,8 @@ func (s *Service) deleteJob(ctx context.Context, id int64) {
 // markFileUnrepairable records why repair could not fix the file on its
 // health record, so the verdict survives the job row's deletion and the file
 // enters the ARR replacement queue when it was degraded and ARR repair is
-// enabled, or is finalized as corrupted otherwise. No-op for NZB-mode
+// enabled, or stays degraded otherwise. Files already corrupted retain that
+// verdict. No-op for NZB-mode
 // jobs (empty filePath): their verdict lands on the import queue entry.
 func (s *Service) markFileUnrepairable(ctx context.Context, filePath, reason string) {
 	if s.health == nil || filePath == "" {

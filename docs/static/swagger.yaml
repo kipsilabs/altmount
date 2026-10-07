@@ -1954,6 +1954,13 @@ definitions:
           files, playback holes and repair-on-import still repair via PAR2
           directly).
         type: boolean
+      arr_replacement_on_failure:
+        description: |-
+          ArrReplacementOnFailure opts degraded files into ARR replacement after a
+          failed PAR2 repair. Off by default: keep the playable file degraded and
+          visible. Requires health.repair.enabled; an accepted ARR request can hide
+          the original before a replacement imports.
+        type: boolean
       enabled:
         type: boolean
       max_concurrent_jobs:

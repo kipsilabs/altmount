@@ -84,9 +84,10 @@ func (r *HealthRepository) UpdateFileHealth(ctx context.Context, filePath string
 }
 
 // RecordPar2RepairFailure preserves the PAR2 verdict and hands degraded files
-// to the ARR notification queue when enabled. Selecting the previous status in
-// the upsert keeps this transition atomic and avoids re-arming corrupted files
-// whose ARR-first repair already failed. Retry budgets and library metadata
+// to the ARR notification queue when enabled, or keeps them degraded otherwise.
+// Selecting the previous status in the upsert keeps this transition atomic
+// and avoids re-arming corrupted files whose ARR-first repair already failed.
+// Retry budgets and library metadata
 // remain intact; the health worker owns ARR attempts and their side effects.
 func (r *HealthRepository) RecordPar2RepairFailure(ctx context.Context, filePath, reason string, arrRepairEnabled bool) error {
 	filePath = normalizeHealthPath(filePath)
@@ -97,10 +98,12 @@ func (r *HealthRepository) RecordPar2RepairFailure(ctx context.Context, filePath
 		    status = CASE
 		        WHEN file_health.status = 'repair_triggered' THEN 'repair_triggered'
 		        WHEN file_health.status = 'degraded' AND ? THEN 'repair_triggered'
+		        WHEN file_health.status = 'degraded' THEN 'degraded'
 		        ELSE 'corrupted' END,
 		    scheduled_check_at = CASE
 		        WHEN file_health.status = 'repair_triggered' THEN file_health.scheduled_check_at
 		        WHEN file_health.status = 'degraded' AND ? THEN datetime('now')
+		        WHEN file_health.status = 'degraded' THEN file_health.scheduled_check_at
 		        ELSE NULL END,
 		    last_error = excluded.last_error,
 		    last_checked = datetime('now'),

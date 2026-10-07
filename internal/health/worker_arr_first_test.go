@@ -160,7 +160,7 @@ func TestFailedPar2RepairUsesArrNotificationFlow(t *testing.T) {
 		wantCalls    int
 	}{
 		{name: "replacement accepted", enabled: true, wantStatus: database.HealthStatusRepairTriggered, wantAttempts: 1, wantCalls: 1},
-		{name: "repair disabled", wantStatus: database.HealthStatusCorrupted},
+		{name: "replacement disabled keeps degraded file", wantStatus: database.HealthStatusDegraded},
 		{name: "repair budget exhausted", enabled: true, exhausted: true, wantStatus: database.HealthStatusCorrupted, wantAttempts: 3},
 		{name: "ARR unavailable", enabled: true, arrErr: &starr.ReqError{Code: 503}, wantStatus: database.HealthStatusRepairTriggered, wantCalls: 1},
 		{name: "ARR path unmatched", enabled: true, arrErr: arrs.ErrPathMatchFailed, wantStatus: database.HealthStatusCorrupted, wantCalls: 1},
@@ -171,7 +171,9 @@ func TestFailedPar2RepairUsesArrNotificationFlow(t *testing.T) {
 			path := "movies/movie.mkv"
 			require.NoError(t, env.metadataService.WriteFileMetadata(path, validSegmentMeta(env.metadataService, 1024)))
 			require.NoError(t, env.healthRepo.UpdateFileHealth(ctx, path, database.HealthStatusDegraded, nil, nil, nil, false))
-			_, err := env.db.Exec(`UPDATE file_health SET library_path='/library/movie.mkv' WHERE file_path=?`, path)
+			// Keep routine health checks in the future so this cycle only tests
+			// the ARR handoff from a failed PAR2 repair.
+			_, err := env.db.Exec(`UPDATE file_health SET library_path='/library/movie.mkv', scheduled_check_at='2099-01-01 00:00:00' WHERE file_path=?`, path)
 			require.NoError(t, err)
 			if tc.exhausted {
 				_, err := env.db.Exec(`UPDATE file_health SET repair_retry_count=3 WHERE file_path=?`, path)

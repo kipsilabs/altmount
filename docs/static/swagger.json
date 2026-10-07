@@ -8373,6 +8373,10 @@
                     "description": "ArrFirst makes PAR2 repair the fallback for corrupted files: the health\nworker triggers the ARR rescan first exactly as before, and enqueues a\nPAR2 repair only when nothing is found in the ARRs (no instance\nconfigured, none tracks the file) or ARR repair is disabled. On by\ndefault; disable to keep PAR2 out of the corrupted-file flow (degraded\nfiles, playback holes and repair-on-import still repair via PAR2\ndirectly).",
                     "type": "boolean"
                 },
+                "arr_replacement_on_failure": {
+                    "description": "ArrReplacementOnFailure opts degraded files into ARR replacement after a\nfailed PAR2 repair. Off by default: keep the playable file degraded and\nvisible. Requires health.repair.enabled; an accepted ARR request can hide\nthe original before a replacement imports.",
+                    "type": "boolean"
+                },
                 "enabled": {
                     "type": "boolean"
                 },
