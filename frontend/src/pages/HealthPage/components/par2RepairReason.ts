@@ -14,6 +14,8 @@ export interface RepairReason {
 	summary: string;
 	/** What the user can do about it, when there is anything. */
 	hint?: string;
+	/** Recovery files are absent, so repeating this repair cannot help. */
+	unavailable?: boolean;
 	/** The raw backend error, always kept for support/debugging. */
 	detail: string;
 }
@@ -52,6 +54,14 @@ function percent(value: string): string {
 
 export function parseRepairReason(raw: string): RepairReason {
 	const { message, exhausted } = stripPrefixes(raw);
+	if (message === "no PAR2 files recorded for this release") {
+		return {
+			summary: "This NZB contains no PAR2 recovery files.",
+			hint: "Use an NZB with matching PAR2 files or replace the release.",
+			unavailable: true,
+			detail: raw,
+		};
+	}
 
 	// Not enough redundancy posted with the release.
 	const slices = message.match(/needs (\d+) recovery slices, set has (\d+)/);
