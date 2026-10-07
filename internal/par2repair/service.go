@@ -21,10 +21,7 @@ import (
 // Config is the repair policy snapshot the service reads per job (so config
 // hot-reloads apply to the next job without a restart).
 type Config struct {
-	Enabled bool
-	// ArrRepairEnabled is true when degraded-file replacement is opted into
-	// and automatic ARR repair is enabled.
-	ArrRepairEnabled  bool
+	Enabled           bool
 	MaxRepairRatio    float64
 	MaxMemoryMB       int
 	MaxConcurrentJobs int
@@ -74,7 +71,7 @@ type ImportResumer interface {
 // database.HealthRepository). Optional: nil skips health updates.
 type HealthStore interface {
 	UpdateFileHealth(ctx context.Context, filePath string, status database.HealthStatus, errorMessage *string, sourceNzbPath *string, errorDetails *string, noRetry bool) error
-	RecordPar2RepairFailure(ctx context.Context, filePath, reason string, arrRepairEnabled bool) error
+	RecordPar2RepairFailure(ctx context.Context, filePath, reason string) error
 }
 
 // MetadataSource reads file metadata and the shared NzbStore (satisfied by
@@ -493,16 +490,14 @@ func (s *Service) deleteJob(ctx context.Context, id int64) {
 }
 
 // markFileUnrepairable records why repair could not fix the file on its
-// health record, so the verdict survives the job row's deletion and the file
-// enters the ARR replacement queue when it was degraded and ARR repair is
-// enabled, or stays degraded otherwise. Files already corrupted retain that
-// verdict. No-op for NZB-mode
-// jobs (empty filePath): their verdict lands on the import queue entry.
+// health record. Degraded files stay playable; a PAR2 failure does not prove
+// their damage is fatal. No-op for NZB-mode jobs (empty filePath): their verdict
+// lands on the import queue entry.
 func (s *Service) markFileUnrepairable(ctx context.Context, filePath, reason string) {
 	if s.health == nil || filePath == "" {
 		return
 	}
-	if err := s.health.RecordPar2RepairFailure(ctx, filePath, reason, s.cfg().ArrRepairEnabled); err != nil {
+	if err := s.health.RecordPar2RepairFailure(ctx, filePath, reason); err != nil {
 		s.log.ErrorContext(ctx, "Failed to record unrepairable verdict on health record",
 			"error", err, "file", filePath)
 	}

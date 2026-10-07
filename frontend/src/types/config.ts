@@ -44,7 +44,6 @@ export interface Par2RepairConfig {
 	max_patch_store_mb?: number; // total patch-store size cap; 0 = unlimited
 	patch_dir?: string; // where patches + solver scratch live; empty = <metadata_root>/patches
 	arr_first?: boolean; // corrupted files: ARR repair first, PAR2 as fallback when the ARRs come up empty (default true)
-	arr_replacement_on_failure?: boolean; // replace degraded files after PAR2 fails (default false)
 	repair_on_import?: boolean; // queue a repair as soon as a damaged file imports
 }
 

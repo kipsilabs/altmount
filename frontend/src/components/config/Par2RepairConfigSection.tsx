@@ -34,7 +34,6 @@ const defaults: Par2RepairConfig = {
 	max_patch_store_mb: 0,
 	patch_dir: "",
 	arr_first: true,
-	arr_replacement_on_failure: false,
 	repair_on_import: false,
 };
 
@@ -119,25 +118,6 @@ export function Par2RepairConfigSection({
 					empty — no instance tracks the file, none is configured, or ARR repair is disabled — a
 					PAR2 repair is queued as the fallback instead of giving up. Degraded files and playback
 					holes always repair via PAR2 directly.
-				</p>
-			</fieldset>
-
-			<fieldset className="fieldset">
-				<legend className="fieldset-legend">ARR Replacement After PAR2 Failure</legend>
-				<label className="label cursor-pointer justify-start gap-3">
-					<input
-						type="checkbox"
-						className="toggle toggle-primary"
-						checked={data.arr_replacement_on_failure ?? false}
-						disabled={isReadOnly || !(data.enabled ?? false)}
-						onChange={(e) => handleChange("arr_replacement_on_failure", e.target.checked)}
-					/>
-					<span className="label-text">Replace degraded files when PAR2 repair fails</span>
-				</label>
-				<p className="label whitespace-normal">
-					Off by default: failed PAR2 repairs keep playable files degraded and visible. Enabling
-					this also requires automatic ARR repair. ARR can remove the original before a replacement
-					imports, even if its search finds nothing.
 				</p>
 			</fieldset>
 

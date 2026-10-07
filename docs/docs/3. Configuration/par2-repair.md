@@ -21,13 +21,12 @@ par2_repair:
   max_concurrent_jobs: 1   # simultaneous repair jobs
   max_patch_store_mb: 0    # total patch-store size cap; 0 = unlimited
   repair_on_import: false  # queue a repair as soon as a damaged file imports
-  arr_replacement_on_failure: false  # keep degraded files visible if PAR2 fails
 ```
 
 - **`max_repair_ratio`** — defaults to the same 2% byte-ratio the streaming zero-fill policy tolerates, so everything watchable becomes byte-exact. Raise it (e.g. `0.10`) to save more heavily damaged files instead of letting ARR replacement handle them. The release's PAR2 redundancy is always the hard ceiling: damage beyond the posted recovery slices is unrepairable no matter the setting.
 - **`max_memory_mb`** — a repair holds one slice-sized buffer per missing slice. A plan exceeding this budget is marked unrepairable.
 
-- **`arr_replacement_on_failure`** — off by default. If PAR2 repair fails for a degraded file, the file stays degraded and visible, the failure reason is recorded on its health record, and its existing health-check schedule is retained. Enable this to hand failed degraded-file repairs to ARR replacement instead; `health.repair.enabled` must also be enabled. An accepted ARR request can remove the original before a replacement successfully imports, even if the search finds nothing or the replacement fails. This setting does not change the handling of files already classified as corrupted or repairs for releases that have not imported yet.
+A failed PAR2 repair does not make a degraded file unplayable. AltMount records the failure reason on its health record and keeps the file degraded and visible, with its existing health-check schedule. Files already classified as corrupted and releases that have not imported yet keep their existing handling.
 
 - **`repair_on_import`** — when an import finds confirmed missing segments, queue the repair immediately rather than waiting for someone to press play. This also covers **archive sets** (RAR/7z), which were previously dropped outright: a damaged set is parked as `waiting_repair` in the queue while PAR2 rebuilds its volumes, then imports automatically once the repair lands (or fails with the repair's reason if the damage proves unrepairable). Because repaired bytes exist only locally, the import availability sweep and segment reads consult the patch store, so a repaired release imports normally. The reason this matters is article lifetime: a release's PAR2 volumes are most likely to still be retrievable close to its post date, so a file imported today with three dead articles is repairable today but may not be six months from now. Off by default, because each repair downloads the full release — importing a large damaged backlog with this on is expensive.
 - **`max_patch_store_mb`** — caps the total size of stored patches; when exceeded, the oldest patches are evicted first. Safe because patches are regenerable — a later stream simply re-triggers the repair.
@@ -55,5 +54,5 @@ curl -X POST http://localhost:8080/api/par2repair \
 ## Notes
 
 - Works for plain files and for RAR/AES/nested releases (their streams fail on new damage as before, but repaired articles serve transparently).
-- Files without PAR2 files in the original NZB, or whose PAR2 articles are themselves gone, cannot be repaired. Degraded files stay visible by default; `arr_replacement_on_failure` opts them into ARR replacement.
+- Files without PAR2 files in the original NZB, or whose PAR2 articles are themselves gone, cannot be repaired. Degraded files stay visible and their health records explain why repair failed.
 - Job state persists in the database: pending repairs survive restarts, transient NNTP failures retry with exponential backoff.
