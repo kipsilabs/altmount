@@ -835,6 +835,33 @@ func (s *Server) handleSABnzbdHistory(c *fiber.Ctx) error {
 		return s.writeSABnzbdErrorFiber(c, "Failed to get history")
 	}
 
+	// #498: Sonarr and Radarr only ever read this first page (start=0,
+	// limit=DownloadClientHistoryLimit, default 60). A tracked download that is
+	// in neither the queue nor that page is dropped without a downloadFailed
+	// event, so no blocklist and no retry. During a burst of grabs, newer
+	// completed rows can push a failed row off the page before the *arr polls.
+	// Append every failed row still kept in import_queue that the page does not
+	// already hold. The page itself, noofslots and later pages are unchanged; a
+	// failed row can therefore appear both here and at its own position on a
+	// later page.
+	if start == 0 {
+		failedRows, err := s.queueRepo.ListSABnzbdFailedHistory(ctx, categoryFilter, maxSABnzbdHistoryLimit)
+		if err != nil {
+			return s.writeSABnzbdErrorFiber(c, "Failed to get history")
+		}
+		onPage := make(map[int64]bool, len(historyRows))
+		for _, row := range historyRows {
+			if row.Source == "failed_queue" {
+				onPage[row.ID] = true
+			}
+		}
+		for _, row := range failedRows {
+			if !onPage[row.ID] {
+				historyRows = append(historyRows, row)
+			}
+		}
+	}
+
 	slots := make([]SABnzbdHistorySlot, 0, len(historyRows))
 	var totalBytes int64
 	itemBasePath := s.calculateItemBasePath()

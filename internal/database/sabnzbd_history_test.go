@@ -148,3 +148,34 @@ func TestSABnzbdHistory_PaginationAndCategory(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, empty)
 }
+
+func TestSABnzbdFailedHistory_FiltersAndCap(t *testing.T) {
+	repo, db := newSABHistoryRepo(t)
+	ctx := context.Background()
+	base := time.Now().UTC().Add(-time.Hour)
+
+	insertQ(t, db, 1, "failed", "tv", base, false)
+	insertQ(t, db, 2, "failed", "tv", base.Add(time.Minute), false)
+	insertQ(t, db, 3, "failed", "tv", base.Add(2*time.Minute), true) // skip_arr_notification: never shown
+	insertQ(t, db, 4, "failed", "movies", base.Add(3*time.Minute), false)
+	insertQ(t, db, 5, "completed", "tv", base.Add(4*time.Minute), false)
+	insertH(t, db, 6, 0, "tv", base.Add(5*time.Minute))
+
+	rows, err := repo.ListSABnzbdFailedHistory(ctx, "tv", 10)
+	require.NoError(t, err)
+	var ids []int64
+	for _, r := range rows {
+		assert.Equal(t, "failed_queue", r.Source)
+		ids = append(ids, r.ID)
+	}
+	assert.Equal(t, []int64{2, 1}, ids, "newest first, tv only, no skip_arr rows")
+
+	rows, err = repo.ListSABnzbdFailedHistory(ctx, "tv", 1)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	assert.Equal(t, int64(2), rows[0].ID)
+
+	rows, err = repo.ListSABnzbdFailedHistory(ctx, "", 10)
+	require.NoError(t, err)
+	assert.Len(t, rows, 3, "empty category means all categories")
+}
