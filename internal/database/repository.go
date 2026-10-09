@@ -1401,6 +1401,39 @@ func (r *Repository) ListSABnzbdHistory(ctx context.Context, category string, li
 	return out, rows.Err()
 }
 
+// ListSABnzbdFailedHistory returns the failed-queue rows of the SABnzbd history
+// view, newest first, at most max rows. It reads the same union as
+// ListSABnzbdHistory, so the category and skip_arr_notification filters match
+// the main page exactly. Failed rows stay in import_queue only until the
+// FailedItemRetentionHours cleanup deletes them; when that cleanup is off they
+// are kept forever, which is why max is required.
+func (r *Repository) ListSABnzbdFailedHistory(ctx context.Context, category string, max int) ([]*SABnzbdHistoryRow, error) {
+	body, args := sabnzbdHistoryUnion(category)
+	query := `SELECT source, id, download_id, name, status, file_size, completed_at, category, storage_path, metadata, error_message
+		FROM (` + body + `) t
+		WHERE source = 'failed_queue'
+		ORDER BY sort_time DESC, id DESC
+		LIMIT ?`
+	args = append(args, max)
+
+	rows, err := r.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list failed sabnzbd history: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*SABnzbdHistoryRow
+	for rows.Next() {
+		var row SABnzbdHistoryRow
+		if err := rows.Scan(&row.Source, &row.ID, &row.DownloadID, &row.Name, &row.Status,
+			&row.FileSize, &row.CompletedAt, &row.Category, &row.StoragePath, &row.Metadata, &row.ErrorMessage); err != nil {
+			return nil, fmt.Errorf("failed to scan failed sabnzbd history row: %w", err)
+		}
+		out = append(out, &row)
+	}
+	return out, rows.Err()
+}
+
 // CountSABnzbdHistory returns the exact pre-pagination total for the SABnzbd
 // history view (for noofslots).
 func (r *Repository) CountSABnzbdHistory(ctx context.Context, category string) (int, error) {
