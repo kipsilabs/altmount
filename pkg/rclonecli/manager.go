@@ -95,7 +95,10 @@ type MountInfo struct {
 	MountedAt  string `json:"mounted_at,omitempty"`
 	ConfigName string `json:"config_name"`
 	Error      string `json:"error,omitempty"`
-	desired    bool
+	// consecutiveHealthFailures is guarded by Manager.mountsMutex. A new mount
+	// instance starts with a fresh streak.
+	consecutiveHealthFailures int
+	desired                   bool
 }
 
 type RCRequest struct {
@@ -713,6 +716,7 @@ func (m *Manager) restartServer(ctx context.Context) error {
 	// FUSE mounts are still usable.
 	m.mountsMutex.Lock()
 	for _, mount := range m.mounts {
+		mount.consecutiveHealthFailures = 0
 		if mount.Mounted {
 			mount.Mounted = false
 			mount.Error = "rcd subprocess restarting"

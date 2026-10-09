@@ -352,6 +352,7 @@ func (m *Manager) unmount(ctx context.Context, provider string, restartRCD bool)
 	if info, exists := m.mounts[provider]; exists {
 		info.Mounted = forceErr != nil
 		if forceErr == nil {
+			info.consecutiveHealthFailures = 0
 			info.desired = false
 		}
 		info.Error = ""
