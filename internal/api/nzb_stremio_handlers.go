@@ -165,7 +165,7 @@ func (s *Server) handleNzbStreams(c *fiber.Ctx) error {
 		}
 		// Some indexers (e.g. NZBHydra2) reject requests without a browser-like User-Agent.
 		req.Header.Set("User-Agent", cfg.GetUserAgent())
-		resp, err := http.DefaultClient.Do(req) //nolint:gosec // URL is provided by an authenticated caller
+		resp, err := httpclient.NewForExternal(cfg.Network, httpclient.LongTimeout).Do(req) //nolint:gosec // URL is provided by an authenticated caller
 		if err != nil {
 			return RespondBadRequest(c, "Failed to fetch NZB from URL", err.Error())
 		}
