@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestMatchKeywordOrPattern_TS_NoFalsePositiveOnDTS(t *testing.T) {
@@ -222,4 +223,25 @@ func TestDownloadNZB_ProwlarrRedirect(t *testing.T) {
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "private address")
 	})
+}
+
+func TestInferReleaseMetaOverlappingTitleMetadata(t *testing.T) {
+	var meta ReleaseMeta
+	require.NotPanics(t, func() {
+		meta = InferReleaseMeta("[ABC 1080p] Black Clover S02E01 Japanese")
+	})
+	require.Equal(t, "Japanese", meta.Language)
+	require.Equal(t, "🇯🇵", meta.FlagEmoji)
+	require.Equal(t, "Jpn", meta.LangCode)
+}
+
+func TestInferReleaseMetaNormalTitle(t *testing.T) {
+	meta := InferReleaseMeta("Black.Clover.S02E01.1080p.WEB-DL.x264.AAC.Japanese")
+	require.Equal(t, "Black Clover", meta.ParsedTitle)
+	require.Equal(t, "1080p", meta.Resolution)
+	require.Equal(t, "FHD", meta.QualityLabel)
+	require.Equal(t, "WEB-DL", meta.Quality)
+	require.Equal(t, "x264", meta.Codec)
+	require.Equal(t, "AAC", meta.Audio)
+	require.Equal(t, "Japanese", meta.Language)
 }

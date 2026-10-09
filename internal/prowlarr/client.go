@@ -340,7 +340,7 @@ func resolutionLabel(res string) string {
 // InferReleaseMeta parses a release title and returns detected metadata.
 // Uses PTN for quality/resolution/codec/audio and custom logic for language.
 func InferReleaseMeta(title string) ReleaseMeta {
-	info, _ := parsetorrentname.Parse(title)
+	info := parseTorrentName(title)
 	meta := ReleaseMeta{
 		Language: InferLanguage(title),
 	}
@@ -362,6 +362,20 @@ func InferReleaseMeta(title string) ReleaseMeta {
 		meta.QualityLabel = meta.Quality
 	}
 	return meta
+}
+
+// parseTorrentName isolates the third-party parser's unchecked title slicing.
+// Overlapping matches (e.g. "[ABC 1080p]") can put its start after its end.
+// Display metadata is optional: retain the release and independently inferred
+// language when parsing fails; stream entries fall back to the original title.
+func parseTorrentName(title string) (info *parsetorrentname.TorrentInfo) {
+	defer func() {
+		if recover() != nil {
+			info = nil
+		}
+	}()
+	info, _ = parsetorrentname.Parse(title)
+	return info
 }
 
 // Search queries Prowlarr for NZB releases matching the given IMDB ID and categories.
