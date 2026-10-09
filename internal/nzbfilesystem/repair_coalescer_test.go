@@ -26,6 +26,14 @@ func (f *fakeRcloneClient) RefreshDir(_ context.Context, _ string, dirs []string
 	return nil
 }
 
+func (f *fakeRcloneClient) ForgetDir(_ context.Context, _ string, dirs []string) error {
+	atomic.AddInt32(&f.calls, 1)
+	f.mu.Lock()
+	f.dirs = append(f.dirs, dirs...)
+	f.mu.Unlock()
+	return nil
+}
+
 func (f *fakeRcloneClient) callCount() int {
 	return int(atomic.LoadInt32(&f.calls))
 }

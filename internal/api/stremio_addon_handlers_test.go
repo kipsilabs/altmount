@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
@@ -206,7 +207,7 @@ func TestFindHealthyLibraryStreams_Disabled(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Stremio.IncludeLibraryStreams = boolPtr(false)
 
-	streams := s.findHealthyLibraryStreams(nil, cfg, "series", "tt123", "http://host", "key", 1, 1)
+	streams := s.findHealthyLibraryStreams(context.Background(), cfg, "series", "tt123", "http://host", "key", 1, 1)
 	assert.Nil(t, streams)
 }
 

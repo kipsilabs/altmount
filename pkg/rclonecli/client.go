@@ -441,7 +441,7 @@ func (m *Manager) RefreshDir(ctx context.Context, provider string, dirs []string
 		return fmt.Errorf("provider %s not mounted", provider)
 	}
 
-	// If no specific directories provided, refresh root
+	// If no specific directories provided, use root
 	if len(dirs) == 0 {
 		dirs = []string{"/"}
 	}
@@ -451,25 +451,7 @@ func (m *Manager) RefreshDir(ctx context.Context, provider string, dirs []string
 	// vfs/forget accepts any string and reports success either way.
 	dirs = ToVFSPaths(dirs)
 
-	// Issue a vfs/forget call for each directory to ensure all parents/children are forgotten
-	for _, dir := range dirs {
-		if dir == "" {
-			continue
-		}
-		forgetArgs := map[string]any{
-			"fs":  fmt.Sprintf("%s:", provider),
-			"dir": dir,
-		}
-		req := RCRequest{
-			Command: "vfs/forget",
-			Args:    forgetArgs,
-		}
-		_, err := m.makeRequestWithContext(ctx, req, true)
-		if err != nil {
-			m.logger.ErrorContext(ctx, "Failed to forget directory", "err", err, "provider", provider, "dir", dir)
-			return fmt.Errorf("failed to forget directory %s for provider %s: %w", dir, provider, err)
-		}
-	}
+	errs := m.forgetDirs(ctx, provider, dirs)
 
 	// Issue a vfs/refresh call for each directory individually
 	for _, dir := range dirs {
@@ -492,7 +474,66 @@ func (m *Manager) RefreshDir(ctx context.Context, provider string, dirs []string
 			return fmt.Errorf("failed to refresh directory %s for provider %s: %w", dir, provider, err)
 		}
 	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("VFS sync completed with %d errors; first error: %w", len(errs), errs[0])
+	}
+
 	return nil
+}
+
+// ForgetDir drops directories from the VFS cache without forcing an eager
+// re-listing: the next client access re-lists lazily. Intended for deletions
+// and moves, where an immediate re-enumeration of large directories would be
+// wasted work.
+func (m *Manager) ForgetDir(ctx context.Context, provider string, dirs []string) error {
+	if !m.IsReady() {
+		return fmt.Errorf("rclone RC server not ready")
+	}
+
+	mountInfo, exists := m.GetMountInfo(provider)
+	if !exists || !mountInfo.Mounted {
+		return fmt.Errorf("provider %s not mounted", provider)
+	}
+
+	// If no specific directories provided, use root
+	if len(dirs) == 0 {
+		dirs = []string{"/"}
+	}
+
+	errs := m.forgetDirs(ctx, provider, dirs)
+
+	if len(errs) > 0 {
+		return fmt.Errorf("VFS forget completed with %d errors; first error: %w", len(errs), errs[0])
+	}
+
+	return nil
+}
+
+// forgetDirs issues a vfs/forget call for each directory to ensure all parents/children are forgotten
+func (m *Manager) forgetDirs(ctx context.Context, provider string, dirs []string) []error {
+	var errs []error
+
+	for _, dir := range dirs {
+		if dir == "" {
+			continue
+		}
+		forgetArgs := map[string]any{
+			"fs":  fmt.Sprintf("%s:", provider),
+			"dir": dir,
+		}
+		req := RCRequest{
+			Command: "vfs/forget",
+			Args:    forgetArgs,
+		}
+		_, err := m.makeRequestWithContext(ctx, req, true)
+		if err != nil {
+			m.logger.ErrorContext(ctx, "Failed to forget directory", "err", err, "provider", provider, "dir", dir)
+			errs = append(errs, fmt.Errorf("failed to forget directory %s for provider %s: %w", dir, provider, err))
+		}
+	}
+
+	return errs
 }
 
 // createConfig creates an rclone config entry for the provider

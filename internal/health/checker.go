@@ -629,13 +629,6 @@ func (hc *HealthChecker) NotifyRcloneVFS(filePath string) {
 	if hc == nil || hc.rcloneClient == nil {
 		return
 	}
-	cfg := hc.configGetter()
-	switch cfg.MountType {
-	case config.MountTypeRClone, config.MountTypeRCloneExternal:
-		// continue
-	default:
-		return
-	}
 
 	// Virtual path, not an OS path: rclone's VFS is forward-slash on every
 	// platform. An OS-aware Dir would emit "\" separators on Windows, which never
@@ -646,8 +639,33 @@ func (hc *HealthChecker) NotifyRcloneVFS(filePath string) {
 	hc.NotifyRcloneVFSDirs([]string{virtualDir})
 }
 
+// NotifyRcloneVFSForget notifies rclone VFS to forget the directory containing
+// filePath after the file has been deleted or moved away (async, non-blocking).
+// Unlike NotifyRcloneVFS it skips the eager vfs/refresh: the next client access
+// re-lists lazily, which avoids forcing a re-enumeration of large directories
+// that nothing asked for.
+func (hc *HealthChecker) NotifyRcloneVFSForget(filePath string) {
+	if hc == nil || hc.rcloneClient == nil {
+		return
+	}
+
+	virtualDir := path.Dir(rclonecli.ToVFSPath(filePath))
+	hc.NotifyRcloneVFSDirsForget([]string{virtualDir})
+}
+
 // NotifyRcloneVFSDirs notifies rclone VFS to forget and refresh the specified directories (async, non-blocking).
 func (hc *HealthChecker) NotifyRcloneVFSDirs(dirs []string) {
+	hc.notifyVFSDirs(dirs, false)
+}
+
+// NotifyRcloneVFSDirsForget drops the specified directories from the rclone VFS
+// cache without a following refresh (async, non-blocking). Use for deletions
+// and moves; see NotifyRcloneVFSForget.
+func (hc *HealthChecker) NotifyRcloneVFSDirsForget(dirs []string) {
+	hc.notifyVFSDirs(dirs, true)
+}
+
+func (hc *HealthChecker) notifyVFSDirs(dirs []string, forgetOnly bool) {
 	if hc == nil || hc.rcloneClient == nil || len(dirs) == 0 {
 		return
 	}
@@ -684,7 +702,16 @@ func (hc *HealthChecker) NotifyRcloneVFSDirs(dirs []string) {
 			vfsName = config.MountProvider
 		}
 
-		err := hc.rcloneClient.RefreshDir(ctx, vfsName, uniqueDirs)
+		var err error
+		if forgetOnly {
+			err = hc.rcloneClient.ForgetDir(ctx, vfsName, uniqueDirs)
+			if err != nil {
+				slog.ErrorContext(ctx, "Failed to notify rclone VFS to forget directories", "dirs", uniqueDirs, "err", err)
+			}
+			return
+		}
+
+		err = hc.rcloneClient.RefreshDir(ctx, vfsName, uniqueDirs)
 		if err != nil {
 			slog.ErrorContext(ctx, "Failed to notify rclone VFS to forget/refresh directories", "dirs", uniqueDirs, "err", err)
 		}

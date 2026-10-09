@@ -103,6 +103,16 @@ func (c *customErrorHandler) mapError(err error) error {
 		}
 	}
 
+	// An unsatisfiable client Range is a request error (416), never a
+	// corruption verdict: the file is fine, the window is not.
+	if errors.Is(err, nzbfilesystem.ErrInvalidRange) {
+		return &HTTPError{
+			StatusCode: http.StatusRequestedRangeNotSatisfiable,
+			Message:    "Requested range not satisfiable",
+			Err:        err,
+		}
+	}
+
 	return err
 }
 
@@ -136,6 +146,16 @@ func (f *errorHandlingFile) Read(p []byte) (int, error) {
 			return n, &HTTPError{
 				StatusCode: http.StatusServiceUnavailable,
 				Message:    "File unavailable due to missing articles",
+				Err:        err,
+			}
+		}
+
+		// An unsatisfiable client Range surfaces as 416, not 503: the
+		// file is healthy, the requested window is not.
+		if errors.Is(err, nzbfilesystem.ErrInvalidRange) {
+			return n, &HTTPError{
+				StatusCode: http.StatusRequestedRangeNotSatisfiable,
+				Message:    "Requested range not satisfiable",
 				Err:        err,
 			}
 		}

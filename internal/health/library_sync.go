@@ -886,7 +886,11 @@ func (lsw *LibrarySyncWorker) SyncLibrary(ctx context.Context, dryRun bool) *Dry
 					go func() {
 						c, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 						defer cancel()
-						_ = lsw.rcloneClient.RefreshDir(c, vfsName, dirs)
+						// Deletion only: forget the directories so rclone drops
+						// stale cache entries; skip the eager refresh since
+						// nothing remains to list and the next access re-lists
+						// lazily.
+						_ = lsw.rcloneClient.ForgetDir(c, vfsName, dirs)
 					}()
 				}
 			}

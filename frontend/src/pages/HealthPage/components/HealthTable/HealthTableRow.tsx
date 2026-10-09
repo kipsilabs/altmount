@@ -8,6 +8,7 @@ import {
 } from "../../../../lib/utils";
 import { type FileHealth, HealthPriority } from "../../../../types/api";
 import { parseRepairReason } from "../par2RepairReason";
+import { RepairFailureMessage } from "../RepairFailureMessage";
 import { ArticleCheckProgress } from "./ArticleCheckProgress";
 import { ContentVerificationBadge } from "./ContentVerificationBadge";
 import { HealthItemActionsMenu } from "./HealthItemActionsMenu";
@@ -201,11 +202,8 @@ export const HealthTableRow = memo(function HealthTableRow({
 				    repair verdicts land here when a repair proved impossible;
 				    render those in their translated, actionable form. */}
 				{repairReason ? (
-					<div className="mt-1 space-y-0.5 text-xs">
-						<div className="break-words text-error">Cannot repair: {repairReason.summary}</div>
-						{repairReason.hint && (
-							<div className="break-words text-base-content/70">{repairReason.hint}</div>
-						)}
+					<div className="mt-1">
+						<RepairFailureMessage reason={repairReason} />
 					</div>
 				) : (
 					item.last_error && (

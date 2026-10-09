@@ -14,6 +14,11 @@ import (
 
 type RcloneRcClient interface {
 	RefreshDir(ctx context.Context, provider string, dirs []string) error
+	// ForgetDir drops the directories from the VFS cache without forcing an
+	// eager re-listing. Use it when files were deleted or moved away: the next
+	// client access re-lists lazily, whereas RefreshDir would trigger an
+	// immediate enumeration nothing asked for.
+	ForgetDir(ctx context.Context, provider string, dirs []string) error
 }
 
 type rcloneRcClient struct {
@@ -95,73 +100,17 @@ func TestConnection(
 }
 
 func (c *rcloneRcClient) RefreshDir(ctx context.Context, provider string, dirs []string) error {
-	cfg := c.config.GetConfig()
-
-	// Check if RC notifications are enabled
-	if cfg.RClone.RCEnabled == nil || !*cfg.RClone.RCEnabled {
-		return nil // Silently skip if RC is not enabled
-	}
-
-	// Check if RC URL is configured
-	if cfg.RClone.RCUrl == "" {
-		return fmt.Errorf("RC URL is not configured")
-	}
-
-	// If no specific directories provided, refresh root
-	if len(dirs) == 0 {
-		dirs = []string{"/"}
-	}
-
-	// rclone's VFS is forward-slash on every platform. Normalize here so a
-	// caller that built a directory with filepath cannot silently no-op:
-	// vfs/forget accepts any string and reports success either way.
-	dirs = ToVFSPaths(dirs)
-
-	baseUrl, err := buildRCUrl(cfg.RClone.RCUrl, cfg.RClone.RCUser, cfg.RClone.RCPass)
+	baseUrl, err := c.prepareRCRequest(provider, &dirs)
 	if err != nil {
-		return fmt.Errorf("invalid RC URL configuration: %w", err)
+		return err
+	}
+	if baseUrl == "" {
+		return nil // RC notifications disabled
 	}
 
 	var errs []error
 
-	// Issue a vfs/forget call for each directory to ensure all parents/children are forgotten
-	for _, dir := range dirs {
-		if dir == "" {
-			continue
-		}
-		forgetArgs := map[string]any{
-			"dir": dir,
-		}
-		if provider != "" {
-			forgetArgs["fs"] = fmt.Sprintf("%s:", provider)
-		}
-
-		forgetPayload, err := json.Marshal(forgetArgs)
-		if err != nil {
-			errs = append(errs, err)
-			continue
-		}
-
-		req, err := http.NewRequestWithContext(ctx, "POST", baseUrl+"/vfs/forget", bytes.NewBuffer(forgetPayload))
-		if err != nil {
-			errs = append(errs, err)
-			continue
-		}
-		req.Header.Set("Content-Type", "application/json")
-		resp, err := c.httpClient.Do(req)
-		if err != nil {
-			errs = append(errs, err)
-			continue
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			errs = append(errs, fmt.Errorf("vfs/forget failed for %s: status %d, error: %s", dir, resp.StatusCode, string(body)))
-			continue
-		}
-		resp.Body.Close()
-	}
+	errs = append(errs, c.forgetDirs(ctx, baseUrl, provider, dirs)...)
 
 	// Issue a vfs/refresh call for each directory to ensure all parents/children are refreshed
 	for _, dir := range dirs {
@@ -209,6 +158,102 @@ func (c *rcloneRcClient) RefreshDir(ctx context.Context, provider string, dirs [
 	}
 
 	return nil
+}
+
+// ForgetDir issues only the vfs/forget half of RefreshDir. It drops the
+// directories from the VFS cache without forcing an eager re-listing: the next
+// client access re-lists lazily. Intended for deletions and moves, where an
+// immediate re-enumeration of large directories would be wasted work.
+func (c *rcloneRcClient) ForgetDir(ctx context.Context, provider string, dirs []string) error {
+	baseUrl, err := c.prepareRCRequest(provider, &dirs)
+	if err != nil {
+		return err
+	}
+	if baseUrl == "" {
+		return nil // RC notifications disabled
+	}
+
+	errs := c.forgetDirs(ctx, baseUrl, provider, dirs)
+
+	if len(errs) > 0 {
+		return fmt.Errorf("VFS forget completed with %d errors; first error: %w", len(errs), errs[0])
+	}
+
+	return nil
+}
+
+// prepareRCRequest validates RC configuration, defaults empty dir lists to the
+// root and builds the RC base URL. It returns an empty baseUrl when RC
+// notifications are disabled, meaning the caller should skip silently.
+func (c *rcloneRcClient) prepareRCRequest(provider string, dirs *[]string) (string, error) {
+	cfg := c.config.GetConfig()
+
+	// Check if RC notifications are enabled
+	if cfg.RClone.RCEnabled == nil || !*cfg.RClone.RCEnabled {
+		return "", nil // Silently skip if RC is not enabled
+	}
+
+	// Check if RC URL is configured
+	if cfg.RClone.RCUrl == "" {
+		return "", fmt.Errorf("RC URL is not configured")
+	}
+
+	// If no specific directories provided, use root
+	if len(*dirs) == 0 {
+		*dirs = []string{"/"}
+	}
+
+	baseUrl, err := buildRCUrl(cfg.RClone.RCUrl, cfg.RClone.RCUser, cfg.RClone.RCPass)
+	if err != nil {
+		return "", fmt.Errorf("invalid RC URL configuration: %w", err)
+	}
+
+	return baseUrl, nil
+}
+
+// forgetDirs issues a vfs/forget call for each directory to ensure all parents/children are forgotten
+func (c *rcloneRcClient) forgetDirs(ctx context.Context, baseUrl string, provider string, dirs []string) []error {
+	var errs []error
+
+	for _, dir := range dirs {
+		if dir == "" {
+			continue
+		}
+		forgetArgs := map[string]any{
+			"dir": dir,
+		}
+		if provider != "" {
+			forgetArgs["fs"] = fmt.Sprintf("%s:", provider)
+		}
+
+		forgetPayload, err := json.Marshal(forgetArgs)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+
+		req, err := http.NewRequestWithContext(ctx, "POST", baseUrl+"/vfs/forget", bytes.NewBuffer(forgetPayload))
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			errs = append(errs, fmt.Errorf("vfs/forget failed for %s: status %d, error: %s", dir, resp.StatusCode, string(body)))
+			continue
+		}
+		resp.Body.Close()
+	}
+
+	return errs
 }
 
 // buildRCUrl constructs the RC URL with proper protocol and authentication handling

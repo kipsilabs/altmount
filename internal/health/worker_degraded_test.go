@@ -113,7 +113,7 @@ func TestDegradedRepairEnqueuedAfterHealthUpdate(t *testing.T) {
 				require.NoError(t, err)
 				require.Equal(t, database.HealthStatusDegraded, got.Status, "persist degraded before PAR2 can finish")
 				reason := "no PAR2 files"
-				require.NoError(t, env.healthRepo.RecordPar2RepairFailure(ctx, path, reason, true))
+				require.NoError(t, env.healthRepo.RecordPar2RepairFailure(ctx, path, reason))
 			}))
 			if mode == "direct" {
 				require.NoError(t, env.hw.performDirectCheck(ctx, holesEnv.filePath, database.HealthStatusPending, nil))
@@ -123,7 +123,9 @@ func TestDegradedRepairEnqueuedAfterHealthUpdate(t *testing.T) {
 			require.True(t, called)
 			got, err := env.healthRepo.GetFileHealth(ctx, holesEnv.filePath)
 			require.NoError(t, err)
-			require.Equal(t, database.HealthStatusRepairTriggered, got.Status, "PAR2 failure must survive the health cycle")
+			require.Equal(t, database.HealthStatusDegraded, got.Status, "PAR2 failure must keep the file degraded")
+			require.NotNil(t, got.LastError)
+			require.Equal(t, "no PAR2 files", *got.LastError, "PAR2 failure must survive the health cycle")
 		})
 	}
 }

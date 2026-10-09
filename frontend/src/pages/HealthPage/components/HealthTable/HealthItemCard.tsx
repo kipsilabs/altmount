@@ -18,6 +18,7 @@ import {
 } from "../../../../lib/utils";
 import { type FileHealth, HealthPriority } from "../../../../types/api";
 import { parseRepairReason } from "../par2RepairReason";
+import { RepairFailureMessage } from "../RepairFailureMessage";
 import { ArticleCheckProgress } from "./ArticleCheckProgress";
 import { ContentVerificationBadge } from "./ContentVerificationBadge";
 import { HealthItemActionsMenu } from "./HealthItemActionsMenu";
@@ -70,6 +71,9 @@ export const HealthItemCard = memo(function HealthItemCard({
 		[item.error_details],
 	);
 	const playbackImpact = errorDetails?.playback_impact ?? null;
+	const repairReason = item.last_error?.startsWith("par2repair:")
+		? parseRepairReason(item.last_error)
+		: null;
 
 	// Reuse status icon logic from HealthTableRow
 	const getNextPriority = (current: HealthPriority): HealthPriority => {
@@ -210,11 +214,11 @@ export const HealthItemCard = memo(function HealthItemCard({
 				{item.last_error && (
 					<div className="alert alert-error px-3 py-2">
 						<AlertCircle className="h-4 w-4 shrink-0" />
-						<span className="text-xs">
-							{item.last_error.startsWith("par2repair:")
-								? `Cannot repair: ${parseRepairReason(item.last_error).summary}`
-								: truncateText(item.last_error, 100)}
-						</span>
+						{repairReason ? (
+							<RepairFailureMessage reason={repairReason} />
+						) : (
+							<span className="text-xs">{truncateText(item.last_error, 100)}</span>
+						)}
 					</div>
 				)}
 

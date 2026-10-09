@@ -25,6 +25,10 @@ func (m *MockRcloneClient) RefreshDir(ctx context.Context, provider string, dirs
 	return nil
 }
 
+func (m *MockRcloneClient) ForgetDir(ctx context.Context, provider string, dirs []string) error {
+	return nil
+}
+
 func TestSyncLibrary_WorkerPool(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("symlinks not supported on Windows")

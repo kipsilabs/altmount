@@ -431,7 +431,6 @@ func startPar2RepairService(
 			c := configGetter()
 			return par2repair.Config{
 				Enabled:           c.Par2Repair.Enabled != nil && *c.Par2Repair.Enabled,
-				ArrRepairEnabled:  c.GetRepairEnabled(),
 				MaxRepairRatio:    c.Par2Repair.MaxRepairRatio,
 				MaxMemoryMB:       c.Par2Repair.MaxMemoryMB,
 				MaxConcurrentJobs: c.Par2Repair.MaxConcurrentJobs,

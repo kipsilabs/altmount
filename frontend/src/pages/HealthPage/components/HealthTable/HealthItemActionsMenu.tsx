@@ -12,6 +12,7 @@ import {
 import { useState } from "react";
 import { apiClient } from "../../../../api/client";
 import type { FileHealth } from "../../../../types/api";
+import { parseRepairReason } from "../par2RepairReason";
 
 interface HealthItemActionsMenuProps {
 	item: FileHealth;
@@ -47,6 +48,10 @@ export function HealthItemActionsMenu({
 	onRegenerate,
 }: HealthItemActionsMenuProps) {
 	const [isDownloadPending, setIsDownloadPending] = useState(false);
+	const repairReason = item.last_error?.startsWith("par2repair:")
+		? parseRepairReason(item.last_error)
+		: null;
+	const par2Unavailable = repairReason?.unavailable === true;
 
 	async function handleDownloadNZB() {
 		setIsDownloadPending(true);
@@ -151,11 +156,16 @@ export function HealthItemActionsMenu({
 						<button
 							type="button"
 							onClick={() => onPar2Repair(item.file_path)}
+							disabled={par2Unavailable}
+							title={par2Unavailable ? repairReason?.summary : undefined}
 							className="text-info"
 						>
 							<Wrench className="h-4 w-4" />
 							PAR2 Repair
 						</button>
+						{par2Unavailable && (
+							<span className="text-base-content/70 text-xs">{repairReason?.summary}</span>
+						)}
 					</li>
 				)}
 				<li>

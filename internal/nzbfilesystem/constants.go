@@ -68,6 +68,11 @@ var (
 	ErrNoEncryptionParams  = errors.New("no NZB data available for encryption parameters")
 	ErrFileIsCorrupted     = errors.New("file is corrupted, there are some missing segments")
 	ErrFileClosed          = errors.New("file closed")
+	// ErrInvalidRange is returned when a client-supplied byte range cannot be
+	// satisfied (negative start after normalization, start past EOF, empty
+	// window). It is a request error, never a corruption verdict, and must
+	// not reach the health/repair pipeline.
+	ErrInvalidRange = errors.New("invalid byte range")
 	// ErrReadTimeout is returned when a single read exceeds
 	// streaming.read_timeout_seconds. Deliberately not a context error: the
 	// FUSE handles map context errors to EINTR (a retryable interruption),

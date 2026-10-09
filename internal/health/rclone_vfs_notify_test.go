@@ -11,25 +11,28 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+type vfsCall struct {
+	VFSName string
+	Dirs    []string
+}
+
 type mockRcloneClient struct {
 	mu           sync.Mutex
-	refreshCalls []struct {
-		VFSName string
-		Dirs    []string
-	}
+	refreshCalls []vfsCall
+	forgetCalls  []vfsCall
 }
 
 func (m *mockRcloneClient) RefreshDir(ctx context.Context, vfsName string, dirs []string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.refreshCalls = append(m.refreshCalls, struct {
-		VFSName string
-		Dirs    []string
-	}{VFSName: vfsName, Dirs: dirs})
+	m.refreshCalls = append(m.refreshCalls, vfsCall{VFSName: vfsName, Dirs: dirs})
 	return nil
 }
 
 func (m *mockRcloneClient) ForgetDir(ctx context.Context, vfsName string, dirs []string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.forgetCalls = append(m.forgetCalls, vfsCall{VFSName: vfsName, Dirs: dirs})
 	return nil
 }
 
@@ -68,6 +71,7 @@ func TestHealthChecker_NotifyRcloneVFS(t *testing.T) {
 	defer mockRclone.mu.Unlock()
 	assert.Equal(t, "altmount_vfs", mockRclone.refreshCalls[0].VFSName)
 	assert.Equal(t, []string{"movies/Fight Club (1999)"}, mockRclone.refreshCalls[0].Dirs)
+	assert.Empty(t, mockRclone.forgetCalls)
 }
 
 func TestHealthChecker_NotifyRcloneVFSDirs_Deduplication(t *testing.T) {
@@ -95,4 +99,63 @@ func TestHealthChecker_NotifyRcloneVFSDirs_Deduplication(t *testing.T) {
 	mockRclone.mu.Lock()
 	defer mockRclone.mu.Unlock()
 	assert.Equal(t, []string{"movies/DirA", "movies/DirB"}, mockRclone.refreshCalls[0].Dirs)
+	assert.Empty(t, mockRclone.forgetCalls)
+}
+
+func TestHealthChecker_NotifyRcloneVFSForget(t *testing.T) {
+	mockRclone := &mockRcloneClient{}
+	cfg := &config.Config{
+		MountType: config.MountTypeRCloneExternal,
+		RClone: config.RCloneConfig{
+			VFSName: "altmount_vfs",
+		},
+	}
+
+	checker := &HealthChecker{
+		rcloneClient: mockRclone,
+		configGetter: func() *config.Config { return cfg },
+	}
+
+	checker.NotifyRcloneVFSForget("tv/SpongeBob.S17E15/ep.mkv")
+
+	require.Eventually(t, func() bool {
+		mockRclone.mu.Lock()
+		defer mockRclone.mu.Unlock()
+		return len(mockRclone.forgetCalls) == 1
+	}, 2*time.Second, 20*time.Millisecond)
+
+	mockRclone.mu.Lock()
+	defer mockRclone.mu.Unlock()
+	assert.Equal(t, "altmount_vfs", mockRclone.forgetCalls[0].VFSName)
+	assert.Equal(t, []string{"tv/SpongeBob.S17E15"}, mockRclone.forgetCalls[0].Dirs)
+	// Deletion must not trigger an eager re-enumeration
+	assert.Empty(t, mockRclone.refreshCalls)
+}
+
+func TestHealthChecker_NotifyRcloneVFSDirsForget_Deduplication(t *testing.T) {
+	mockRclone := &mockRcloneClient{}
+	cfg := &config.Config{
+		MountType: config.MountTypeRClone,
+		RClone: config.RCloneConfig{
+			VFSName: "altmount_vfs",
+		},
+	}
+
+	checker := &HealthChecker{
+		rcloneClient: mockRclone,
+		configGetter: func() *config.Config { return cfg },
+	}
+
+	checker.NotifyRcloneVFSDirsForget([]string{"movies/DirA", "movies/DirB", "movies/DirA", ""})
+
+	require.Eventually(t, func() bool {
+		mockRclone.mu.Lock()
+		defer mockRclone.mu.Unlock()
+		return len(mockRclone.forgetCalls) == 1
+	}, 2*time.Second, 20*time.Millisecond)
+
+	mockRclone.mu.Lock()
+	defer mockRclone.mu.Unlock()
+	assert.Equal(t, []string{"movies/DirA", "movies/DirB", "/"}, mockRclone.forgetCalls[0].Dirs)
+	assert.Empty(t, mockRclone.refreshCalls)
 }

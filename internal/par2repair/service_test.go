@@ -186,7 +186,7 @@ type recordingHealth struct {
 	calls []healthCall
 }
 
-func (h *recordingHealth) RecordPar2RepairFailure(ctx context.Context, filePath, reason string, _ bool) error {
+func (h *recordingHealth) RecordPar2RepairFailure(ctx context.Context, filePath, reason string) error {
 	return h.UpdateFileHealth(ctx, filePath, database.HealthStatusCorrupted, &reason, nil, nil, false)
 }
 
