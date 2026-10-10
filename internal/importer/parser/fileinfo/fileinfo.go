@@ -71,17 +71,27 @@ func getFileInfo(
 
 	// Select best filename using priority system (PAR2 > subject > yEnc header > subject header)
 	filename := selectBestFilename(par2Filename, subjectFilename, headerFilename, file.SubjectHeader)
+	// Media extensions score higher than sidecars, but a sidecar must not consume
+	// the video's name when an encoder reused it in the yEnc header.
+	fromSidecar := false
+	if isSidecarFilename(par2Filename) {
+		filename, fromSidecar = par2Filename, true
+	} else if par2Filename == "" && isSafeSubjectSidecar(file) {
+		filename, fromSidecar = subjectFilename, true
+	}
 	fromPar2 := par2Filename != "" && filename == par2Filename
 
 	// Gap 4: Correct extension based on magic bytes when filename appears obfuscated.
 	// This handles files that were uploaded with a wrong or missing extension.
-	filename = correctExtensionFromMagicBytes(filename, file.First16KB)
+	if !fromSidecar {
+		filename = correctExtensionFromMagicBytes(filename, file.First16KB)
+	}
 
 	// Gap 5: Last resort — use NZB filename stem when all other sources are obfuscated/empty.
 	// A PAR2-sourced name is authoritative, so trust it even when the obfuscation heuristic
 	// flags it (e.g. a short base like "yay.rar"); overriding it would split a multi-volume
 	// RAR set whose first volume PAR2 named differently from its .rNN continuations.
-	if !fromPar2 && nzbFilenameStem != "" && (filename == "" || isProbablyObfuscated(filename)) {
+	if !fromPar2 && !fromSidecar && nzbFilenameStem != "" && (filename == "" || isProbablyObfuscated(filename)) {
 		ext := filepath.Ext(filename)
 		// An NZB named after its file ("The.Movie.mkv.nzb") already carries the
 		// extension in the stem; don't double it.
@@ -129,6 +139,23 @@ func getFileInfo(
 		First16KB:     file.First16KB,
 		OriginalIndex: file.OriginalIndex,
 	}
+}
+
+func isSidecarFilename(filename string) bool {
+	switch strings.ToLower(filepath.Ext(filename)) {
+	case ".nfo", ".sfv", ".txt", ".srt", ".sub", ".jpg", ".jpeg", ".png", ".nzb", ".md5":
+		return true
+	}
+	return false
+}
+
+func isSafeSubjectSidecar(file *NzbFileWithFirstSegment) bool {
+	// Unlike a matched PAR2 descriptor, a subject alone is not authoritative:
+	// protect real media and archives, and require a known small decoded size.
+	return isSidecarFilename(file.NzbFile.Filename) &&
+		file.Headers != nil && file.Headers.FileSize > 0 && file.Headers.FileSize <= 32<<20 &&
+		len(file.First16KB) > 0 && !IsRecognizedMediaContainer(file.First16KB) &&
+		!HasRarMagic(file.First16KB) && !Has7zMagic(file.First16KB) && !par2.HasMagicBytes(file.First16KB)
 }
 
 // correctExtensionFromMagicBytes fixes the extension of an obfuscated file based on its magic bytes.
