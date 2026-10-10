@@ -73,7 +73,7 @@ func (m *Manager) restartAfterProbeFailures() int {
 }
 
 // checkMountHealth checks if a specific mount is healthy
-func (m *Manager) checkMountHealth(provider string) bool {
+func (m *Manager) checkMountHealth(provider string) error {
 	// Try to list the root directory of the mount
 	req := RCRequest{
 		Command: "operations/list",
@@ -84,11 +84,17 @@ func (m *Manager) checkMountHealth(provider string) bool {
 	}
 
 	_, err := m.makeRequest(req, true)
-	return err == nil
+	return err
 }
 
 // RecoverMount attempts to recover a failed mount
 func (m *Manager) RecoverMount(ctx context.Context, provider string) error {
+	return m.recoverMount(ctx, provider, nil)
+}
+
+// recoverMount optionally limits health-triggered recovery to the mount instance
+// that failed its probe. Public recovery requests do not impose this condition.
+func (m *Manager) recoverMount(ctx context.Context, provider string, expected *MountInfo) error {
 	m.recoveryMu.Lock()
 	if m.recovering == nil {
 		m.recovering = make(map[string]struct{})
@@ -110,6 +116,10 @@ func (m *Manager) RecoverMount(ctx context.Context, provider string) error {
 
 	m.mountsMutex.RLock()
 	mountInfo, exists := m.mounts[provider]
+	if expected != nil && (!exists || mountInfo != expected || !mountInfo.Mounted || !mountInfo.desired) {
+		m.mountsMutex.RUnlock()
+		return nil
+	}
 	m.mountsMutex.RUnlock()
 
 	if !exists {
@@ -240,32 +250,56 @@ func (m *Manager) performMountHealthCheck() {
 	}
 
 	m.mountsMutex.RLock()
-	providers := make([]string, 0, len(m.mounts))
-	for provider, mount := range m.mounts {
+	mounts := make([]*MountInfo, 0, len(m.mounts))
+	for _, mount := range m.mounts {
 		if mount.Mounted {
-			providers = append(providers, provider)
+			mounts = append(mounts, mount)
 		}
 	}
 	m.mountsMutex.RUnlock()
 
-	for _, provider := range providers {
-		if !m.checkMountHealth(provider) {
-			m.logger.WarnContext(m.ctx, "Mount health check failed, attempting recovery", "provider", provider)
+	restartAfter := m.restartAfterProbeFailures()
+	for _, mount := range mounts {
+		provider := mount.Provider
+		err := m.checkMountHealth(provider)
 
-			// Record the health failure, but leave Mounted=true so RecoverMount can
-			// still issue mount/unmount and reclaim rclone's VFS before remounting.
-			m.mountsMutex.Lock()
-			if mount, exists := m.mounts[provider]; exists {
-				mount.Error = "Health check failed"
-			}
+		m.mountsMutex.Lock()
+		// A mount may have been replaced or unmounted while the RPC was in flight.
+		// Its result belongs only to the mount instance that was checked.
+		if m.mounts[provider] != mount || !mount.Mounted {
 			m.mountsMutex.Unlock()
-
-			// Attempt recovery
-			go func(provider string) {
-				if err := m.RecoverMount(m.ctx, provider); err != nil {
-					m.logger.ErrorContext(m.ctx, "Failed to recover mount", "err", err, "provider", provider)
-				}
-			}(provider)
+			continue
 		}
+		if err == nil {
+			mount.consecutiveHealthFailures = 0
+			mount.Error = ""
+			m.mountsMutex.Unlock()
+			continue
+		}
+
+		mount.consecutiveHealthFailures++
+		failures := mount.consecutiveHealthFailures
+		// Keep Mounted=true so recovery can unmount and reclaim rclone's VFS.
+		mount.Error = fmt.Sprintf("Health check failed: %v", err)
+		if failures >= restartAfter {
+			mount.consecutiveHealthFailures = 0
+		}
+		m.mountsMutex.Unlock()
+
+		if failures < restartAfter {
+			m.logger.WarnContext(m.ctx, "Mount health check failed; not recovering yet",
+				"provider", provider, "err", err,
+				"consecutive_failures", failures, "threshold", restartAfter)
+			continue
+		}
+
+		m.logger.WarnContext(m.ctx, "Mount health check failed, attempting recovery",
+			"provider", provider, "err", err,
+			"consecutive_failures", failures, "threshold", restartAfter)
+		go func(provider string, expected *MountInfo) {
+			if err := m.recoverMount(m.ctx, provider, expected); err != nil {
+				m.logger.ErrorContext(m.ctx, "Failed to recover mount", "err", err, "provider", provider)
+			}
+		}(provider, mount)
 	}
 }
