@@ -6,6 +6,8 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -166,18 +168,21 @@ func TestRestartAfterProbeFailures_DerivesCountFromDuration(t *testing.T) {
 		want       int
 		why        string
 	}{
-		{"90s", 3, "the default, and the previous hard-coded behaviour"},
-		{"30s", 1, "exactly one interval"},
-		{"5m", 10, "a tolerant install riding out a long stall"},
-		{"45s", 2, "rounds up rather than truncating to one interval"},
-		{"1s", 1, "shorter than an interval still means one sustained failure"},
-		{"", 3, "unset falls back to the built-in default"},
-		{"nonsense", 3, "unparseable falls back rather than disabling the guard"},
-		{"-30s", 3, "negative falls back rather than restarting every tick"},
+		{"90s", 4, "three intervals elapse after the first failure"},
+		{"30.000000001s", 3, "just beyond an interval needs two complete intervals"},
+		{"29.999999999s", 2, "just below an interval waits one complete interval"},
+		{"0s", 4, "zero uses the 90-second default"},
+		{"30s", 2, "exactly one interval after the first failure"},
+		{"5m", 11, "a tolerant install riding out a long stall"},
+		{"45s", 3, "rounds up rather than truncating to one interval"},
+		{"1s", 2, "a positive tolerance requires another probe"},
+		{"", 4, "unset falls back to the built-in default"},
+		{"nonsense", 4, "unparseable falls back rather than disabling the guard"},
+		{"-30s", 4, "negative falls back rather than restarting every tick"},
 		// Near time.Duration's maximum. The obvious (x+interval-1)/interval form
 		// overflows here and collapses to 1, turning the longest tolerance
 		// expressible into a restart on every failed probe.
-		{"2562047h47m16.854775807s", 307445735, "an absurd but valid duration must not invert into no tolerance"},
+		{"2562047h47m16.854775807s", 307445736, "an absurd but valid duration must not invert into no tolerance"},
 	} {
 		m, _ := newHealthTestManager(t, false, time.Time{})
 		withRcdRestartAfter(t, m, tc.configured)
@@ -191,8 +196,8 @@ func TestRestartAfterProbeFailures_DerivesCountFromDuration(t *testing.T) {
 
 func TestRestartAfterProbeFailures_NoConfigUsesDefault(t *testing.T) {
 	m, _ := newHealthTestManager(t, false, time.Time{})
-	if got := m.restartAfterProbeFailures(); got != maxConsecutiveProbeFailures {
-		t.Errorf("with no config wired, threshold = %d, want %d", got, maxConsecutiveProbeFailures)
+	if got := m.restartAfterProbeFailures(); got != 4 {
+		t.Errorf("with no config wired, threshold = %d, want 4 for the 90s default", got)
 	}
 }
 
@@ -202,7 +207,7 @@ func TestRestartAfterProbeFailures_NoConfigUsesDefault(t *testing.T) {
 // every reader.
 func TestPerformMountHealthCheck_HonoursConfiguredTolerance(t *testing.T) {
 	m, restarts := newHealthTestManager(t, false, time.Now().Add(-time.Hour))
-	withRcdRestartAfter(t, m, "5m") // 10 probes
+	withRcdRestartAfter(t, m, "5m") // 11 probes
 
 	for range maxConsecutiveProbeFailures + 2 {
 		m.performMountHealthCheck()
@@ -211,10 +216,71 @@ func TestPerformMountHealthCheck_HonoursConfiguredTolerance(t *testing.T) {
 		t.Fatalf("restarted %d times past the default threshold; the configured tolerance was ignored", got)
 	}
 
-	for range 5 {
+	for range 11 - (maxConsecutiveProbeFailures + 2) {
 		m.performMountHealthCheck()
 	}
 	if got := atomic.LoadInt32(restarts); got != 1 {
 		t.Fatalf("restarts = %d after reaching the configured threshold, want 1", got)
+	}
+}
+
+// A regression to ceil(duration/interval) restarts at t=60s for a 90s
+// tolerance. Exercise the real HTTP probe and health-check decision together,
+// with each call representing a monitor tick; no wall-clock sleeps are needed.
+func TestPerformMountHealthCheck_RestartToleranceWithRCServer(t *testing.T) {
+	for _, configured := range []string{"90s", "", "invalid", "0s", "-1s"} {
+		t.Run(configured, func(t *testing.T) {
+			var healthy atomic.Bool
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost || r.URL.Path != "/core/version" {
+					t.Errorf("unexpected probe: %s %s", r.Method, r.URL.Path)
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				if !healthy.Load() {
+					w.WriteHeader(http.StatusServiceUnavailable)
+					return
+				}
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"version":"v1.70.0"}`))
+			}))
+			defer server.Close()
+			u, err := url.Parse(server.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			m, restarts := newHealthTestManager(t, false, afterGrace())
+			withRcdRestartAfter(t, m, configured)
+			m.rcPort = u.Port()
+			m.httpClient = server.Client()
+			m.probe = m.pingServerWithTimeout
+
+			for _, elapsed := range []time.Duration{0, 30 * time.Second, 60 * time.Second} {
+				m.performMountHealthCheck()
+				if got := atomic.LoadInt32(restarts); got != 0 {
+					t.Fatalf("restart at %s before the 90s tolerance elapsed: %d", elapsed, got)
+				}
+			}
+			// One successful probe breaks the streak: subsequent failures must wait
+			// the whole tolerance, rather than retaining the previous failures.
+			healthy.Store(true)
+			m.performMountHealthCheck()
+			healthy.Store(false)
+			for _, elapsed := range []time.Duration{0, 30 * time.Second, 60 * time.Second, 90 * time.Second} {
+				m.performMountHealthCheck()
+				want := int32(0)
+				if elapsed == 90*time.Second {
+					want = 1
+				}
+				if got := atomic.LoadInt32(restarts); got != want {
+					t.Fatalf("after healthy reset, restarts at %s = %d, want %d", elapsed, got, want)
+				}
+			}
+			// A restart also breaks the streak; its next failure cannot restart again.
+			m.performMountHealthCheck()
+			if got := atomic.LoadInt32(restarts); got != 1 {
+				t.Fatalf("restart failed to reset the streak: %d restarts", got)
+			}
+		})
 	}
 }

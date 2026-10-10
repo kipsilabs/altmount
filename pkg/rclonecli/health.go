@@ -21,9 +21,10 @@ const (
 	// probes are required before the rcd subprocess is considered wedged and
 	// restarted. Prevents a single transient miss from nuking a healthy rcd.
 	//
+	// Four failures span three intervals, matching the default 90s tolerance.
 	// This is the fallback for rclone.rcd_restart_after; see
 	// restartAfterProbeFailures, which derives the count from that setting.
-	maxConsecutiveProbeFailures = 3
+	maxConsecutiveProbeFailures = 4
 
 	// probeTimeout bounds a single liveness probe.
 	probeTimeout = 5 * time.Second
@@ -34,8 +35,9 @@ const (
 //
 // The knob is expressed as a duration rather than a probe count because a count
 // is meaningless without healthCheckInterval, and exposing both invites
-// combinations that mean nothing. One duration, divided by the interval, keeps
-// the two in step.
+// combinations that mean nothing. The first failure starts the streak at t=0,
+// so N failures span (N-1) intervals. Wait enough whole intervals to cover the
+// duration, plus the initial failed probe.
 func (m *Manager) restartAfterProbeFailures() int {
 	if m.cfg == nil {
 		return maxConsecutiveProbeFailures
@@ -55,18 +57,12 @@ func (m *Manager) restartAfterProbeFailures() int {
 
 	// Round up by dividing first and adjusting, rather than the usual
 	// (after + interval - 1) / interval. That form overflows for a duration near
-	// the maximum time.Duration, wrapping negative, and the clamp below would
-	// then turn the longest tolerance anyone can express into a threshold of 1:
-	// a restart on every failed probe, the exact opposite of what was asked for.
-	threshold := int(after / healthCheckInterval)
+	// the maximum time.Duration and could turn a long tolerance into an immediate
+	// restart. Even the maximum duration needs fewer than 308 million probes at
+	// this interval, so the initial probe and rounding fit in a 32-bit int.
+	threshold := int(after/healthCheckInterval) + 1
 	if after%healthCheckInterval != 0 {
 		threshold++
-	}
-
-	// A value shorter than one interval still means "restart on the first
-	// sustained failure" rather than "restart immediately, every tick".
-	if threshold < 1 {
-		threshold = 1
 	}
 
 	return threshold
