@@ -207,6 +207,8 @@ func (r *QueueRepository) AddToQueue(ctx context.Context, item *ImportQueueItem)
 		metadata = excluded.metadata,
 		file_size = excluded.file_size,
 		target_path = excluded.target_path,
+		skip_arr_notification = excluded.skip_arr_notification,
+		skip_post_import_links = excluded.skip_post_import_links,
 		status = excluded.status,
 		indexer = COALESCE(excluded.indexer, import_queue.indexer),
 		retry_count = 0,
