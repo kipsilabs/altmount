@@ -21,9 +21,10 @@ type DB struct {
 	conn    *sql.DB
 	dialect dialectHelper
 	// Repository is kept for backwards-compat; prefer using Connection() directly.
-	Repository    *QueueRepository
-	MigrationRepo *ImportMigrationRepository
-	StoreRefRepo  *StoreRefRepository
+	Repository       *QueueRepository
+	MigrationRepo    *ImportMigrationRepository
+	StoreRefRepo     *StoreRefRepository
+	AvailabilityRepo *AvailabilityRepository
 }
 
 // Config holds database configuration.
@@ -92,6 +93,7 @@ func newSQLiteDB(config Config) (*DB, error) {
 	db.Repository = NewQueueRepository(conn, DialectSQLite)
 	db.MigrationRepo = NewImportMigrationRepository(conn, DialectSQLite)
 	db.StoreRefRepo = NewStoreRefRepository(conn, DialectSQLite)
+	db.AvailabilityRepo = NewAvailabilityRepository(conn, DialectSQLite)
 	return db, nil
 }
 
@@ -122,6 +124,7 @@ func newPostgresDB(config Config) (*DB, error) {
 	db.Repository = NewQueueRepository(conn, DialectPostgres)
 	db.MigrationRepo = NewImportMigrationRepository(conn, DialectPostgres)
 	db.StoreRefRepo = NewStoreRefRepository(conn, DialectPostgres)
+	db.AvailabilityRepo = NewAvailabilityRepository(conn, DialectPostgres)
 	return db, nil
 }
 
