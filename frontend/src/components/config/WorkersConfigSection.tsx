@@ -73,6 +73,45 @@ export function ImportConfigSection({
 	return (
 		<div className="min-w-0 space-y-10">
 			<div className="min-w-0 space-y-8">
+				<div className="space-y-4 rounded-2xl border-2 border-base-300/80 bg-base-200/60 p-6">
+					<h4 className="font-bold text-sm">Indexer cart RSS</h4>
+					<p className="text-base-content/70 text-sm">
+						Import new NZBs from your indexer’s cart feed. Leave the URL empty to disable polling.
+						Imported entries are remembered across restarts.
+					</p>
+					<div className="grid grid-cols-1 gap-6 sm:grid-cols-2">
+						<fieldset className="fieldset">
+							<legend className="fieldset-legend">RSS feed URL</legend>
+							<input
+								type="password"
+								autoComplete="new-password"
+								aria-label="RSS feed URL"
+								className="input w-full"
+								placeholder="https://indexer.example/rss?apikey=…"
+								value={formData.rss_feed_url ?? ""}
+								disabled={isReadOnly || isUpdating}
+								onChange={(e) => handleInputChange("rss_feed_url", e.target.value)}
+							/>
+							<p className="label">The saved URL is hidden because it may contain an API key.</p>
+						</fieldset>
+						<fieldset className="fieldset">
+							<legend className="fieldset-legend">Polling interval (seconds)</legend>
+							<input
+								type="number"
+								min={1}
+								max={86400}
+								aria-label="RSS polling interval in seconds"
+								className="input w-full"
+								value={formData.rss_poll_interval_seconds ?? 300}
+								disabled={isReadOnly || isUpdating}
+								onChange={(e) =>
+									handleInputChange("rss_poll_interval_seconds", Number(e.target.value))
+								}
+							/>
+							<p className="label">Default: 300 seconds. Changes apply automatically.</p>
+						</fieldset>
+					</div>
+				</div>
 				{/* Worker Core Configuration */}
 				<div className="min-w-0 space-y-6 overflow-hidden rounded-2xl border-2 border-base-300/80 bg-base-200/60 p-6">
 					<div className="flex items-center gap-2">

@@ -11,10 +11,10 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/javi11/nntppool/v5"
 	"github.com/kipsilabs/altmount/internal/auth"
 	"github.com/kipsilabs/altmount/internal/config"
 	"github.com/kipsilabs/altmount/internal/slogutil"
-	"github.com/javi11/nntppool/v5"
 )
 
 // ConfigManager interface defines methods for configuration management
@@ -134,6 +134,9 @@ func (s *Server) handleUpdateConfig(c *fiber.Ctx) error {
 	// stored value when a full-config update sends an empty masked field; a
 	// separate credential-rotation operation can still replace it explicitly.
 	preserveMaskedStremioCredentials(currentConfig, newConfig)
+	if newConfig.Import.RSSFeedURL == "********" {
+		newConfig.Import.RSSFeedURL = currentConfig.Import.RSSFeedURL
+	}
 
 	slog.DebugContext(c.Context(), "Updating configuration")
 
@@ -264,6 +267,9 @@ func (s *Server) handlePatchConfigSection(c *fiber.Ctx) error {
 		return RespondValidationError(c, "Invalid JSON in request body", err.Error())
 	}
 
+	if newConfig.Import.RSSFeedURL == "********" {
+		newConfig.Import.RSSFeedURL = currentConfig.Import.RSSFeedURL
+	}
 	slog.DebugContext(c.Context(), "Patching configuration section",
 		"section", section)
 
@@ -502,6 +508,7 @@ func (s *Server) handleTestProvider(c *fiber.Ctx) error {
 //	@Failure		400		{object}	APIResponse
 //	@Security		BearerAuth
 //	@Router			/providers [post]
+//
 // nextProviderID picks the lowest-numbered "provider_N" id not already used
 // by an existing provider. Providers can be deleted, so the next free index
 // is not simply len(existing)+1 — that can collide with a surviving provider.

@@ -125,6 +125,8 @@ rclone:
 
 # Import processing configuration
 import:
+  rss_feed_url: "" # Optional indexer cart RSS URL; empty disables polling (may contain an API key)
+  rss_poll_interval_seconds: 300 # Polling interval, 1-86400 seconds; changes apply without restart
   max_processor_workers: 2 # Number of NZB processor workers
   queue_processing_interval_seconds: 5 # Queue processing interval in seconds
   # Allowed file extensions for import (video, audio, and book formats)

@@ -20,6 +20,7 @@ import (
 	"github.com/kipsilabs/altmount/internal/arrs/registrar"
 	"github.com/kipsilabs/altmount/internal/config"
 	"github.com/kipsilabs/altmount/internal/health"
+	"github.com/kipsilabs/altmount/internal/importer"
 	"github.com/kipsilabs/altmount/internal/metadata"
 	"github.com/kipsilabs/altmount/internal/nzbfilesystem/segcache"
 	"github.com/kipsilabs/altmount/internal/pool"
@@ -132,6 +133,16 @@ func runServe(cmd *cobra.Command, args []string) error {
 			logger.Error("failed to close importer service", "err", err)
 		}
 	}()
+
+	// Stop RSS requests before closing the importer or database, including on
+	// early startup errors. The parent context also stops it during shutdown.
+	rssCtx, stopRSS := context.WithCancel(ctx)
+	rssDone := make(chan struct{})
+	go func() {
+		defer close(rssDone)
+		importer.NewRSSPoller(importerService, configManager.GetConfigGetter()).Run(rssCtx)
+	}()
+	defer func() { stopRSS(); <-rssDone }()
 
 	// Initialize segment cache source — encapsulates atomic manager swap and enabled-flag check.
 	cacheSource := segcache.NewSource(configManager.GetConfigGetter())
@@ -364,6 +375,8 @@ func runServe(cmd *cobra.Command, args []string) error {
 	case <-ctx.Done():
 		logger.InfoContext(ctx, "Context cancelled, shutting down")
 	}
+
+	<-rssDone
 
 	// Start graceful shutdown sequence
 	logger.InfoContext(ctx, "Starting graceful shutdown sequence")

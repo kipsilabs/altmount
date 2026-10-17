@@ -238,3 +238,32 @@ With ARR integration configured:
 ---
 
 ARR integration enables fully automated media management with AltMount acting as your primary download client. Combined with health monitoring, you can achieve a self-healing media collection that automatically repairs corruption and maintains high availability.
+
+
+## Indexer cart RSS
+
+In **Configuration → Import**, set **RSS feed URL** to your indexer's cart RSS URL
+and choose a **Polling interval (seconds)**. The default is 300 seconds; accepted
+intervals range from 1 to 86400 seconds. Clear the URL to disable polling. Changes
+apply automatically without restarting AltMount.
+
+```yaml
+import:
+  rss_feed_url: "https://indexer.example/rss?apikey=YOUR_KEY"
+  rss_poll_interval_seconds: 300
+```
+
+AltMount reads RSS 2.0 items, downloads NZBs from an NZB enclosure or the item's
+link, and sends them through the normal import queue. Relative URLs are supported.
+The saved feed URL is hidden in configuration responses because it can contain an
+API key. Keep the masked value when changing other settings, replace it to change
+the feed, or clear it to disable the feature.
+
+Successfully queued entries are remembered in the database even after queue or
+history cleanup and restarts. Failed downloads retry on the next poll, and a failed
+entry does not block other entries. Changing the feed URL creates a new feed identity.
+The feature supports one RSS feed and XML NZBs; Atom feeds and compressed NZB
+attachments are not supported. Network proxy settings and the configured User-Agent
+apply to both feed and NZB requests. Feed responses are limited to 8 MiB and NZBs
+to 64 MiB. A local configured feed is supported, but a feed cannot direct downloads
+to other literal private addresses.

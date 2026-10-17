@@ -151,6 +151,8 @@ type ProviderAPIResponse struct {
 
 // ImportAPIResponse handles Import config for API responses
 type ImportAPIResponse struct {
+	RSSFeedURL                     string   `json:"rss_feed_url"`
+	RSSPollIntervalSeconds         int      `json:"rss_poll_interval_seconds"`
 	MaxProcessorWorkers            int      `json:"max_processor_workers"`
 	QueueProcessingIntervalSeconds int      `json:"queue_processing_interval_seconds"` // Interval in seconds
 	AllowedFileExtensions          []string `json:"allowed_file_extensions"`
@@ -564,7 +566,17 @@ func ToConfigAPIResponse(cfg *config.Config, apiKey string) *ConfigAPIResponse {
 }
 
 func ToImportAPIResponse(importConfig config.ImportConfig) ImportAPIResponse {
+	maskedFeed := ""
+	if importConfig.RSSFeedURL != "" {
+		maskedFeed = "********"
+	}
+	interval := importConfig.RSSPollIntervalSeconds
+	if interval == 0 {
+		interval = 300
+	}
 	return ImportAPIResponse{
+		RSSFeedURL:                     maskedFeed,
+		RSSPollIntervalSeconds:         interval,
 		MaxProcessorWorkers:            importConfig.MaxProcessorWorkers,
 		QueueProcessingIntervalSeconds: importConfig.QueueProcessingIntervalSeconds,
 		AllowedFileExtensions:          importConfig.AllowedFileExtensions,

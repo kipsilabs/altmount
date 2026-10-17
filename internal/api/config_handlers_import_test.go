@@ -2,8 +2,11 @@ package api
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/gofiber/fiber/v2"
@@ -72,4 +75,43 @@ func TestGetConfigImportContentVerification(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRSSConfigMasksAndPreservesSavedFeed(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Import.RSSFeedURL = "https://indexer.example/rss?apikey=secret"
+	cfg.Import.RSSPollIntervalSeconds = 600
+	response := ToImportAPIResponse(cfg.Import)
+	require.Equal(t, "********", response.RSSFeedURL)
+	require.Equal(t, 600, response.RSSPollIntervalSeconds)
+
+	manager := config.NewManager(cfg, filepath.Join(t.TempDir(), "config.yaml"))
+	s := &Server{configManager: manager}
+	app := fiber.New()
+	app.Put("/api/config", s.handleUpdateConfig)
+	app.Patch("/api/config/:section", s.handlePatchConfigSection)
+	for _, method := range []string{http.MethodPut, http.MethodPatch} {
+		path := "/api/config"
+		if method == http.MethodPatch {
+			path += "/import"
+		}
+		request := httptest.NewRequest(method, path, strings.NewReader(`{"import":{"rss_feed_url":"********","rss_poll_interval_seconds":900}}`))
+		request.Header.Set("Content-Type", "application/json")
+		result, err := app.Test(request)
+		require.NoError(t, err)
+		body, err := io.ReadAll(result.Body)
+		require.NoError(t, err)
+		result.Body.Close()
+		require.Equal(t, http.StatusOK, result.StatusCode, string(body))
+		require.NotContains(t, string(body), "secret")
+		require.Equal(t, cfg.Import.RSSFeedURL, manager.GetConfig().Import.RSSFeedURL)
+		require.Equal(t, 900, manager.GetConfig().Import.RSSPollIntervalSeconds)
+	}
+	request := httptest.NewRequest(http.MethodPatch, "/api/config/import", strings.NewReader(`{"import":{"rss_feed_url":""}}`))
+	request.Header.Set("Content-Type", "application/json")
+	result, err := app.Test(request)
+	require.NoError(t, err)
+	defer result.Body.Close()
+	require.Equal(t, http.StatusOK, result.StatusCode)
+	require.Empty(t, manager.GetConfig().Import.RSSFeedURL)
 }

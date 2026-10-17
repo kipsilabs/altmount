@@ -52,7 +52,7 @@ func TestHealthMetadataIndexes_Postgres(t *testing.T) {
 		})
 	}
 	// Goose must remove all metadata indexes on rollback and recreate them on up.
-	require.NoError(t, goose.Down(db, "migrations/postgres"))
+	require.NoError(t, goose.DownTo(db, "migrations/postgres", 40))
 	var count int
 	require.NoError(t, db.QueryRow("SELECT count(*) FROM pg_indexes WHERE schemaname = 'public' AND indexname LIKE 'idx_file_health_metadata_%'").Scan(&count))
 	require.Zero(t, count)
