@@ -8,6 +8,12 @@ keywords: [altmount, sonarr, radarr, sabnzbd, arr, integration, download client,
 
 AltMount acts as a SABnzbd-compatible download client for Sonarr and Radarr. This guide walks through the full setup process for seamless integration with your media management applications.
 
+## Sonarr Version Compatibility
+
+Sonarr v4 and v5 use the same AltMount integration. You can configure instances of both versions at the same time; no version selector or configuration migration is required. Enter the instance URL (including any URL base, such as `http://sonarr:8989/sonarr`), without an `/api/v3` or `/api/v5` suffix.
+
+AltMount uses the v3 compatibility API retained by Sonarr v5 for library discovery, queue cleanup, repair searches, and download client and webhook registration. This preserves the per-episode queue records used by AltMount's failure tracking; Sonarr's native v5 API groups multiple episodes into one queue record.
+
 ## Prerequisites
 
 Before configuring ARR integration, make sure the following are in place:

@@ -65,7 +65,10 @@ func (m *Manager) GetOrCreateRadarrClient(instanceName, url, apiKey string) (*ra
 	return client, nil
 }
 
-// GetOrCreateSonarrClient gets or creates a Sonarr client for an instance
+// GetOrCreateSonarrClient gets or creates a Sonarr v4 or v5 client for an instance.
+// Both versions expose the v3 API used by starr. Keep using that compatibility
+// API: v5's native queue groups episodeIds, while v3 supplies per-episode records
+// needed by repair and failure tracking.
 func (m *Manager) GetOrCreateSonarrClient(instanceName, url, apiKey string) (*sonarr.Sonarr, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -168,7 +171,7 @@ func (m *Manager) TestConnection(ctx context.Context, instanceType, url, apiKey 
 
 	case "sonarr":
 		client := sonarr.New(m.starrConfig(url, apiKey))
-		_, err := client.GetSystemStatus()
+		_, err := client.GetSystemStatusContext(ctx)
 		if err != nil {
 			return fmt.Errorf("failed to connect to Sonarr: %w", err)
 		}
