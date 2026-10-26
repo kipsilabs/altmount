@@ -984,6 +984,20 @@ type readerInterrupter interface {
 	Interrupt()
 }
 
+// cancelableReader preserves cancellation through decryption wrappers. Its
+// cancel function is safe to call even while the wrapped reader is opening.
+type cancelableReader struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (r *cancelableReader) Interrupt() { r.cancel() }
+
+func (r *cancelableReader) Close() error {
+	r.cancel()
+	return r.ReadCloser.Close()
+}
+
 // interruptSlot wraps a readerInterrupter so we can store a nil-valued
 // entry in atomic.Value without panicking (Value.Store rejects untyped
 // nil and rejects type changes between calls).
@@ -1485,7 +1499,7 @@ ephemeral:
 		return n, nil
 	}
 
-	reader, err := mvf.createReaderAtOffset(off, end)
+	reader, err := mvf.createReaderAtOffset(readCtx, off, end)
 	if err != nil {
 		return 0, err
 	}
@@ -1587,7 +1601,7 @@ func (mvf *MetadataVirtualFile) tryServeFromRandomReadCache(readCtx context.Cont
 
 	// Miss: fetch the whole segment via an ephemeral reader so the next
 	// small read in the same segment is a cache hit.
-	reader, err := mvf.createReaderAtOffset(segStart, segEnd)
+	reader, err := mvf.createReaderAtOffset(readCtx, segStart, segEnd)
 	if err != nil {
 		return 0, false
 	}
@@ -1613,26 +1627,28 @@ func (mvf *MetadataVirtualFile) tryServeFromRandomReadCache(readCtx context.Cont
 
 // createReaderAtOffset creates an independent reader for reading at a specific offset.
 // This reader is self-contained and can be used concurrently with other readers.
-func (mvf *MetadataVirtualFile) createReaderAtOffset(start, end int64) (io.ReadCloser, error) {
+func (mvf *MetadataVirtualFile) createReaderAtOffset(ctx context.Context, start, end int64) (io.ReadCloser, error) {
 	if mvf.remuxActive() {
 		// Open the underlying window aligned to the packet grid and trim back to
 		// [start,end] so the rewrite is independent of this (possibly unaligned)
 		// window — see wrapAlignedRemux.
-		return mvf.wrapAlignedRemux(start, end, mvf.createRawReaderAtOffset)
+		return mvf.wrapAlignedRemux(start, end, func(s, e int64) (io.ReadCloser, error) {
+			return mvf.createRawReaderAtOffset(ctx, s, e)
+		})
 	}
-	return mvf.createRawReaderAtOffset(start, end)
+	return mvf.createRawReaderAtOffset(ctx, start, end)
 }
 
 // createRawReaderAtOffset builds the underlying reader for [start,end] without
 // the continuous-timeline remux wrapper.
-func (mvf *MetadataVirtualFile) createRawReaderAtOffset(start, end int64) (io.ReadCloser, error) {
+func (mvf *MetadataVirtualFile) createRawReaderAtOffset(ctx context.Context, start, end int64) (io.ReadCloser, error) {
 	if mvf.poolManager == nil {
 		return nil, ErrNoUsenetPool
 	}
 
 	// Nested sources take priority — each source has its own segments and AES credentials
 	if len(mvf.meta.NestedSources) > 0 {
-		return mvf.createNestedReader(start, end)
+		return mvf.createNestedReader(ctx, start, end)
 	}
 
 	if len(mvf.meta.SegmentData) == 0 {
@@ -1641,10 +1657,10 @@ func (mvf *MetadataVirtualFile) createRawReaderAtOffset(start, end int64) (io.Re
 
 	// Create reader based on encryption type
 	if mvf.meta.Encryption != metapb.Encryption_NONE {
-		return mvf.createEncryptedReaderAtOffset(start, end)
+		return mvf.createEncryptedReaderAtOffset(ctx, start, end)
 	}
 
-	return mvf.createUsenetReader(mvf.ctx, start, end)
+	return mvf.createUsenetReader(ctx, start, end)
 }
 
 // remuxActive reports whether this file needs the continuous-timeline TS remux
@@ -1681,7 +1697,7 @@ func (mvf *MetadataVirtualFile) wrapAlignedRemux(start, end int64, rawOpen func(
 }
 
 // createEncryptedReaderAtOffset creates an encrypted reader for a specific offset range
-func (mvf *MetadataVirtualFile) createEncryptedReaderAtOffset(start, end int64) (io.ReadCloser, error) {
+func (mvf *MetadataVirtualFile) createEncryptedReaderAtOffset(ctx context.Context, start, end int64) (io.ReadCloser, error) {
 	switch mvf.meta.Encryption {
 	case metapb.Encryption_RCLONE:
 		if mvf.rcloneCipher == nil {
@@ -1698,7 +1714,7 @@ func (mvf *MetadataVirtualFile) createEncryptedReaderAtOffset(start, end int64) 
 		}
 
 		return mvf.rcloneCipher.Open(
-			mvf.ctx,
+			ctx,
 			&utils.RangeHeader{Start: start, End: end},
 			mvf.meta.FileSize,
 			password,
@@ -1720,7 +1736,7 @@ func (mvf *MetadataVirtualFile) createEncryptedReaderAtOffset(start, end int64) 
 		}
 
 		return mvf.aesCipher.Open(
-			mvf.ctx,
+			ctx,
 			&utils.RangeHeader{Start: start, End: end},
 			mvf.meta.FileSize,
 			mvf.meta.AesKey,
@@ -2042,23 +2058,26 @@ func (mvf *MetadataVirtualFile) ensureReader() error {
 		rawEnd = alignEndUp(mvf.clipSpans, end, mvf.meta.FileSize)
 	}
 
-	// Create reader for the calculated range using metadata segments
-	if len(mvf.meta.NestedSources) > 0 {
-		// Nested RAR: use multi-source reader
-		reader, err := mvf.createNestedReader(rawStart, rawEnd)
+	// Encrypted constructors can read from the network while opening a tail
+	// range. Publish cancellation before calling them, and keep it available
+	// through wrappers that do not implement readerInterrupter themselves.
+	if len(mvf.meta.NestedSources) > 0 || mvf.meta.Encryption != metapb.Encryption_NONE {
+		ctx, cancel := context.WithCancel(mvf.readContext())
+		reader := &cancelableReader{cancel: cancel}
+		mvf.interruptHandle.Store(interruptSlot{i: reader})
+		var err error
+		if len(mvf.meta.NestedSources) > 0 {
+			reader.ReadCloser, err = mvf.createNestedReader(ctx, rawStart, rawEnd)
+		} else {
+			reader.ReadCloser, err = mvf.wrapWithEncryption(ctx, rawStart, rawEnd)
+		}
 		if err != nil {
-			return fmt.Errorf("failed to create nested reader: %w", err)
+			cancel()
+			mvf.interruptHandle.Store(interruptSlot{})
+			return err
 		}
 		mvf.setReader(reader)
-	} else if mvf.meta.Encryption != metapb.Encryption_NONE {
-		// Wrap the usenet reader with encryption
-		decryptedReader, err := mvf.wrapWithEncryption(rawStart, rawEnd)
-		if err != nil {
-			return fmt.Errorf(ErrMsgFailedWrapEncryption, err)
-		}
-		mvf.setReader(decryptedReader)
 	} else {
-		// Create plain usenet reader
 		ur, err := mvf.createUsenetReader(mvf.ctx, rawStart, rawEnd)
 		if err != nil {
 			return err
@@ -2266,7 +2285,7 @@ func (mvf *MetadataVirtualFile) createUsenetReader(ctx context.Context, start, e
 // building a lazy reader that opens each inner-volume reader only when needed.
 // This avoids opening all inner volumes simultaneously, which would cause all their
 // segments to be prefetched concurrently and spike memory usage.
-func (mvf *MetadataVirtualFile) createNestedReader(start, end int64) (io.ReadCloser, error) {
+func (mvf *MetadataVirtualFile) createNestedReader(ctx context.Context, start, end int64) (io.ReadCloser, error) {
 	sources := mvf.meta.NestedSources
 	if len(sources) == 0 {
 		return nil, fmt.Errorf("no nested sources available")
@@ -2316,12 +2335,13 @@ func (mvf *MetadataVirtualFile) createNestedReader(start, end int64) (io.ReadClo
 		return nil, fmt.Errorf("no nested sources cover range [%d, %d]", start, end)
 	}
 
-	return &lazyNestedMultiReader{mvf: mvf, specs: specs}, nil
+	return &lazyNestedMultiReader{mvf: mvf, ctx: ctx, specs: specs}, nil
 }
 
 // createNestedSourceReader creates a reader for a single NestedSegmentSource,
 // starting at innerStart within the decrypted inner volume and reading readLen bytes.
 func (mvf *MetadataVirtualFile) createNestedSourceReader(
+	ctx context.Context,
 	src *metapb.NestedSegmentSource,
 	innerStart int64,
 	readLen int64,
@@ -2340,7 +2360,7 @@ func (mvf *MetadataVirtualFile) createNestedSourceReader(
 		}
 
 		return mvf.aesCipher.Open(
-			mvf.ctx,
+			ctx,
 			rh,
 			src.InnerVolumeSize,
 			src.AesKey,
@@ -2352,7 +2372,7 @@ func (mvf *MetadataVirtualFile) createNestedSourceReader(
 	}
 
 	// Unencrypted source: read directly from segments at inner offset
-	return mvf.createUsenetReaderFromSegments(mvf.ctx, src.Segments, absoluteStart, absoluteStart+readLen-1)
+	return mvf.createUsenetReaderFromSegments(ctx, src.Segments, absoluteStart, absoluteStart+readLen-1)
 }
 
 // createUsenetReaderFromSegments creates a usenet reader from a specific set of segments
@@ -2397,6 +2417,7 @@ type nestedSourceSpec struct {
 // This prevents all inner volumes from being opened simultaneously, which would cause
 // all their segments to be prefetched concurrently and spike memory usage.
 type lazyNestedMultiReader struct {
+	ctx     context.Context
 	mvf     *MetadataVirtualFile
 	specs   []nestedSourceSpec
 	idx     int
@@ -2416,7 +2437,7 @@ func (r *lazyNestedMultiReader) Read(p []byte) (int, error) {
 			r.idx++
 			r.mu.Unlock()
 
-			rc, err := r.mvf.createNestedSourceReader(spec.src, spec.localStart, spec.readLen)
+			rc, err := r.mvf.createNestedSourceReader(r.ctx, spec.src, spec.localStart, spec.readLen)
 			if err != nil {
 				return 0, err
 			}
@@ -2464,7 +2485,7 @@ func (r *lazyNestedMultiReader) Interrupt() {
 }
 
 // wrapWithEncryption wraps a usenet reader with encryption using metadata
-func (mvf *MetadataVirtualFile) wrapWithEncryption(start, end int64) (io.ReadCloser, error) {
+func (mvf *MetadataVirtualFile) wrapWithEncryption(ctx context.Context, start, end int64) (io.ReadCloser, error) {
 	if mvf.meta.Encryption == metapb.Encryption_NONE {
 		return nil, ErrNoEncryptionParams
 	}
@@ -2487,7 +2508,7 @@ func (mvf *MetadataVirtualFile) wrapWithEncryption(start, end int64) (io.ReadClo
 
 		// Wrap with rclone decryption
 		decryptedReader, err := mvf.rcloneCipher.Open(
-			mvf.ctx,
+			ctx,
 			&utils.RangeHeader{Start: start, End: end},
 			mvf.meta.FileSize,
 			password,
@@ -2515,7 +2536,7 @@ func (mvf *MetadataVirtualFile) wrapWithEncryption(start, end int64) (io.ReadClo
 
 		// Wrap with AES decryption - pass key and IV directly
 		decryptedReader, err := mvf.aesCipher.Open(
-			mvf.ctx,
+			ctx,
 			&utils.RangeHeader{Start: start, End: end},
 			mvf.meta.FileSize,
 			mvf.meta.AesKey,

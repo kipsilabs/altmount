@@ -2,12 +2,14 @@ package nzbfilesystem
 
 import (
 	"context"
+	"io"
 	"testing"
 	"time"
 
 	"github.com/javi11/nntppool/v5"
 	"github.com/kipsilabs/altmount/internal/config"
 	"github.com/kipsilabs/altmount/internal/database"
+	"github.com/kipsilabs/altmount/internal/encryption/aes"
 	metapb "github.com/kipsilabs/altmount/internal/metadata/proto"
 	"github.com/kipsilabs/altmount/internal/testsupport/fakepool"
 	"github.com/kipsilabs/altmount/internal/testsupport/segments"
@@ -229,6 +231,71 @@ func TestReadTimeout_Defaults(t *testing.T) {
 			cfg := config.DefaultConfig()
 			cfg.Streaming.ReadTimeoutSeconds = tt.seconds
 			assert.Equal(t, tt.want, cfg.GetStreamReadTimeout())
+		})
+	}
+}
+
+// Encrypted wrappers must preserve cancellation, including while opening a
+// tail range (AES reads the preceding ciphertext block to reconstruct its IV).
+func TestEncryptedRead_StalledFetch_TimesOut(t *testing.T) {
+	for _, kind := range []string{"aes", "nested-aes"} {
+		t.Run(kind, func(t *testing.T) {
+			for _, mode := range []string{"webdav", "fuse", "webdav-tail", "fuse-tail", "fuse-seek"} {
+				t.Run(mode, func(t *testing.T) {
+					ctx, cancel := context.WithCancel(context.Background())
+					defer cancel()
+					fp := fakepool.New()
+					mvf := newTestMVF(t, ctx, fp, 8, 1024, 2)
+					for _, seg := range mvf.meta.SegmentData {
+						seg.Id = t.Name() + seg.Id
+						fp.SetBehavior(seg.Id, fakepool.SegmentBehavior{Latency: time.Minute})
+					}
+					mvf.meta.Encryption = metapb.Encryption_AES
+					mvf.meta.AesKey = make([]byte, 32)
+					mvf.meta.AesIv = make([]byte, 16)
+					mvf.aesCipher = aes.NewAesCipher()
+					if kind == "nested-aes" {
+						mvf.meta.NestedSources = []*metapb.NestedSegmentSource{{
+							Segments:        mvf.meta.SegmentData,
+							AesKey:          mvf.meta.AesKey,
+							AesIv:           mvf.meta.AesIv,
+							InnerLength:     mvf.meta.FileSize,
+							InnerVolumeSize: mvf.meta.FileSize,
+						}}
+					}
+
+					cfg := config.DefaultConfig()
+					cfg.Streaming.ReadTimeoutSeconds = 1
+					withConfig(mvf, cfg)
+					if mode == "webdav-tail" || mode == "fuse-tail" {
+						_, err := mvf.Seek(4096, io.SeekStart)
+						require.NoError(t, err)
+					}
+
+					done := make(chan error, 1)
+					go func() {
+						buf := make([]byte, 16)
+						var err error
+						switch mode {
+						case "webdav", "webdav-tail":
+							_, err = mvf.Read(buf)
+						case "fuse":
+							_, err = mvf.ReadAtContext(ctx, buf, 0)
+						default:
+							_, err = mvf.ReadAtContext(ctx, buf, 4096)
+						}
+						done <- err
+					}()
+					select {
+					case err := <-done:
+						assert.ErrorIs(t, err, ErrReadTimeout)
+					case <-time.After(4 * time.Second):
+						cancel()
+						<-done // release the read before newTestMVF's cleanup closes it
+						t.Fatal("encrypted read ignored the configured 1s timeout")
+					}
+				})
+			}
 		})
 	}
 }
