@@ -21,6 +21,7 @@ type openContextFS struct {
 	mu         sync.Mutex
 	ids        []string
 	suppressed []bool
+	ctxs       []context.Context
 	err        error
 }
 
@@ -31,6 +32,7 @@ func (f *openContextFS) Open(ctx context.Context, name string) (afero.File, erro
 	suppress, _ := ctx.Value(utils.SuppressStreamTrackingKey).(bool)
 	f.ids = append(f.ids, id)
 	f.suppressed = append(f.suppressed, suppress)
+	f.ctxs = append(f.ctxs, ctx)
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -91,6 +93,21 @@ func TestFileOpenPassesPerHandleDownloadID(t *testing.T) {
 		require.Equal(t, syscall.Errno(0), handle.Release(context.Background()))
 		require.False(t, tracker.streams[id])
 	}
+}
+
+func TestFileOpenIgnoresOpenContextCancellation(t *testing.T) {
+	backing := &openContextFS{fakeNzbFS: newFakeNzbFS()}
+	backing.addFile("movie.mkv", 1024)
+	file := &File{nzbfs: backing, path: "movie.mkv", logger: slog.Default()}
+
+	reqCtx, cancel := context.WithCancel(context.Background())
+	handle, _, errno := file.Open(reqCtx, syscall.O_RDONLY)
+	require.Equal(t, syscall.Errno(0), errno)
+	defer handle.(*Handle).Release(context.Background())
+
+	cancel()
+	require.Len(t, backing.ctxs, 1)
+	require.NoError(t, backing.ctxs[0].Err(), "handle context must not follow the open request's cancellation")
 }
 
 func TestFileOpenFailureRemovesDownloadStream(t *testing.T) {

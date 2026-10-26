@@ -81,7 +81,8 @@ func (f *File) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 		ctx = context.WithValue(ctx, utils.StreamIDKey, stream.ID)
 	}
 
-	aferoFile, err := f.nzbfs.Open(ctx, f.path)
+	// The handle outlives this request, whose context go-fuse may cancel later.
+	aferoFile, err := f.nzbfs.Open(context.WithoutCancel(ctx), f.path)
 	if err != nil {
 		if stream != nil {
 			f.streamTracker.Remove(stream.ID)
