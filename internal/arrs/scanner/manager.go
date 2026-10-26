@@ -3,11 +3,13 @@ package scanner
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/kipsilabs/altmount/internal/arrs/clients"
@@ -15,6 +17,7 @@ import (
 	"github.com/kipsilabs/altmount/internal/arrs/failures"
 	"github.com/kipsilabs/altmount/internal/arrs/instances"
 	"github.com/kipsilabs/altmount/internal/arrs/model"
+	"github.com/kipsilabs/altmount/internal/arrs/registrar"
 	"github.com/kipsilabs/altmount/internal/config"
 	"github.com/kipsilabs/altmount/internal/database"
 	"golang.org/x/sync/singleflight"
@@ -25,18 +28,29 @@ import (
 	"golift.io/starr/sonarr"
 )
 
+var errNoSonarrQueueMatch = errors.New("no matching Sonarr queue download")
+
 type Manager struct {
-	configGetter config.ConfigGetter
-	instances    *instances.Manager
-	clients      *clients.Manager
-	data         *data.Manager
-	repo         *database.Repository
+	sonarrStagesMu sync.Mutex
+	sonarrStages   map[string]*sonarrRepairStage
+	configGetter   config.ConfigGetter
+	instances      *instances.Manager
+	clients        *clients.Manager
+	data           *data.Manager
+	repo           *database.Repository
 	// failures is the shared per-target circuit breaker (see arrs/failures). The
 	// scanner bumps it on every targeted re-search it issues; at the configured
 	// queue_cleanup_max_failures threshold it stops searching and unmonitors the
 	// target instead, so a dead release can't drive an endless re-grab storm.
-	failures *failures.Tracker
-	sf       singleflight.Group
+	failures          *failures.Tracker
+	sf                singleflight.Group
+	sonarrQueueRepair func(context.Context, string, clients.SonarrClient, model.SonarrDownloadGroup) error
+}
+
+// SetSonarrQueueRepair routes queue fallback through the worker's grouped,
+// resumable executor. Install before starting scanner/worker goroutines.
+func (m *Manager) SetSonarrQueueRepair(repair func(context.Context, string, clients.SonarrClient, model.SonarrDownloadGroup) error) {
+	m.sonarrQueueRepair = repair
 }
 
 func NewManager(configGetter config.ConfigGetter, instances *instances.Manager, clients *clients.Manager, data *data.Manager, repo *database.Repository, failureTracker *failures.Tracker) *Manager {
@@ -164,7 +178,7 @@ func (m *Manager) managesFile(ctx context.Context, instanceType string, client a
 		}
 		return m.radarrManagesFile(ctx, rc, filePath)
 	case "sonarr":
-		sc, ok := client.(*sonarr.Sonarr)
+		sc, ok := client.(clients.SonarrClient)
 		if !ok {
 			return 0
 		}
@@ -182,7 +196,7 @@ func (m *Manager) managesFile(ctx context.Context, instanceType string, client a
 		}
 		return m.readarrManagesFile(ctx, rc, filePath)
 	case "whisparr":
-		wc, ok := client.(*sonarr.Sonarr)
+		wc, ok := client.(clients.SonarrClient)
 		if !ok {
 			return 0
 		}
@@ -201,7 +215,7 @@ func (m *Manager) hasFile(ctx context.Context, instanceType string, client any, 
 		}
 		return m.radarrHasFile(ctx, rc, instanceName, relativePath)
 	case "sonarr":
-		sc, ok := client.(*sonarr.Sonarr)
+		sc, ok := client.(clients.SonarrClient)
 		if !ok {
 			return false
 		}
@@ -245,7 +259,7 @@ func (m *Manager) radarrManagesFile(ctx context.Context, client *radarr.Radarr, 
 
 // sonarrManagesFile scores how specifically Sonarr's root folders claim
 // filePath (checkrr approach). See rootFolderScore for the match rule.
-func (m *Manager) sonarrManagesFile(ctx context.Context, client *sonarr.Sonarr, filePath string) int {
+func (m *Manager) sonarrManagesFile(ctx context.Context, client clients.SonarrClient, filePath string) int {
 	slog.DebugContext(ctx, "Checking Sonarr root folders for file ownership",
 		"file_path", filePath)
 
@@ -327,7 +341,7 @@ func (m *Manager) radarrHasFile(ctx context.Context, client *radarr.Radarr, inst
 }
 
 // sonarrHasFile checks if any series in the instance contains the given relative path
-func (m *Manager) sonarrHasFile(ctx context.Context, client *sonarr.Sonarr, instanceName, relativePath string) bool {
+func (m *Manager) sonarrHasFile(ctx context.Context, client clients.SonarrClient, instanceName, relativePath string) bool {
 	seriesList, err := m.data.GetSeries(ctx, client, instanceName)
 	if err != nil {
 		slog.ErrorContext(ctx, "Failed to get series for relative path check", "instance", instanceName, "error", err)
@@ -419,7 +433,7 @@ func (m *Manager) TriggerFileRescan(ctx context.Context, pathForRescan string, r
 			return nil, m.triggerRadarrRescanByPath(bgCtx, client, pathForRescan, relativePath, instanceName, metadata)
 
 		case "sonarr":
-			client, err := m.clients.GetOrCreateSonarrClient(instanceName, instanceConfig.URL, instanceConfig.APIKey)
+			client, err := m.clients.GetOrCreateSonarrClientContext(bgCtx, instanceName, instanceConfig.URL, instanceConfig.APIKey, instanceConfig.APIVersion)
 			if err != nil {
 				return nil, fmt.Errorf("failed to create Sonarr client: %w", err)
 			}
@@ -500,7 +514,7 @@ func (m *Manager) TriggerScanForFile(ctx context.Context, filePath string) error
 			}
 
 		case "sonarr":
-			client, err := m.clients.GetOrCreateSonarrClient(instance.Name, instance.URL, instance.APIKey)
+			client, err := m.clients.GetOrCreateSonarrClientContext(bgCtx, instance.Name, instance.URL, instance.APIKey, instance.APIVersion)
 			if err != nil {
 				slog.ErrorContext(bgCtx, "Failed to create Sonarr client for scan trigger", "instance", instance.Name, "error", err)
 				return
@@ -564,7 +578,7 @@ func (m *Manager) TriggerDownloadScan(ctx context.Context, instanceType string) 
 					}
 
 				case "sonarr":
-					client, err := m.clients.GetOrCreateSonarrClient(inst.Name, inst.URL, inst.APIKey)
+					client, err := m.clients.GetOrCreateSonarrClientContext(bgCtx, inst.Name, inst.URL, inst.APIKey, inst.APIVersion)
 					if err != nil {
 						slog.ErrorContext(bgCtx, "Failed to create Sonarr client for scan trigger", "instance", inst.Name, "error", err)
 						return nil, err
@@ -868,7 +882,7 @@ func (m *Manager) triggerRadarrRescanByPath(ctx context.Context, client *radarr.
 }
 
 // triggerSonarrRescanByPath triggers a rescan in Sonarr for the given file path
-func (m *Manager) triggerSonarrRescanByPath(ctx context.Context, client *sonarr.Sonarr, filePath, relativePath, instanceName string, metadata *model.WebhookMetadata) error {
+func (m *Manager) triggerSonarrRescanByPath(ctx context.Context, client clients.SonarrClient, filePath, relativePath, instanceName string, metadata *model.WebhookMetadata) (resultErr error) {
 	slog.InfoContext(ctx, "Searching Sonarr for matching series",
 		"instance", instanceName,
 		"file_path", filePath,
@@ -944,8 +958,10 @@ func (m *Manager) triggerSonarrRescanByPath(ctx context.Context, client *sonarr.
 				"file_path", filePath)
 
 			// Fallback: search in Sonarr download queue for active/stuck imports
-			if err := m.failSonarrQueueItemByPath(ctx, client, filePath); err == nil {
+			if err := m.failSonarrQueueItemByPath(ctx, client, instanceName, filePath); err == nil {
 				return nil
+			} else if !errors.Is(err, errNoSonarrQueueMatch) {
+				return err
 			}
 
 			return fmt.Errorf("no series found containing file path in library or queue: %s: %w", filePath, model.ErrPathMatchFailed)
@@ -1008,6 +1024,35 @@ func (m *Manager) triggerSonarrRescanByPath(ctx context.Context, client *sonarr.
 		}
 	}
 
+	if targetEpisodeFileID == 0 {
+		if err := m.failSonarrQueueItemByPath(ctx, client, instanceName, filePath); err == nil {
+			return nil
+		} else if !errors.Is(err, errNoSonarrQueueMatch) {
+			return err
+		}
+	}
+	event := m.sonarrRepairEvent(ctx, instanceName, relativePath, targetEpisodeFileID)
+	if metadata != nil && strings.TrimSpace(metadata.DownloadID) != "" {
+		event = failures.SonarrDownloadKey(instanceName, metadata.DownloadID)
+	}
+	unlock, lockErr := m.failures.LockAction(ctx, event)
+	if lockErr != nil {
+		return lockErr
+	}
+	defer unlock()
+	completionKey := fmt.Sprintf("%s|repair:%d:%s", event, targetEpisodeFileID, relativePath)
+	finish, acquired := m.failures.BeginAction(completionKey)
+	if !acquired {
+		return nil
+	}
+	stage, finishStage := m.startSonarrRepairStage(completionKey)
+	defer func() {
+		success := resultErr == nil || errors.Is(resultErr, model.ErrEpisodeAlreadySatisfied)
+		finish(success)
+		finishStage(success)
+	}()
+
+	failedDownloadID := m.sonarrSourceDownloadID(ctx, relativePath, metadata)
 	var episodeIDs []int64
 	var autoSearch *arrCommand
 
@@ -1027,24 +1072,20 @@ func (m *Manager) triggerSonarrRescanByPath(ctx context.Context, client *sonarr.
 			}
 		}
 
-		// Smart Repair Guard: If we had a file ID but it's no longer found linked to any episode,
-		// it's likely been upgraded or deleted.
 		if len(episodeIDs) == 0 {
-			slog.InfoContext(ctx, "Smart Repair Guard: Episode file ID is no longer active. Checking for newer replacements.",
-				"old_file_id", targetEpisodeFileID)
-
-			// Try to find if any episode currently has a different file at the same path or with same scene name
-			episodeFiles, err := m.data.GetEpisodeFiles(ctx, client, instanceName, targetSeriesID)
-			if err == nil {
-				for _, ef := range episodeFiles {
-					if ef.Path == filePath || (sceneName != "" && ef.SceneName == sceneName) {
-						slog.InfoContext(ctx, "Smart Repair Guard: Episode already has a different healthy file (likely upgraded). Skipping repair.",
-							"old_file_id", targetEpisodeFileID,
-							"new_file_id", ef.ID)
-						return model.ErrEpisodeAlreadySatisfied
+			// Recover intended targets after an earlier deletion, or from the
+			// original webhook. File-cache entries cannot establish satisfaction.
+			episodeIDs = append(episodeIDs, stage.EpisodeIDs...)
+			if len(episodeIDs) == 0 && metadata != nil {
+				for _, ep := range metadata.Episodes {
+					if ep.Id > 0 {
+						episodeIDs = append(episodeIDs, ep.Id)
 					}
 				}
 			}
+		}
+		if len(episodeIDs) > 0 {
+			stage.EpisodeIDs = append([]int64(nil), episodeIDs...)
 		}
 
 		if len(episodeIDs) > 0 {
@@ -1052,17 +1093,31 @@ func (m *Manager) triggerSonarrRescanByPath(ctx context.Context, client *sonarr.
 				"episode_count", len(episodeIDs),
 				"episode_file_id", targetEpisodeFileID)
 
-			failAt := time.Now()
+			stage.EpisodeIDs = append([]int64(nil), episodeIDs...)
+			failAt := stage.Created
 
+			eligibleIDs, refreshErr := unresolvedSonarrRepairEpisodes(ctx, client, episodeIDs, targetEpisodeFileID, failedDownloadID)
+			if refreshErr != nil {
+				return refreshErr
+			}
+			if len(eligibleIDs) == 0 && !stage.CleanupStarted {
+				return nil
+			}
+			stage.CleanupStarted = true
+			_, exhausted := m.splitEpisodesByBreaker(instanceName, eligibleIDs, event)
+			if err := unmonitorSonarrEpisodes(ctx, client, instanceName, exhausted); err != nil {
+				return err
+			}
 			// Try to blocklist the release associated with this file
-			if err := m.blocklistSonarrEpisodeFile(ctx, client, targetSeriesID, targetEpisodeFileID, relativePath, episodeIDs, sceneName); err != nil {
-				slog.WarnContext(ctx, "Failed to blocklist Sonarr release", "error", err)
+			if err := m.blocklistSonarrRepairOnce(ctx, client, event, targetSeriesID, targetEpisodeFileID, relativePath, episodeIDs, sceneName, failedDownloadID); err != nil {
+				return err
 			}
 
 			auto, state, err := m.settleSonarrAutoRedownload(ctx, client, instanceName, sonarrRedownloadTarget{
 				seriesID:      targetSeriesID,
 				episodeIDs:    episodeIDs,
 				episodeFileID: targetEpisodeFileID,
+				downloadID:    failedDownloadID,
 			}, failAt)
 			if err != nil {
 				return err
@@ -1076,15 +1131,7 @@ func (m *Manager) triggerSonarrRescanByPath(ctx context.Context, client *sonarr.
 			autoSearch = auto
 		}
 	} else {
-		slog.WarnContext(ctx, "Series found but no matching episode file ID found, attempting queue-based failure",
-			"series", targetSeriesTitle,
-			"file_path", filePath)
-
-		// Fallback: search in Sonarr download queue
-		if err := m.failSonarrQueueItemByPath(ctx, client, filePath); err == nil {
-			return nil
-		}
-
+		// Queue fallback was attempted before taking the file repair lock.
 		// Fallback 2: If we have episode IDs from metadata, use them to trigger replacement search
 		if metadata != nil && len(metadata.Episodes) > 0 {
 			slog.InfoContext(ctx, "Using episode IDs from metadata to trigger replacement search", "series", targetSeriesTitle)
@@ -1092,16 +1139,30 @@ func (m *Manager) triggerSonarrRescanByPath(ctx context.Context, client *sonarr.
 				episodeIDs = append(episodeIDs, ep.Id)
 			}
 
-			failAt := time.Now()
+			stage.EpisodeIDs = append([]int64(nil), episodeIDs...)
+			failAt := stage.Created
 
+			eligibleIDs, refreshErr := unresolvedSonarrRepairEpisodes(ctx, client, episodeIDs, targetEpisodeFileID, failedDownloadID)
+			if refreshErr != nil {
+				return refreshErr
+			}
+			if len(eligibleIDs) == 0 && !stage.CleanupStarted {
+				return nil
+			}
+			stage.CleanupStarted = true
+			_, exhausted := m.splitEpisodesByBreaker(instanceName, eligibleIDs, event)
+			if err := unmonitorSonarrEpisodes(ctx, client, instanceName, exhausted); err != nil {
+				return err
+			}
 			// Try to blocklist the release associated with these episodes
-			if err := m.blocklistSonarrEpisodeFile(ctx, client, targetSeriesID, 0, relativePath, episodeIDs, sceneName); err != nil {
-				slog.WarnContext(ctx, "Failed to blocklist Sonarr release using metadata fallback", "error", err)
+			if err := m.blocklistSonarrRepairOnce(ctx, client, event, targetSeriesID, 0, relativePath, episodeIDs, sceneName, failedDownloadID); err != nil {
+				return err
 			}
 
 			auto, state, err := m.settleSonarrAutoRedownload(ctx, client, instanceName, sonarrRedownloadTarget{
 				seriesID:   targetSeriesID,
 				episodeIDs: episodeIDs,
+				downloadID: failedDownloadID,
 			}, failAt)
 			if err != nil {
 				return err
@@ -1120,15 +1181,35 @@ func (m *Manager) triggerSonarrRescanByPath(ctx context.Context, client *sonarr.
 		return fmt.Errorf("no episodes found for file in library or queue: %s: %w", filePath, model.ErrPathMatchFailed)
 	}
 
+	// Automatic searches can cover only part of a pack. Refresh and search the
+	// unresolved monitored siblings rather than repeating the full episode set.
+	episodeIDs, err = unresolvedSonarrRepairEpisodes(ctx, client, episodeIDs, targetEpisodeFileID, failedDownloadID)
+	if err != nil {
+		return err
+	}
+	if len(episodeIDs) == 0 {
+		return nil
+	}
+
 	// Failure breaker: every targeted re-search counts one failure-driven action
 	// against each episode. Episodes at the threshold are unmonitored instead of
 	// re-searched so a dead release can't drive an endless re-grab storm.
-	searchIDs, giveUpIDs := m.splitEpisodesByBreaker(instanceName, episodeIDs)
-	unmonitorSonarrEpisodes(ctx, client, instanceName, giveUpIDs)
+	searchIDs, giveUpIDs := m.splitEpisodesByBreaker(instanceName, episodeIDs, event)
+	if err := unmonitorSonarrEpisodes(ctx, client, instanceName, giveUpIDs); err != nil {
+		return err
+	}
 	if len(searchIDs) == 0 {
 		return nil
 	}
 
+	searchIDs, err = reconcileSonarrSearch(ctx, client, stage, searchIDs)
+	if err != nil {
+		return err
+	}
+	if len(searchIDs) == 0 {
+		return nil
+	}
+	stage.CommandAttempted = time.Now()
 	// Trigger targeted episode search for the remaining episodes in this file
 	response, err := m.sendSonarrSearch(ctx, client, instanceName, searchIDs, autoSearch)
 	if err != nil {
@@ -1173,31 +1254,27 @@ func (m *Manager) failRadarrQueueItemByPath(ctx context.Context, client *radarr.
 }
 
 // failSonarrQueueItemByPath searches for an item in the active Sonarr queue by path and marks it as failed
-func (m *Manager) failSonarrQueueItemByPath(ctx context.Context, client *sonarr.Sonarr, path string) error {
-	queue, err := client.GetQueueContext(ctx, 0, 500)
+func (m *Manager) failSonarrQueueItemByPath(ctx context.Context, client clients.SonarrClient, instanceName, path string) error {
+	groups, err := client.QueueGroups(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to get Sonarr queue: %w", err)
+		return fmt.Errorf("read Sonarr queue: %w", err)
 	}
-
-	for _, q := range queue.Records {
-		// Try exact match, prefix match (if queue item is parent dir), or filename match
-		if q.OutputPath == path ||
-			(q.OutputPath != "" && strings.HasPrefix(filepath.ToSlash(path), filepath.ToSlash(q.OutputPath))) ||
-			(q.OutputPath != "" && filepath.Base(q.OutputPath) == filepath.Base(path)) {
-			slog.InfoContext(ctx, "Found matching item in Sonarr download queue, marking as failed",
-				"queue_id", q.ID, "path", path, "output_path", q.OutputPath)
-
-			removeFromClient := true
-			opts := &starr.QueueDeleteOpts{
-				RemoveFromClient: &removeFromClient,
-				BlockList:        true,
-				SkipRedownload:   false,
-			}
-			return client.DeleteQueueContext(ctx, q.ID, opts)
+	for _, group := range groups {
+		q := group.Record
+		if q == nil || !registrar.IsAltmountDownloadClient(q.DownloadClient) || q.OutputPath == "" {
+			continue
 		}
+		source := strings.TrimRight(filepath.ToSlash(q.OutputPath), "/")
+		target := filepath.ToSlash(path)
+		if target != source && !strings.HasPrefix(target, source+"/") && filepath.Base(q.OutputPath) != filepath.Base(path) {
+			continue
+		}
+		if m.sonarrQueueRepair == nil {
+			return fmt.Errorf("grouped Sonarr queue executor unavailable; deferring repair")
+		}
+		return m.sonarrQueueRepair(ctx, instanceName, client, group)
 	}
-
-	return fmt.Errorf("no matching item found in Sonarr queue for path: %s", path)
+	return fmt.Errorf("%w for path: %s", errNoSonarrQueueMatch, path)
 }
 
 // blocklistRadarrMovieFile finds the history event for the given file and marks it as failed (blocklisting the release)
@@ -1286,11 +1363,14 @@ func (m *Manager) blocklistRadarrMovieFile(ctx context.Context, client *radarr.R
 }
 
 // blocklistSonarrEpisodeFile finds the grabbed history event for the given file and marks it as failed (blocklisting the release)
-func (m *Manager) blocklistSonarrEpisodeFile(ctx context.Context, client *sonarr.Sonarr, seriesID int64, fileID int64, relativePath string, episodeIDs []int64, sceneName string) error {
+func (m *Manager) blocklistSonarrEpisodeFile(ctx context.Context, client clients.SonarrClient, seriesID int64, fileID int64, relativePath string, episodeIDs []int64, sceneName string, attempted *time.Time, downloadIDs ...string) error {
 	slog.DebugContext(ctx, "Attempting to find and blocklist release for episode file", "series_id", seriesID, "file_id", fileID, "scene_name", sceneName)
 
 	var downloadID string
-	if m.repo != nil && relativePath != "" {
+	if len(downloadIDs) > 0 {
+		downloadID = downloadIDs[0]
+	}
+	if downloadID == "" && m.repo != nil && relativePath != "" {
 		if hist, err := m.repo.GetImportHistoryByPath(ctx, relativePath); err == nil && hist != nil {
 			if hist.DownloadID != nil {
 				downloadID = *hist.DownloadID
@@ -1314,11 +1394,49 @@ func (m *Manager) blocklistSonarrEpisodeFile(ctx context.Context, client *sonarr
 		return fmt.Errorf("failed to fetch Sonarr history: %w", err)
 	}
 
+	// A response can be lost after Sonarr accepted a history failure. Its
+	// failed event is definitive acknowledgement; never fail the grabbed event twice.
+	if downloadID != "" {
+		for _, record := range history.Records {
+			if record == nil {
+				continue
+			}
+			if record != nil && strings.EqualFold(record.DownloadID, downloadID) && record.EventType == "downloadFailed" {
+				return nil
+			}
+		}
+	}
+
+	failGrab := func(grab *sonarr.HistoryRecord) error {
+		if grab.DownloadID != "" {
+			for _, record := range history.Records {
+				if record != nil && record.EventType == "downloadFailed" && strings.EqualFold(record.DownloadID, grab.DownloadID) {
+					return nil
+				}
+			}
+		}
+		if attempted != nil && !attempted.IsZero() && time.Since(*attempted) < 30*time.Second {
+			return fmt.Errorf("waiting to reconcile uncertain Sonarr history failure")
+		}
+		if attempted != nil {
+			*attempted = time.Now()
+		}
+		err := client.FailContext(ctx, grab.ID)
+		var request *starr.ReqError
+		if err != nil && attempted != nil && errors.As(err, &request) && request.Code >= 400 && request.Code < 500 {
+			*attempted = time.Time{}
+		}
+		return err
+	}
+
 	targetFileID := strconv.FormatInt(fileID, 10)
 
 	// 1. Find the import event to get the downloadId
 	for _, record := range history.Records {
-		if record.EventType == "downloadFolderImported" {
+		if record == nil {
+			continue
+		}
+		if downloadID == "" && record.EventType == "downloadFolderImported" {
 			if record.Data.FileID == targetFileID {
 				downloadID = record.DownloadID
 				break
@@ -1343,11 +1461,14 @@ func (m *Manager) blocklistSonarrEpisodeFile(ctx context.Context, client *sonarr
 
 		// Precision Fallback: Find the grabbed event matching the SceneName
 		for _, record := range history.Records {
+			if record == nil {
+				continue
+			}
 			if record.EventType == "grabbed" {
 				if sceneName != "" && strings.Contains(strings.ToLower(record.SourceTitle), strings.ToLower(sceneName)) {
 					slog.InfoContext(ctx, "Found grabbed history record using SceneName precision fallback, marking as failed to blocklist release",
 						"history_id", record.ID, "source_title", record.SourceTitle)
-					if failErr := client.FailContext(ctx, record.ID); failErr != nil {
+					if failErr := failGrab(record); failErr != nil {
 						return fmt.Errorf("failed to fail Sonarr grab event %d: %w", record.ID, failErr)
 					}
 					return nil
@@ -1359,7 +1480,7 @@ func (m *Manager) blocklistSonarrEpisodeFile(ctx context.Context, client *sonarr
 						if time.Since(record.Date) < 24*time.Hour {
 							slog.InfoContext(ctx, "Found recent grabbed history record using EpisodeID fallback, marking as failed to blocklist release",
 								"history_id", record.ID, "episode_id", epID, "grabbed_at", record.Date)
-							if failErr := client.FailContext(ctx, record.ID); failErr != nil {
+							if failErr := failGrab(record); failErr != nil {
 								return fmt.Errorf("failed to fail Sonarr grab event %d: %w", record.ID, failErr)
 							}
 							return nil
@@ -1375,10 +1496,13 @@ func (m *Manager) blocklistSonarrEpisodeFile(ctx context.Context, client *sonarr
 
 	// 2. Find the original grab event using the downloadId
 	for _, record := range history.Records {
-		if record.DownloadID == downloadID && record.EventType == "grabbed" {
+		if record == nil {
+			continue
+		}
+		if strings.EqualFold(record.DownloadID, downloadID) && record.EventType == "grabbed" {
 			slog.InfoContext(ctx, "Found grabbed history record, marking as failed to blocklist release",
 				"history_id", record.ID, "download_id", downloadID)
-			if failErr := client.FailContext(ctx, record.ID); failErr != nil {
+			if failErr := failGrab(record); failErr != nil {
 				return fmt.Errorf("failed to fail Sonarr grab event %d: %w", record.ID, failErr)
 			}
 			return nil

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -16,17 +17,56 @@ import (
 
 // fakeSonarrQueue serves a fixed Sonarr queue and records deletes/unmonitors.
 type fakeSonarrQueue struct {
-	mu          sync.Mutex
-	records     []map[string]any
-	queueGets   int
-	deletes     []string  // raw query of each queue DELETE
-	unmonitored [][]int64 // episodeIds of each monitored=false PUT
+	native         bool
+	mu             sync.Mutex
+	records        []map[string]any
+	queueGets      int
+	deletes        []string  // raw query of each queue DELETE
+	unmonitored    [][]int64 // episodeIds of each monitored=false PUT
+	episodeFileIDs map[int64]int64
+	monitorFails   bool
+	searches       [][]int64
 }
 
 func (f *fakeSonarrQueue) handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		if f.native {
+			if r.URL.Path == "/api" {
+				_, _ = w.Write([]byte(`{"current":"v5"}`))
+				return
+			}
+			if strings.HasSuffix(r.URL.Path, "/system/status") {
+				_, _ = w.Write([]byte(`{"appName":"Sonarr","version":"5.0.0"}`))
+				return
+			}
+			// Reuse fixture behavior while retaining native queue/removal payloads.
+			r.URL.Path = strings.Replace(r.URL.Path, "/api/v5/", "/api/v3/", 1)
+		}
+
 		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v3/episode":
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			var episodes []map[string]any
+			seen := map[int64]bool{}
+			for _, value := range r.URL.Query()["episodeIds"] {
+				id, _ := strconv.ParseInt(value, 10, 64)
+				if !seen[id] {
+					episodes = append(episodes, map[string]any{"id": id, "monitored": true, "episodeFileId": f.episodeFileIDs[id], "hasFile": f.episodeFileIDs[id] > 0})
+					seen[id] = true
+				}
+			}
+			_ = json.NewEncoder(w).Encode(episodes)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v3/command":
+			var body struct {
+				EpisodeIDs []int64 `json:"episodeIds"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			f.mu.Lock()
+			f.searches = append(f.searches, body.EpisodeIDs)
+			f.mu.Unlock()
+			_, _ = w.Write([]byte(`{"id":99,"name":"EpisodeSearch","trigger":"manual"}`))
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v3/queue":
 			f.mu.Lock()
 			f.queueGets++
@@ -41,6 +81,10 @@ func (f *fakeSonarrQueue) handler() http.Handler {
 			f.mu.Unlock()
 			_, _ = w.Write([]byte(`{}`))
 		case r.Method == http.MethodPut && r.URL.Path == "/api/v3/episode/monitor":
+			if f.monitorFails {
+				http.Error(w, "failed to unmonitor", 500)
+				return
+			}
 			var body struct {
 				EpisodeIDs []int64 `json:"episodeIds"`
 				Monitored  bool    `json:"monitored"`
@@ -108,7 +152,10 @@ func TestHandleImportFailure_GivesUpAtThreshold(t *testing.T) {
 
 	// First failure: counted only. Second failure (re-grab also failed): give up.
 	w.HandleImportFailure(context.Background(), "SABnzbd_nzo_abc", "tv")
-	w.HandleImportFailure(context.Background(), "sabnzbd_NZO_ABC", "tv") // case-insensitive match
+	fake.mu.Lock()
+	fake.records[0]["downloadId"] = "replacement-download"
+	fake.mu.Unlock()
+	w.HandleImportFailure(context.Background(), "replacement-download", "tv") // a new failed download generation
 
 	if len(fake.unmonitored) != 1 || len(fake.unmonitored[0]) != 1 || fake.unmonitored[0][0] != 42 {
 		t.Fatalf("unmonitored = %v, want [[42]]", fake.unmonitored)

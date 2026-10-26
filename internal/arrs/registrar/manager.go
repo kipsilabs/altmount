@@ -145,7 +145,7 @@ func (m *Manager) EnsureWebhookRegistration(ctx context.Context, altmountURL str
 			}
 
 		case "sonarr":
-			client, err := m.clients.GetOrCreateSonarrClient(instance.Name, instance.URL, instance.APIKey)
+			client, err := m.clients.GetOrCreateSonarrClientContext(ctx, instance.Name, instance.URL, instance.APIKey, instance.APIVersion)
 			if err != nil {
 				slog.ErrorContext(ctx, "Failed to create Sonarr client for webhook check", "instance", instance.Name, "error", err)
 				continue
@@ -526,7 +526,7 @@ func (m *Manager) EnsureDownloadClientRegistration(ctx context.Context, altmount
 			}
 
 		case "sonarr":
-			client, err := m.clients.GetOrCreateSonarrClient(instance.Name, instance.URL, instance.APIKey)
+			client, err := m.clients.GetOrCreateSonarrClientContext(ctx, instance.Name, instance.URL, instance.APIKey, instance.APIVersion)
 			if err != nil {
 				slog.ErrorContext(ctx, "Failed to create Sonarr client for download client check", "instance", instance.Name, "error", err)
 				continue
@@ -870,7 +870,7 @@ func (m *Manager) TestDownloadClientRegistration(ctx context.Context, altmountHo
 			testErr = client.TestDownloadClientContext(ctx, dc)
 
 		case "sonarr":
-			client, err := m.clients.GetOrCreateSonarrClient(instance.Name, instance.URL, instance.APIKey)
+			client, err := m.clients.GetOrCreateSonarrClientContext(ctx, instance.Name, instance.URL, instance.APIKey, instance.APIVersion)
 			if err != nil {
 				results[instance.Name] = fmt.Sprintf("Failed to create client: %v", err)
 				continue

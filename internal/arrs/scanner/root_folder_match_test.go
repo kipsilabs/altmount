@@ -17,6 +17,10 @@ func fakeArr(t *testing.T, rootPaths ...string) string {
 	t.Helper()
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/system/status", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"appName":"Sonarr","version":"4.0.0"}`))
+	})
 	mux.HandleFunc("/api/v3/rootFolder", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		body := "["

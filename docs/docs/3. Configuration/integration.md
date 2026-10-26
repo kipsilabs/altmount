@@ -10,9 +10,29 @@ AltMount acts as a SABnzbd-compatible download client for Sonarr and Radarr. Thi
 
 ## Sonarr Version Compatibility
 
-Sonarr v4 and v5 use the same AltMount integration. You can configure instances of both versions at the same time; no version selector or configuration migration is required. Enter the instance URL (including any URL base, such as `http://sonarr:8989/sonarr`), without an `/api/v3` or `/api/v5` suffix.
+Sonarr v4 and v5 instances can run together. AltMount selects an API independently for each instance: **Auto (default)** uses the legacy v3 API for Sonarr v4 and native v5 for a confirmed Sonarr v5 instance. Existing configurations use Auto without migration. Enter the instance URL, including any URL base such as `http://sonarr:8989/sonarr`, without an `/api/v3` or `/api/v5` suffix.
 
-AltMount uses the v3 compatibility API retained by Sonarr v5 for library discovery, queue cleanup, repair searches, and download client and webhook registration. This preserves the per-episode queue records used by AltMount's failure tracking; Sonarr's native v5 API groups multiple episodes into one queue record.
+In the instance's **Sonarr API** selector, choose **Legacy v3** to retain compatibility behavior or roll back API selection on Sonarr v5. Choose **Native v5** to require the native API. An unsupported forced version fails the connection test. Authentication errors, timeouts and server errors are reported instead of triggering a switch to another API. Whisparr retains its existing legacy integration.
+
+The YAML equivalent is `api_version: auto`, `v3` or `v5` on a Sonarr instance. An omitted or empty value means Auto. This setting is supported only for Sonarr:
+
+```yaml
+arrs:
+  enabled: true
+  sonarr_instances:
+    - name: sonarr-v4
+      url: http://sonarr-v4:8989
+      api_key: YOUR_V4_API_KEY
+      api_version: auto
+      enabled: true
+    - name: sonarr-v5
+      url: http://sonarr-v5:8989/sonarr
+      api_key: YOUR_V5_API_KEY
+      api_version: auto # Use v3 to force compatibility mode, v5 to require native.
+      enabled: true
+```
+
+Test each instance after changing its URL, credentials or API selection. Automatic selection is refreshed periodically so an upgraded instance can move to native v5 without restarting AltMount.
 
 ## Prerequisites
 
@@ -190,6 +210,18 @@ arrs:
 | `webhook_base_url`                   | Base URL ARRs use to reach AltMount for webhooks (default: `http://<host>:<port>`)                                                                    |
 | `queue_cleanup_rules`                | Message rules for stuck imports. Each rule has a `message` substring (case-insensitive), an `enabled` boolean, and an `action`: `remove`, `blocklist`, or `blocklist_search`. |
 
+### Sonarr season packs and failure limits
+
+Sonarr cleanup groups queue entries by download within an instance, including legacy episode rows split across queue pages. A failed pack receives one download removal/blocklist action; failure limits and monitoring decisions remain per episode. Cleanup still follows your configured message actions, grace period and AltMount download-client ownership restriction.
+
+Repair refreshes episode/file state and preserves healthy imported siblings. An active replacement for one episode does not suppress repair of missing siblings. Remaining eligible episodes are searched together with `EpisodeSearch`; AltMount does not automatically search the whole season. If episode state cannot be established, repair defers until a later retry.
+
+Set `queue_cleanup_max_failures` to a positive value to unmonitor an episode after that many failed replacement attempts, or `0` to disable the breaker (the default). Exhausted episodes are unmonitored before requesting replacements for eligible siblings. If that monitoring update fails, replacement waits for a retry.
+
+Recovery steps and episode failure counters are kept in memory and reset on restart. A partially completed operation retains its targets for retries even after Sonarr removes the queue entry; disabled or reconfigured instances are not mutated by an old pending operation.
+
+For example, when eight episodes in a ten-episode pack are healthy, episode nine already has a replacement and episode ten is missing, repair preserves the eight files and searches only episode ten. If episode ten has reached its failure limit, it is unmonitored instead.
+
 ## Verifying the Setup
 
 After completing the steps above:
@@ -204,6 +236,18 @@ You can also check the integration health via API:
 curl http://localhost:8080/api/arrs/health \
   -H "Authorization: Bearer <token>"
 ```
+
+### Optional read-only API smoke tests
+
+Developers can explicitly provide `ALTMOUNT_SONARR_V4_URL` and `ALTMOUNT_SONARR_V4_KEY`, and/or `ALTMOUNT_SONARR_V5_URL` and `ALTMOUNT_SONARR_V5_KEY`, then run:
+
+```bash
+go test ./internal/arrs/clients -run TestSonarrLiveReadOnly -count=1 -v
+```
+
+Without those variables, live cases skip. The suite reads status, library, root folders, queue, history, notifications, download clients and commands. It verifies automatic v4/v5 selection and forced v3 on v5; it does not register integrations, delete files, change monitoring or submit searches.
+
+On 2026-10-26, this suite passed against disposable macOS ARM64 instances running Sonarr **4.0.15.2941** and **5.0.0.2800**. Each used an isolated temporary data directory and localhost port. These were empty libraries: populated pack handling, registration writes and destructive cleanup were not validated live by this smoke run. Pack repair outcomes are covered by automated fixtures separately.
 
 ## Troubleshooting
 

@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"fmt"
+	"github.com/kipsilabs/altmount/internal/arrs/clients"
 	"log/slog"
 	"strings"
 	"time"
@@ -13,12 +14,13 @@ import (
 	"github.com/kipsilabs/altmount/internal/config"
 	"golift.io/starr"
 	"golift.io/starr/radarr"
-	"golift.io/starr/sonarr"
 )
 
 // stuckItem is a normalized view of an *arr queue record across all client types,
 // holding only the fields the stuck-import detection needs.
 type stuckItem struct {
+	ConfirmGhost          func(context.Context) (bool, error)
+	ObservationKey        string // stable grouped-download identity for grace tracking
 	ID                    int64
 	Title                 string
 	TrackedDownloadStatus string
@@ -95,6 +97,7 @@ func (w *Worker) CleanupStuckQueue(ctx context.Context) error {
 // stuckAction is a queue item selected for cleanup plus how to act on it
 // (one of the config.StuckAction* values).
 type stuckAction struct {
+	Ghost  bool
 	ID     int64
 	Action string
 	// Unmonitor is set only when the failure breaker has tripped for this item: it
@@ -152,6 +155,9 @@ func (w *Worker) selectStuckActions(ctx context.Context, instance *model.ConfigI
 		}
 
 		key := fmt.Sprintf("stuck|%s|%d", instance.Name, item.ID)
+		if item.ObservationKey != "" {
+			key = "stuck|" + instance.Name + "|" + item.ObservationKey
+		}
 		clearFirstSeen := func() {
 			w.firstSeenMu.Lock()
 			delete(w.firstSeen, key)
@@ -172,14 +178,22 @@ func (w *Worker) selectStuckActions(ctx context.Context, instance *model.ConfigI
 		// observation window via firstSeen. Ghosts are always removed (never
 		// blocklisted) and never count toward the breaker — the release was not bad,
 		// the queue entry is just stale.
-		if w.checkGhostByImportHistory(ctx, item.OutputPath, cfg, instance.Name, item.Title) {
+		healthyGhost := w.checkGhostByImportHistory(ctx, item.OutputPath, cfg, instance.Name, item.Title)
+		if healthyGhost && item.ConfirmGhost != nil {
+			var err error
+			healthyGhost, err = item.ConfirmGhost(ctx)
+			if err != nil {
+				continue
+			}
+		}
+		if healthyGhost {
 			w.resetBreaker(item.BreakerKey)
-			actions = append(actions, stuckAction{ID: item.ID, Action: config.StuckActionRemove})
+			actions = append(actions, stuckAction{ID: item.ID, Action: config.StuckActionRemove, Ghost: true})
 			clearFirstSeen()
 			continue
 		}
 		if w.isGhostByPathGone(ctx, item.OutputPath, item.ID, cfg, instance.Name, item.Title) {
-			actions = append(actions, stuckAction{ID: item.ID, Action: config.StuckActionRemove})
+			actions = append(actions, stuckAction{ID: item.ID, Action: config.StuckActionRemove, Ghost: true})
 			clearFirstSeen()
 			continue
 		}
@@ -266,19 +280,6 @@ func (w *Worker) runUnmonitor(ctx context.Context, instance *model.ConfigInstanc
 	}
 	slog.InfoContext(ctx, "Unmonitored target after repeated import failures",
 		"instance", instance.Name, "id", a.ID)
-}
-
-// unmonitorSonarrEpisode returns a closure that unmonitors a single Sonarr or
-// Whisparr episode so the *arr stops automatically re-searching for it. Returns
-// nil when there is no usable episode ID.
-func unmonitorSonarrEpisode(client *sonarr.Sonarr, episodeID int64) func(ctx context.Context) error {
-	if episodeID <= 0 {
-		return nil
-	}
-	return func(ctx context.Context) error {
-		_, err := client.MonitorEpisodeContext(ctx, []int64{episodeID}, false)
-		return err
-	}
 }
 
 // unmonitorRadarrMovie returns a closure that unmonitors a Radarr movie so the
@@ -378,45 +379,45 @@ func (w *Worker) cleanupStuckRadarr(ctx context.Context, instance *model.ConfigI
 // cleanupStuckSonarr handles Sonarr and Whisparr (both use the Sonarr client).
 func (w *Worker) cleanupStuckSonarr(ctx context.Context, instance *model.ConfigInstance, cfg *config.Config, whisparr bool) (int, error) {
 	var (
-		client *sonarr.Sonarr
+		client clients.SonarrClient
 		err    error
 	)
 	if whisparr {
 		client, err = w.clients.GetOrCreateWhisparrClient(instance.Name, instance.URL, instance.APIKey)
 	} else {
-		client, err = w.clients.GetOrCreateSonarrClient(instance.Name, instance.URL, instance.APIKey)
+		client, err = w.clients.GetOrCreateSonarrClientContext(ctx, instance.Name, instance.URL, instance.APIKey, instance.APIVersion)
 	}
 	if err != nil {
 		return 0, fmt.Errorf("failed to get Sonarr client: %w", err)
 	}
-	queue, err := client.GetQueueContext(ctx, 0, 500)
+	groups, err := client.QueueGroups(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("failed to get Sonarr queue: %w", err)
 	}
-
-	items := make([]stuckItem, 0, len(queue.Records))
-	for _, q := range queue.Records {
-		item := stuckItem{
-			ID:                    q.ID,
-			Title:                 q.Title,
-			TrackedDownloadStatus: q.TrackedDownloadStatus,
-			TrackedDownloadState:  q.TrackedDownloadState,
-			DownloadClient:        q.DownloadClient,
-			OutputPath:            q.OutputPath,
-			Messages:              flattenStarrMessages(q.StatusMessages),
+	items := make([]stuckItem, 0, len(groups))
+	byID := map[int64]model.SonarrDownloadGroup{}
+	for _, group := range groups {
+		q := group.Record
+		if q == nil {
+			continue
 		}
-		// Breaker target: the episode. A dead season pack trips each of its
-		// episodes' breakers independently, so the whole pack ends up unmonitored
-		// episode by episode without needing a season lookup.
-		if q.EpisodeID > 0 {
-			item.BreakerKey = failures.EpisodeKey(instance.Name, q.EpisodeID)
-			item.Unmonitor = unmonitorSonarrEpisode(client, q.EpisodeID)
-		}
-		items = append(items, item)
+		items = append(items, stuckItem{ID: q.ID, Title: q.Title, TrackedDownloadStatus: q.TrackedDownloadStatus, TrackedDownloadState: q.TrackedDownloadState, DownloadClient: q.DownloadClient, OutputPath: q.OutputPath, Messages: flattenStarrMessages(q.StatusMessages), ObservationKey: group.Key(), ConfirmGhost: func(ctx context.Context) (bool, error) {
+			return w.confirmSonarrPackImported(ctx, client, instance.Name, group.EpisodeIDs)
+		}})
+		byID[q.ID] = group
 	}
-
 	actions := w.selectStuckActions(ctx, instance, cfg, items)
-	return w.deleteStarrQueue(ctx, instance, actions, client.DeleteQueueContext), nil
+	acted := 0
+	for _, action := range actions {
+		ok, err := w.actOnSonarrPack(ctx, instance, client, byID[action.ID], action.Action, cfg.Arrs.QueueCleanupMaxFailures, false, action.Ghost)
+		if err != nil {
+			return acted, err
+		}
+		if ok {
+			acted++
+		}
+	}
+	return acted, nil
 }
 
 func (w *Worker) cleanupStuckLidarr(ctx context.Context, instance *model.ConfigInstance, cfg *config.Config) (int, error) {

@@ -10,12 +10,17 @@ package failures
 import (
 	"fmt"
 	"sync"
+	"time"
 )
 
 // Tracker counts failures per stable target key.
 type Tracker struct {
-	mu     sync.Mutex
-	counts map[string]int
+	mu          sync.Mutex
+	counts      map[string]int
+	events      map[string]map[string]struct{}
+	actions     map[string]bool // false: in flight; true: completed
+	completedAt map[string]time.Time
+	locks       map[string]*actionLock
 }
 
 // NewTracker creates an empty failure tracker.
@@ -43,6 +48,7 @@ func (t *Tracker) Reset(key string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	delete(t.counts, key)
+	delete(t.events, key)
 }
 
 // Key builders — the single source of truth for breaker key formats, so the

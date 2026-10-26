@@ -49,6 +49,7 @@ type EpisodeMetadata struct {
 }
 
 type WebhookMetadata struct {
+	DownloadID   string               `json:"downloadId,omitempty"`
 	EventType    string               `json:"eventType,omitempty"`
 	InstanceName string               `json:"instanceName,omitempty"`
 	Movie        *MovieMetadata       `json:"movie,omitempty"`
@@ -63,4 +64,3 @@ type WebhookMetadata struct {
 	Book         *BookMetadata        `json:"book,omitempty"`
 	BookFile     *BookFileMetadata    `json:"bookFile,omitempty"`
 }
-

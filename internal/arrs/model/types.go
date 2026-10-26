@@ -14,12 +14,13 @@ var (
 
 // ConfigInstance represents an arrs instance from configuration
 type ConfigInstance struct {
-	Name     string `json:"name"`
-	Type     string `json:"type"` // "radarr", "sonarr", "lidarr", "readarr", "whisparr", or "sportarr"
-	URL      string `json:"url"`
-	APIKey   string `json:"api_key"`
-	Category string `json:"category"`
-	Enabled  bool   `json:"enabled"`
+	APIVersion string `json:"api_version,omitempty"`
+	Name       string `json:"name"`
+	Type       string `json:"type"` // "radarr", "sonarr", "lidarr", "readarr", "whisparr", or "sportarr"
+	URL        string `json:"url"`
+	APIKey     string `json:"api_key"`
+	Category   string `json:"category"`
+	Enabled    bool   `json:"enabled"`
 }
 
 // ConfigManager interface defines methods needed for configuration management

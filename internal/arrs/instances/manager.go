@@ -5,17 +5,21 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
+	"github.com/kipsilabs/altmount/internal/arrs/clients"
 	"github.com/kipsilabs/altmount/internal/arrs/model"
 	"github.com/kipsilabs/altmount/internal/config"
+	"github.com/kipsilabs/altmount/internal/httpclient"
 	"golift.io/starr"
 	"golift.io/starr/lidarr"
 	"golift.io/starr/radarr"
 	"golift.io/starr/readarr"
 	"golift.io/starr/sonarr"
-	)
+)
 
 type Manager struct {
 	configGetter  config.ConfigGetter
@@ -53,12 +57,13 @@ func (m *Manager) GetAllInstances() []*model.ConfigInstance {
 	if len(cfg.Arrs.SonarrInstances) > 0 {
 		for _, sonarrConfig := range cfg.Arrs.SonarrInstances {
 			instance := &model.ConfigInstance{
-				Name:     sonarrConfig.Name,
-				Type:     "sonarr",
-				URL:      sonarrConfig.URL,
-				APIKey:   sonarrConfig.APIKey,
-				Category: sonarrConfig.Category,
-				Enabled:  sonarrConfig.Enabled != nil && *sonarrConfig.Enabled,
+				Name:       sonarrConfig.Name,
+				Type:       "sonarr",
+				URL:        sonarrConfig.URL,
+				APIKey:     sonarrConfig.APIKey,
+				APIVersion: sonarrConfig.APIVersion,
+				Category:   sonarrConfig.Category,
+				Enabled:    sonarrConfig.Enabled != nil && *sonarrConfig.Enabled,
 			}
 			instances = append(instances, instance)
 		}
@@ -242,7 +247,7 @@ func (m *Manager) RegisterInstance(ctx context.Context, arrURL, apiKey string) (
 
 	// Determine category based on ARR type
 	var category string
-	
+
 	// Check if instance already exists in config to respect pre-configured category
 	existingInstances := m.GetAllInstances()
 	found := false
@@ -365,25 +370,19 @@ func (m *Manager) detectARRType(ctx context.Context, arrURL, apiKey string) (str
 		}
 	}
 
-	// Try Sonarr
-	sonarrClient := sonarr.New(&starr.Config{URL: arrURL, APIKey: apiKey})
-	sonarrStatus, err := sonarrClient.GetSystemStatusContext(ctx)
-	if err == nil {
-		switch sonarrStatus.AppName {
-		case "Radarr":
-			slog.DebugContext(ctx, "Detected Radarr instance", "url", arrURL)
-			return "radarr", nil
-		case "Sonarr":
-			slog.DebugContext(ctx, "Detected Sonarr instance", "url", arrURL)
+	// Native Sonarr v5 may not expose the legacy status endpoint.
+	var externalClient *http.Client
+	if m.configGetter != nil {
+		if cfg := m.configGetter(); cfg != nil {
+			externalClient = httpclient.NewForExternal(cfg.Network, 30*time.Second)
+		}
+	}
+	sonarrClient, sonarrErr := clients.NewManager(externalClient).GetOrCreateSonarrClientContext(ctx, "detect", arrURL, apiKey, "auto")
+	if sonarrErr == nil {
+		sonarrStatus, statusErr := sonarrClient.GetSystemStatusContext(ctx)
+		if statusErr == nil && sonarrStatus.AppName == "Sonarr" {
+			slog.DebugContext(ctx, "Detected Sonarr instance", "url", arrURL, "api_version", sonarrClient.APIVersion())
 			return "sonarr", nil
-		case "Lidarr":
-			return "lidarr", nil
-		case "Readarr":
-			return "readarr", nil
-		case "Whisparr":
-			return "whisparr", nil
-		default:
-			slog.DebugContext(ctx, "Unknown AppName from Sonarr client", "app_name", sonarrStatus.AppName, "url", arrURL)
 		}
 	}
 	// Try Lidarr

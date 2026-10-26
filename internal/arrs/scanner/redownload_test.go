@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/kipsilabs/altmount/internal/arrs/clients"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -28,7 +29,11 @@ func testManager(autoSearchWaitSeconds, fileDeleteConfirmSeconds int) *Manager {
 // episode, movie, queue and file-delete endpoints the repair coordination
 // touches and records the order in which they were hit.
 type arrStub struct {
-	mu sync.Mutex
+	episodeStates   []*sonarr.Episode
+	unmonitored     [][]int64
+	failHistoryOnce bool
+	historyFailed   bool
+	mu              sync.Mutex
 
 	events       []string
 	postedSonarr []sonarrSearchBody
@@ -40,10 +45,17 @@ type arrStub struct {
 	statuses    map[int64][]string
 	postReplies []arrCommandResponse
 
-	episodeFileID int64
-	clearOnDelete bool
+	episodeFileID        int64
+	extraEpisodeID       int64
+	primaryEpisodeID     int64
+	failedHistory        int
+	clearOnDelete        bool
+	failQueueAfterDelete bool
 
 	queueEpisodeIDs []int64
+	queueDownloadID string
+	queueClient     string
+	queueOutputPath string
 	queueMovieIDs   []int64
 
 	movieFileID int64
@@ -121,15 +133,79 @@ func (s *arrStub) serve() *httptest.Server {
 			s.record("status:" + status)
 			_ = json.NewEncoder(w).Encode(arrCommandResponse{ID: id, Name: "EpisodeSearch", Status: status, Trigger: "unspecified"})
 
+		case path == "/api/v3/history":
+			if s.historyFailed {
+				_, _ = w.Write([]byte(`{"records":[{"id":51,"eventType":"downloadFailed","downloadId":"one-pack"},{"id":50,"eventType":"grabbed","downloadId":"one-pack"}],"totalRecords":2}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"records":[{"id":50,"sourceTitle":"broken","eventType":"grabbed","downloadId":"one-pack"}],"totalRecords":1}`))
+		case path == "/api/v3/history/failed/50" && r.Method == http.MethodPost:
+			s.failedHistory++
+			if s.failHistoryOnce {
+				s.failHistoryOnce = false
+				s.historyFailed = true
+				http.Error(w, "response lost after accepted failure", http.StatusGatewayTimeout)
+				return
+			}
+			_, _ = w.Write([]byte(`{}`))
 		case path == "/api/v3/episode":
-			s.record(fmt.Sprintf("episodes:%d", s.episodeFileID))
-			_ = json.NewEncoder(w).Encode([]*sonarr.Episode{{ID: 10, EpisodeFileID: s.episodeFileID}})
+			if s.episodeStates != nil {
+				var rows []*sonarr.Episode
+				for _, ep := range s.episodeStates {
+					include := len(r.URL.Query()["episodeIds"]) == 0
+					for _, raw := range r.URL.Query()["episodeIds"] {
+						if raw == fmt.Sprint(ep.ID) {
+							include = true
+						}
+					}
+					if include {
+						rows = append(rows, ep)
+					}
+				}
+				_ = json.NewEncoder(w).Encode(rows)
+				return
+			}
 
+			s.record(fmt.Sprintf("episodes:%d", s.episodeFileID))
+			primaryID := s.primaryEpisodeID
+			if primaryID == 0 {
+				primaryID = 10
+			}
+			eps := []*sonarr.Episode{{ID: primaryID, EpisodeFileID: s.episodeFileID, Monitored: true}}
+			if s.extraEpisodeID > 0 {
+				eps = append(eps, &sonarr.Episode{ID: s.extraEpisodeID, EpisodeFileID: s.episodeFileID, Monitored: true})
+			}
+			_ = json.NewEncoder(w).Encode(eps)
+
+		case path == "/api/v3/episode/monitor" && r.Method == http.MethodPut:
+			var body struct {
+				IDs       []int64 `json:"episodeIds"`
+				Monitored bool    `json:"monitored"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if !body.Monitored {
+				s.unmonitored = append(s.unmonitored, body.IDs)
+			}
+			for _, ep := range s.episodeStates {
+				for _, id := range body.IDs {
+					if ep.ID == id {
+						ep.Monitored = body.Monitored
+					}
+				}
+			}
+			_, _ = w.Write([]byte(`[]`))
 		case strings.HasPrefix(path, "/api/v3/episodeFile/") && r.Method == http.MethodDelete:
 			s.deletes++
 			s.record("delete")
 			if s.clearOnDelete {
 				s.episodeFileID = 0
+				var removed int64
+				_, _ = fmt.Sscanf(strings.TrimPrefix(path, "/api/v3/episodeFile/"), "%d", &removed)
+				for _, ep := range s.episodeStates {
+					if ep.EpisodeFileID == removed {
+						ep.EpisodeFileID = 0
+					}
+				}
 			}
 			w.WriteHeader(http.StatusOK)
 
@@ -150,10 +226,15 @@ func (s *arrStub) serve() *httptest.Server {
 			_ = json.NewEncoder(w).Encode(movie)
 
 		case path == "/api/v3/queue":
+			if s.failQueueAfterDelete && s.deletes > 0 {
+				s.failQueueAfterDelete = false
+				http.Error(w, "temporary queue error", 500)
+				return
+			}
 			s.record("queue")
 			sonarrRecords := make([]*sonarr.QueueRecord, 0, len(s.queueEpisodeIDs))
 			for _, id := range s.queueEpisodeIDs {
-				sonarrRecords = append(sonarrRecords, &sonarr.QueueRecord{EpisodeID: id})
+				sonarrRecords = append(sonarrRecords, &sonarr.QueueRecord{EpisodeID: id, DownloadID: s.queueDownloadID, DownloadClient: s.queueClient, OutputPath: s.queueOutputPath, Status: "downloading"})
 			}
 			radarrRecords := make([]*radarr.QueueRecord, 0, len(s.queueMovieIDs))
 			for _, id := range s.queueMovieIDs {
@@ -177,9 +258,9 @@ func remarshal(in any, out any) {
 	_ = json.Unmarshal(data, out)
 }
 
-func sonarrClient(t *testing.T, srv *httptest.Server) *sonarr.Sonarr {
+func sonarrClient(t *testing.T, srv *httptest.Server) clients.SonarrClient {
 	t.Helper()
-	return sonarr.New(&starr.Config{URL: srv.URL, APIKey: "test", Client: srv.Client()})
+	return clients.NewLegacySonarr(&starr.Config{URL: srv.URL, APIKey: "test", Client: srv.Client()})
 }
 
 func radarrClient(t *testing.T, srv *httptest.Server) *radarr.Radarr {
@@ -269,7 +350,7 @@ func TestSettleSonarrAutoRedownload_WaitsForAutoSearchThenDeletesAndSearchesOnce
 	if statusAt == -1 || deleteAt == -1 || postAt == -1 || clearedAt == -1 {
 		t.Fatalf("missing expected events: %v", events)
 	}
-	if !(statusAt < deleteAt && deleteAt < clearedAt && clearedAt < postAt) {
+	if statusAt >= deleteAt || deleteAt >= clearedAt || clearedAt >= postAt {
 		t.Errorf("unexpected ordering %v (status=%d delete=%d cleared=%d post=%d)",
 			events, statusAt, deleteAt, clearedAt, postAt)
 	}
@@ -333,50 +414,24 @@ func TestSendSonarrSearch_RetriesOnceWhenDeduplicated(t *testing.T) {
 	firstPost := indexOf(events, "post")
 	statusAt := indexOf(events, "status:completed")
 	lastPost := lastIndexOf(events, "post")
-	if statusAt == -1 || !(firstPost < statusAt && statusAt < lastPost) {
+	if statusAt == -1 || firstPost >= statusAt || statusAt >= lastPost {
 		t.Errorf("retry was not issued after the deduplicated command finished: %v", events)
 	}
 }
 
-func TestSettleSonarrAutoRedownload_BudgetExpiryDegradesToDeleteAndSearch(t *testing.T) {
+func TestSettleSonarrAutoRedownload_BudgetExpiryDefersDestructiveRepair(t *testing.T) {
 	stub := newArrStub()
 	stub.episodeFileID = 500
 	stub.commands = []arrCommandResponse{autoEpisodeSearch(1, 10)}
 	stub.statuses[1] = []string{"started"}
-
 	srv := stub.serve()
 	defer srv.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-
-	client := sonarrClient(t, srv)
-	m := testManager(1, 1)
-
-	start := time.Now()
-	auto, state, err := m.settleSonarrAutoRedownload(ctx, client, "sonarr", sonarrRedownloadTarget{
-		seriesID:      3,
-		episodeIDs:    []int64{10},
-		episodeFileID: 500,
-	}, time.Now().Add(-time.Second))
-	if err != nil {
-		t.Fatalf("settle returned error: %v", err)
+	_, _, err := testManager(1, 1).settleSonarrAutoRedownload(context.Background(), sonarrClient(t, srv), "sonarr", sonarrRedownloadTarget{seriesID: 3, episodeIDs: []int64{10}, episodeFileID: 500}, time.Now().Add(-time.Second))
+	if err == nil {
+		t.Fatal("expected deferred repair while automatic search is active")
 	}
-	if state != redownloadProceed {
-		t.Fatalf("state = %v; want redownloadProceed", state)
-	}
-	if stub.deletes != 1 {
-		t.Errorf("delete count = %d; want 1", stub.deletes)
-	}
-	if elapsed := time.Since(start); elapsed > 10*time.Second {
-		t.Errorf("settle took %s; expected it to give up near the 1s budget", elapsed)
-	}
-
-	if _, err := m.sendSonarrSearch(ctx, client, "sonarr", []int64{10}, auto); err != nil {
-		t.Fatalf("sendSonarrSearch returned error: %v", err)
-	}
-	if len(stub.postedSonarr) != 1 {
-		t.Fatalf("expected exactly one search command, got %d", len(stub.postedSonarr))
+	if stub.deletes != 0 || len(stub.postedSonarr) > 0 {
+		t.Fatalf("must not mutate after wait expiry; deletes=%d", stub.deletes)
 	}
 }
 
@@ -418,8 +473,8 @@ func TestSettleSonarrAutoRedownload_ZeroWaitKeepsImmediateBehaviour(t *testing.T
 	}
 
 	events := stub.snapshotEvents()
-	if indexOf(events, "queue") != -1 {
-		t.Errorf("queue must not be polled with the wait disabled: %v", events)
+	if indexOf(events, "queue") == -1 {
+		t.Errorf("queue coverage must be refreshed even with command waiting disabled: %v", events)
 	}
 }
 
@@ -473,7 +528,7 @@ func TestSettleRadarrAutoRedownload_WaitsThenDeletesAndSearches(t *testing.T) {
 	deleteAt := indexOf(events, "delete")
 	postAt := indexOf(events, "post")
 	clearedAt := lastIndexOf(events, "movie:0")
-	if deleteAt == -1 || postAt == -1 || clearedAt == -1 || !(deleteAt < clearedAt && clearedAt < postAt) {
+	if deleteAt == -1 || postAt == -1 || clearedAt == -1 || deleteAt >= clearedAt || clearedAt >= postAt {
 		t.Errorf("unexpected ordering %v", events)
 	}
 }

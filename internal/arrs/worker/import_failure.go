@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"fmt"
+	"github.com/kipsilabs/altmount/internal/arrs/clients"
 	"log/slog"
 	"strings"
 
@@ -10,7 +11,6 @@ import (
 	"github.com/kipsilabs/altmount/internal/arrs/model"
 	"github.com/kipsilabs/altmount/internal/arrs/registrar"
 	"github.com/kipsilabs/altmount/internal/config"
-	"golift.io/starr/sonarr"
 )
 
 // HandleImportFailure runs the importer-side failure breaker for one
@@ -42,6 +42,7 @@ func (w *Worker) HandleImportFailure(ctx context.Context, downloadID, category s
 	if cfg.Arrs.Enabled == nil || !*cfg.Arrs.Enabled {
 		return
 	}
+	w.retryPendingSonarrActions(ctx)
 	maxFailures := cfg.Arrs.QueueCleanupMaxFailures
 	if maxFailures <= 0 {
 		return
@@ -99,66 +100,32 @@ func (w *Worker) HandleImportFailure(ctx context.Context, downloadID, category s
 // Returns handled=true when the download was found in this instance's queue.
 func (w *Worker) importFailureSonarr(ctx context.Context, instance *model.ConfigInstance, downloadID string, maxFailures int, whisparr bool) (bool, error) {
 	var (
-		client *sonarr.Sonarr
+		client clients.SonarrClient
 		err    error
 	)
 	if whisparr {
 		client, err = w.clients.GetOrCreateWhisparrClient(instance.Name, instance.URL, instance.APIKey)
 	} else {
-		client, err = w.clients.GetOrCreateSonarrClient(instance.Name, instance.URL, instance.APIKey)
+		client, err = w.clients.GetOrCreateSonarrClientContext(ctx, instance.Name, instance.URL, instance.APIKey, instance.APIVersion)
 	}
 	if err != nil {
 		return false, fmt.Errorf("failed to get Sonarr client: %w", err)
 	}
-	queue, err := client.GetQueueContext(ctx, 0, 500)
+	groups, err := client.QueueGroups(ctx)
 	if err != nil {
 		return false, fmt.Errorf("failed to get Sonarr queue: %w", err)
 	}
-
-	var (
-		found       bool
-		deleteID    int64 // any record of the download; the delete cascades to siblings
-		giveUpIDs   []int64
-		giveUpTitle string
-	)
-	for _, q := range queue.Records {
-		if !strings.EqualFold(q.DownloadID, downloadID) || !registrar.IsAltmountDownloadClient(q.DownloadClient) {
+	found := false
+	for _, group := range groups {
+		if group.Record == nil || !strings.EqualFold(group.Record.DownloadID, downloadID) || !registrar.IsAltmountDownloadClient(group.Record.DownloadClient) {
 			continue
 		}
 		found = true
-		if deleteID == 0 {
-			deleteID = q.ID
-		}
-		if q.EpisodeID <= 0 {
-			continue
-		}
-		count := w.bumpBreaker(failures.EpisodeKey(instance.Name, q.EpisodeID))
-		if count >= maxFailures {
-			giveUpIDs = append(giveUpIDs, q.EpisodeID)
-			giveUpTitle = q.Title
+		if _, err := w.actOnSonarrPack(ctx, instance, client, group, config.StuckActionBlocklist, maxFailures, true); err != nil {
+			return true, err
 		}
 	}
-	if !found {
-		return false, nil
-	}
-	if len(giveUpIDs) == 0 {
-		slog.InfoContext(ctx, "Import failure counted toward failure limit",
-			"instance", instance.Name, "download_id", downloadID, "max_failures", maxFailures)
-		return true, nil
-	}
-
-	slog.WarnContext(ctx, "Failure threshold reached on import failure, giving up (unmonitor + blocklist without re-search)",
-		"instance", instance.Name, "title", giveUpTitle, "episode_ids", giveUpIDs, "max_failures", maxFailures)
-
-	// Unmonitor BEFORE touching the queue: even if the delete loses a race with
-	// the *arr's own failed-download handling, the episode can no longer be
-	// auto-re-grabbed.
-	if _, err := client.MonitorEpisodeContext(ctx, giveUpIDs, false); err != nil {
-		slog.WarnContext(ctx, "Failed to unmonitor episodes after failure threshold",
-			"instance", instance.Name, "episode_ids", giveUpIDs, "error", err)
-	}
-	w.deleteStarrQueue(ctx, instance, []stuckAction{{ID: deleteID, Action: config.StuckActionBlocklist}}, client.DeleteQueueContext)
-	return true, nil
+	return found, nil
 }
 
 // importFailureRadarr is the Radarr counterpart of importFailureSonarr.

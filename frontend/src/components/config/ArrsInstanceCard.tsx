@@ -37,7 +37,7 @@ export function ArrsInstanceCard({
 	const [isTestingConnection, setIsTestingConnection] = useState(false);
 
 	const testConnection = useCallback(async () => {
-		if (!instance.url || !instance.api_key) {
+		if (!instance.url) {
 			setTestResult({ type: "error", message: "Required info missing" });
 			return;
 		}
@@ -47,13 +47,19 @@ export function ArrsInstanceCard({
 			const response = await fetch("/api/arrs/instances/test", {
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({ type: type, url: instance.url, api_key: instance.api_key }),
+				body: JSON.stringify({
+					type,
+					name: instance.name,
+					url: instance.url,
+					api_key: instance.api_key,
+					...(type === "sonarr" ? { api_version: instance.api_version || "auto" } : {}),
+				}),
 			});
 			const data = await response.json();
 			if (data.success) {
 				setTestResult({ type: "success", message: data.message || "Link Active" });
 			} else {
-				setTestResult({ type: "error", message: data.error || "Link Failed" });
+				setTestResult({ type: "error", message: data.error || data.message || "Link Failed" });
 			}
 		} catch (_error) {
 			setTestResult({ type: "error", message: "Network Error" });
@@ -63,11 +69,12 @@ export function ArrsInstanceCard({
 				setTestResult({ type: null, message: "" });
 			}, 5000);
 		}
-	}, [instance.url, instance.api_key, type]);
+	}, [instance.name, instance.url, instance.api_key, instance.api_version, type]);
 
 	const handleInstanceChange = useCallback(
 		(field: keyof ArrsInstanceConfig, value: ArrsInstanceConfig[keyof ArrsInstanceConfig]) => {
-			if (field === "url" || field === "api_key") setTestResult({ type: null, message: "" });
+			if (field === "url" || field === "api_key" || field === "api_version")
+				setTestResult({ type: null, message: "" });
 			onInstanceChange(field, value);
 		},
 		[onInstanceChange],
@@ -185,6 +192,26 @@ export function ArrsInstanceCard({
 						</select>
 					</fieldset>
 
+					{type === "sonarr" && (
+						<fieldset className="fieldset">
+							<legend className="fieldset-legend font-semibold">Sonarr API</legend>
+							<select
+								className="select select-sm select-bordered w-full bg-base-100 text-xs"
+								value={instance.api_version || "auto"}
+								onChange={(e) =>
+									handleInstanceChange(
+										"api_version",
+										e.target.value as ArrsInstanceConfig["api_version"],
+									)
+								}
+								disabled={isReadOnly}
+							>
+								<option value="auto">Auto (default)</option>
+								<option value="v3">Legacy v3</option>
+								<option value="v5">Native v5</option>
+							</select>
+						</fieldset>
+					)}
 					<div className="flex flex-col justify-center pt-2">
 						<label className="label cursor-pointer justify-start gap-3">
 							<input
@@ -222,7 +249,7 @@ export function ArrsInstanceCard({
 										: "btn-outline border-base-300"
 						}`}
 						onClick={testConnection}
-						disabled={isReadOnly || isTestingConnection || !instance.url || !instance.api_key}
+						disabled={isReadOnly || isTestingConnection || !instance.url}
 					>
 						{isTestingConnection ? <LoadingSpinner size="sm" /> : "Test Link"}
 					</button>

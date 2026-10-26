@@ -1141,6 +1141,7 @@ func migrateArrsCleanup(config *Config) {
 
 // ArrsInstanceConfig represents a single arrs instance configuration
 type ArrsInstanceConfig struct {
+	APIVersion        string `yaml:"api_version,omitempty" mapstructure:"api_version" json:"api_version,omitempty"`
 	Name              string `yaml:"name" mapstructure:"name" json:"name"`
 	URL               string `yaml:"url" mapstructure:"url" json:"url"`
 	APIKey            string `yaml:"api_key" mapstructure:"api_key" json:"api_key"`
@@ -1563,6 +1564,29 @@ func (c *Config) Validate() error {
 	// AsyncBufferMaxTotalMB: 0 means unlimited. Clamp negatives.
 	if c.Fuse.AsyncBufferMaxTotalMB < 0 {
 		c.Fuse.AsyncBufferMaxTotalMB = 0
+	}
+
+	for _, group := range []struct {
+		kind      string
+		instances []ArrsInstanceConfig
+	}{
+		{"sonarr", c.Arrs.SonarrInstances}, {"radarr", c.Arrs.RadarrInstances},
+		{"lidarr", c.Arrs.LidarrInstances}, {"readarr", c.Arrs.ReadarrInstances},
+		{"whisparr", c.Arrs.WhisparrInstances}, {"sportarr", c.Arrs.SportarrInstances},
+	} {
+		for i, instance := range group.instances {
+			if instance.APIVersion == "" {
+				continue
+			}
+			if group.kind != "sonarr" {
+				return fmt.Errorf("arrs %s_instances[%d]: api_version is only supported for Sonarr", group.kind, i)
+			}
+			switch instance.APIVersion {
+			case "auto", "v3", "v5":
+			default:
+				return fmt.Errorf("arrs sonarr_instances[%d]: invalid api_version %q (must be auto, v3, or v5)", i, instance.APIVersion)
+			}
+		}
 	}
 
 	// Validate arrs queue-cleanup rule actions: an explicitly set action must be a

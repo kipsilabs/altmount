@@ -3,6 +3,7 @@ package data
 import (
 	"context"
 	"fmt"
+	"github.com/kipsilabs/altmount/internal/arrs/clients"
 	"log/slog"
 	"strings"
 	"sync"
@@ -80,7 +81,7 @@ func (m *Manager) GetMovies(ctx context.Context, client *radarr.Radarr, instance
 }
 
 // GetSeries retrieves all series from Sonarr, using a cache if available and valid
-func (m *Manager) GetSeries(ctx context.Context, client *sonarr.Sonarr, instanceName string) ([]*sonarr.Series, error) {
+func (m *Manager) GetSeries(ctx context.Context, client clients.SonarrClient, instanceName string) ([]*sonarr.Series, error) {
 	// 1. Check cache (read lock)
 	m.cacheMu.RLock()
 	series, ok := m.seriesCache[instanceName]
@@ -126,7 +127,7 @@ func (m *Manager) GetSeries(ctx context.Context, client *sonarr.Sonarr, instance
 }
 
 // GetEpisodeFiles retrieves all episode files for a series from Sonarr, using a cache if available and valid
-func (m *Manager) GetEpisodeFiles(ctx context.Context, client *sonarr.Sonarr, instanceName string, seriesID int64) ([]*sonarr.EpisodeFile, error) {
+func (m *Manager) GetEpisodeFiles(ctx context.Context, client clients.SonarrClient, instanceName string, seriesID int64) ([]*sonarr.EpisodeFile, error) {
 	cacheKey := fmt.Sprintf("sonarr_episode_files_%s_%d", instanceName, seriesID)
 
 	// 1. Check cache (read lock)

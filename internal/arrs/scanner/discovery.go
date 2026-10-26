@@ -3,6 +3,7 @@ package scanner
 import (
 	"context"
 	"fmt"
+	"github.com/kipsilabs/altmount/internal/arrs/clients"
 	"log/slog"
 	"path/filepath"
 	"regexp"
@@ -184,7 +185,16 @@ func (m *Manager) discoverSonarrStrict(ctx context.Context, inst *model.ConfigIn
 	// type would miss whisparr instances and return a nil config, causing a
 	// nil-pointer dereference. inst is guaranteed non-nil by runStrictDiscovery.
 	instanceName := inst.Name
-	client, _ := m.clients.GetOrCreateSonarrClient(instanceName, inst.URL, inst.APIKey)
+	var client clients.SonarrClient
+	var clientErr error
+	if inst.Type == "whisparr" {
+		client, clientErr = m.clients.GetOrCreateWhisparrClient(instanceName, inst.URL, inst.APIKey)
+	} else {
+		client, clientErr = m.clients.GetOrCreateSonarrClientContext(ctx, instanceName, inst.URL, inst.APIKey, inst.APIVersion)
+	}
+	if clientErr != nil {
+		return nil, clientErr
+	}
 
 	// 1. Check Library (Active Files)
 	series, err := m.data.GetSeries(ctx, client, instanceName)

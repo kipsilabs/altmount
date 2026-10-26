@@ -43,7 +43,9 @@ type Worker struct {
 	// Once a target reaches the configured queue_cleanup_max_failures, cleanup
 	// gives up on it (blocklist without re-search + unmonitor). In-memory only;
 	// resets on restart and when the target later imports healthy.
-	breaker *failures.Tracker
+	breaker         *failures.Tracker
+	sonarrPendingMu sync.Mutex
+	sonarrPending   map[string]*sonarrPendingAction
 
 	// History sync tracking
 	lastHistorySync   time.Time
@@ -92,12 +94,8 @@ func (w *Worker) Start(ctx context.Context) error {
 		return nil
 	}
 
-	// Queue cleanup covers ghost/empty-folder detection, the automatic-import-failure
-	// purge and the message-rule pass. Enabled by default (nil or true).
-	if !IsQueueCleanupEnabled(cfg) {
-		slog.InfoContext(ctx, "ARR queue cleanup disabled")
-		return nil
-	}
+	// Keep staged recovery alive even when periodic queue rules are disabled.
+	// safeCleanup independently gates those rules before scanning any queues.
 
 	w.workerCtx, w.workerCancel = context.WithCancel(ctx)
 	w.workerRunning = true
@@ -162,6 +160,7 @@ func (w *Worker) safeCleanup() {
 			slog.Error("Panic in queue cleanup", "panic", r)
 		}
 	}()
+	w.retryPendingSonarrActions(w.workerCtx)
 	if !IsQueueCleanupEnabled(w.configGetter()) {
 		return
 	}
@@ -229,7 +228,7 @@ func (w *Worker) captureSportarrIndexer(ctx context.Context, downloadID, indexer
 // by looking up AltMount's import history. Returns true if confirmed ghost
 // (i.e., the file has been moved to the library).
 func (w *Worker) checkGhostByImportHistory(ctx context.Context, outputPath string, cfg *config.Config, instanceName, title string) bool {
-	if outputPath == "" {
+	if outputPath == "" || w.repo == nil {
 		return false
 	}
 
@@ -407,7 +406,7 @@ func (w *Worker) resolveIndexerFromArrs(ctx context.Context, downloadID string) 
 			continue
 		}
 		if instance.Type == "sonarr" {
-			client, err := w.clients.GetOrCreateSonarrClient(instance.Name, instance.URL, instance.APIKey)
+			client, err := w.clients.GetOrCreateSonarrClientContext(ctx, instance.Name, instance.URL, instance.APIKey, instance.APIVersion)
 			if err != nil {
 				continue
 			}
@@ -439,4 +438,9 @@ func (w *Worker) resolveIndexerFromArrs(ctx context.Context, downloadID string) 
 		}
 	}
 	return "", fmt.Errorf("not found in any starr instance")
+}
+
+// ShouldRunWorker keeps staged importer/scanner recovery alive when queue rules are disabled.
+func ShouldRunWorker(cfg *config.Config) bool {
+	return cfg.Arrs.Enabled != nil && *cfg.Arrs.Enabled
 }

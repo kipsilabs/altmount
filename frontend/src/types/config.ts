@@ -686,6 +686,7 @@ export interface LogFormData {
 export type ArrsType = "radarr" | "sonarr" | "lidarr" | "readarr" | "whisparr" | "sportarr";
 
 export interface ArrsInstanceConfig {
+	api_version?: "auto" | "v3" | "v5";
 	name: string;
 	url: string;
 	api_key: string;

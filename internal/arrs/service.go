@@ -92,6 +92,7 @@ func NewService(configGetter config.ConfigGetter, configManager model.ConfigMana
 	failureTracker := failures.NewTracker()
 	scannerManager := scanner.NewManager(configGetter, instManager, clientManager, dataManager, queueRepo, failureTracker)
 	workerManager := worker.NewWorker(configGetter, instManager, clientManager, queueRepo, failureTracker)
+	scannerManager.SetSonarrQueueRepair(workerManager.RepairSonarrDownload)
 	registrarManager := registrar.NewManager(instManager, clientManager)
 
 	return &Service{
@@ -255,11 +256,11 @@ func (s *Service) StopWorker(ctx context.Context) {
 }
 
 // RegisterConfigChangeHandler subscribes to config changes and starts/stops
-// the queue cleanup worker when arrs.enabled or arrs.queue_cleanup_enabled flips.
+// the recovery worker when arrs.enabled changes. Queue rules are gated per tick.
 func (s *Service) RegisterConfigChangeHandler(ctx context.Context, configManager *config.Manager) {
 	configManager.OnConfigChange(func(oldConfig, newConfig *config.Config) {
-		oldOn := worker.IsQueueCleanupEnabled(oldConfig)
-		newOn := worker.IsQueueCleanupEnabled(newConfig)
+		oldOn := worker.ShouldRunWorker(oldConfig)
+		newOn := worker.ShouldRunWorker(newConfig)
 		if oldOn == newOn {
 			return
 		}
@@ -289,7 +290,6 @@ func (s *Service) ClearInstanceCache(ctx context.Context, instanceName string) {
 	s.data.ClearMoviesCache(instanceName)
 	s.data.ClearSeriesCache(instanceName)
 }
-
 
 // DiscoverFileMetadata attempts to discover the rich metadata for a file through the appropriate ARR instance
 func (s *Service) DiscoverFileMetadata(ctx context.Context, filePath, relativePath, nzbName, libraryPath string) (*model.WebhookMetadata, error) {
@@ -322,8 +322,8 @@ func (s *Service) TestDownloadClientRegistration(ctx context.Context, altmountHo
 }
 
 // TestConnection tests the connection to an arrs instance
-func (s *Service) TestConnection(ctx context.Context, instanceType, url, apiKey string) error {
-	return s.clients.TestConnection(ctx, instanceType, url, apiKey)
+func (s *Service) TestConnection(ctx context.Context, instanceType, url, apiKey string, apiVersion ...string) error {
+	return s.clients.TestConnection(ctx, instanceType, url, apiKey, apiVersion...)
 }
 
 // GetHealth retrieves health checks from all enabled ARR instances
@@ -345,9 +345,9 @@ func (s *Service) GetHealth(ctx context.Context) (map[string]any, error) {
 				_ = client.GetInto(ctx, starr.Request{URI: "/health"}, &health)
 			}
 		case "sonarr":
-			client, err := s.clients.GetOrCreateSonarrClient(instance.Name, instance.URL, instance.APIKey)
+			client, err := s.clients.GetOrCreateSonarrClientContext(ctx, instance.Name, instance.URL, instance.APIKey, instance.APIVersion)
 			if err == nil {
-				_ = client.GetInto(ctx, starr.Request{URI: "/health"}, &health)
+				_ = client.GetInto(ctx, starr.Request{URI: client.APIVersion() + "/health"}, &health)
 			}
 		case "lidarr":
 			client, err := s.clients.GetOrCreateLidarrClient(instance.Name, instance.URL, instance.APIKey)

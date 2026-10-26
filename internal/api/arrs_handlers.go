@@ -93,6 +93,7 @@ type ArrsWebhookRequest struct {
 
 func (req ArrsWebhookRequest) ToMetadata() model.WebhookMetadata {
 	meta := model.WebhookMetadata{
+		DownloadID:   req.DownloadId,
 		EventType:    req.EventType,
 		InstanceName: req.InstanceName,
 	}
@@ -692,9 +693,11 @@ type ArrsStatsResponse struct {
 
 // TestConnectionRequest represents a request to test connection
 type TestConnectionRequest struct {
-	Type   string `json:"type"`
-	URL    string `json:"url"`
-	APIKey string `json:"api_key"`
+	Name       string `json:"name,omitempty"`
+	APIVersion string `json:"api_version,omitempty"`
+	Type       string `json:"type"`
+	URL        string `json:"url"`
+	APIKey     string `json:"api_key"`
 }
 
 // handleListArrsInstances returns all arrs instances
@@ -821,7 +824,7 @@ func (s *Server) handleTestArrsConnection(c *fiber.Ctx) error {
 	// A masked stored API key arrives empty; fall back to the credentials of
 	// a configured instance with the same URL so testing an existing instance
 	// does not require re-typing the key.
-	if req.APIKey == "" && s.configManager != nil {
+	if s.configManager != nil {
 		if cfg := s.configManager.GetConfig(); cfg != nil {
 			var instances []config.ArrsInstanceConfig
 			switch strings.ToLower(req.Type) {
@@ -839,11 +842,26 @@ func (s *Server) handleTestArrsConnection(c *fiber.Ctx) error {
 				instances = cfg.Arrs.SportarrInstances
 			}
 			for _, inst := range instances {
-				if inst.URL == req.URL && inst.APIKey != "" {
-					req.APIKey = inst.APIKey
+				if inst.URL == req.URL && (req.Name == "" || req.Name == inst.Name) {
+					if req.APIKey == "" {
+						req.APIKey = inst.APIKey
+					}
+					if req.APIVersion == "" {
+						req.APIVersion = inst.APIVersion
+					}
 					break
 				}
 			}
+		}
+	}
+	if req.APIVersion != "" {
+		if req.Type != "sonarr" {
+			return c.Status(400).JSON(fiber.Map{"success": false, "error": "api_version is only supported for Sonarr"})
+		}
+		switch req.APIVersion {
+		case "auto", "v3", "v5":
+		default:
+			return c.Status(400).JSON(fiber.Map{"success": false, "error": "api_version must be auto, v3, or v5"})
 		}
 	}
 	if req.APIKey == "" {
@@ -853,7 +871,7 @@ func (s *Server) handleTestArrsConnection(c *fiber.Ctx) error {
 		})
 	}
 
-	if err := s.arrsService.TestConnection(c.Context(), string(req.Type), req.URL, req.APIKey); err != nil {
+	if err := s.arrsService.TestConnection(c.Context(), string(req.Type), req.URL, req.APIKey, req.APIVersion); err != nil {
 		return c.Status(400).JSON(fiber.Map{
 			"success": false,
 			"error":   err.Error(),

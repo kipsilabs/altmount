@@ -20,6 +20,7 @@ interface ArrsConfigSectionProps {
 }
 
 interface NewInstanceForm {
+	api_version: "auto" | "v3" | "v5";
 	name: string;
 	type: ArrsType;
 	url: string;
@@ -29,6 +30,7 @@ interface NewInstanceForm {
 }
 
 const DEFAULT_NEW_INSTANCE: NewInstanceForm = {
+	api_version: "auto",
 	name: "",
 	type: "radarr",
 	url: "",
@@ -178,6 +180,7 @@ export function ArrsConfigSection({
 				name: newInstance.name,
 				url: newInstance.url,
 				api_key: newInstance.api_key,
+				...(newInstance.type === "sonarr" ? { api_version: newInstance.api_version } : {}),
 				category: category,
 				enabled: newInstance.enabled,
 				sync_interval_hours: 1,
@@ -614,6 +617,25 @@ export function ArrsConfigSection({
 									onChange={(e) => setNewInstance((prev) => ({ ...prev, api_key: e.target.value }))}
 								/>
 							</fieldset>
+							{newInstance.type === "sonarr" && (
+								<fieldset className="fieldset">
+									<legend className="fieldset-legend font-bold">Sonarr API</legend>
+									<select
+										className="select select-bordered w-full"
+										value={newInstance.api_version}
+										onChange={(e) =>
+											setNewInstance((prev) => ({
+												...prev,
+												api_version: e.target.value as NewInstanceForm["api_version"],
+											}))
+										}
+									>
+										<option value="auto">Auto (default)</option>
+										<option value="v3">Legacy v3</option>
+										<option value="v5">Native v5</option>
+									</select>
+								</fieldset>
+							)}
 							<fieldset className="fieldset">
 								<legend className="fieldset-legend font-bold">Category Mapping</legend>
 								<select

@@ -5209,6 +5209,13 @@ components:
       type: object
     api.TestConnectionRequest:
       properties:
+        name:
+          description: Configured instance name for stored credential recovery.
+          type: string
+        api_version:
+          description: Sonarr only. Empty or auto selects the API automatically.
+          type: string
+          enum: ["", auto, v3, v5]
         api_key:
           type: string
         type:
@@ -5419,6 +5426,10 @@ components:
       type: object
     config.ArrsInstanceConfig:
       properties:
+        api_version:
+          description: Sonarr only. Empty or auto selects the API automatically.
+          type: string
+          enum: ["", auto, v3, v5]
         api_key:
           type: string
         category:

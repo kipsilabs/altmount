@@ -256,7 +256,7 @@ arrs:
   enabled: false # Enable arrs service
   max_workers: 5 # Number of concurrent workers (default: 5)
   radarr_instances: [] # Radarr instances (configured via UI)
-  sonarr_instances: [] # Sonarr instances (configured via UI)
+  sonarr_instances: [] # Sonarr v4/v5 instances (configured via UI; API defaults to auto)
   lidarr_instances: [] # Lidarr instances (configured via UI)
   readarr_instances: [] # Readarr instances (configured via UI)
   whisparr_instances: [] # Whisparr instances (configured via UI)
@@ -267,6 +267,7 @@ arrs:
   queue_cleanup_grace_period_minutes: 5 # Minutes an item must stay stuck before cleanup acts (default: 5)
   # Message rules: when a stuck import's *arr status message matches a rule, run its
   # action (action: remove | blocklist | blocklist_search). Manage these in the web UI.
+  queue_cleanup_max_failures: 0 # Per-episode failed replacement limit; 0 disables the breaker
   queue_cleanup_rules: []
   # Example:
   # queue_cleanup_rules:
@@ -276,6 +277,9 @@ arrs:
   #   - message: "automatic import is not possible"
   #     enabled: false
   #     action: remove
+  # Sonarr packs are removed/blocklisted once per download; replacement limits apply
+  # per episode. Healthy imports and episodes with active replacements are preserved.
+  # Repairs search unresolved eligible episodes rather than the entire season.
   # Example instance configuration (use the web UI instead):
   # radarr_instances:
   #   - name: "radarr-main"
@@ -286,6 +290,8 @@ arrs:
   #   - name: "sonarr-main"
   #     url: "http://localhost:8989"
   #     api_key: "your-sonarr-api-key"
+  #     api_version: auto # Sonarr only: auto (default), v3 (compatibility), v5 (native)
+  #     # URL bases are supported; do not include /api/v3 or /api/v5 in url.
   #     enabled: true
 
 # Logging configuration with rotation support

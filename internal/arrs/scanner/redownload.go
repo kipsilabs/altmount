@@ -4,12 +4,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"github.com/kipsilabs/altmount/internal/arrs/clients"
 	"log/slog"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/kipsilabs/altmount/internal/arrs/model"
 	"golift.io/starr"
 	"golift.io/starr/radarr"
 	"golift.io/starr/sonarr"
@@ -90,7 +93,7 @@ func commandIsTerminal(cmd *arrCommand) bool {
 // the request is issued, so every wait helper takes this closure.
 type commandGetter func(context.Context, int64) (*arrCommand, error)
 
-func sonarrCommandByID(ctx context.Context, client *sonarr.Sonarr, id int64) (*arrCommand, error) {
+func sonarrCommandByID(ctx context.Context, client clients.SonarrClient, id int64) (*arrCommand, error) {
 	resp, err := client.GetCommandStatusContext(ctx, id)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read Sonarr command %d: %w", id, err)
@@ -116,7 +119,7 @@ func radarrCommandByID(ctx context.Context, client *radarr.Radarr, id int64) (*a
 	return out.command(), nil
 }
 
-func sonarrCommands(ctx context.Context, client *sonarr.Sonarr) ([]*arrCommand, error) {
+func sonarrCommands(ctx context.Context, client clients.SonarrClient) ([]*arrCommand, error) {
 	list, err := client.GetCommandsContext(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list Sonarr commands: %w", err)
@@ -293,7 +296,7 @@ func commandStatus(cmd *arrCommand) string {
 
 // waitEpisodeFileCleared polls until no target episode still points at a file
 // record, so the search that follows cannot race the deletion.
-func waitEpisodeFileCleared(ctx context.Context, client *sonarr.Sonarr, episodeIDs []int64, budget time.Duration) bool {
+func waitEpisodeFileCleared(ctx context.Context, client clients.SonarrClient, episodeIDs []int64, budget time.Duration, originalFileIDs ...int64) bool {
 	if len(episodeIDs) == 0 || budget <= 0 {
 		return false
 	}
@@ -314,7 +317,7 @@ func waitEpisodeFileCleared(ctx context.Context, client *sonarr.Sonarr, episodeI
 		}
 
 		if time.Now().After(deadline) {
-			slog.WarnContext(ctx, "Sonarr still reports an episode file after deletion, proceeding with the search anyway",
+			slog.WarnContext(ctx, "Sonarr still reports the original episode file after deletion, deferring search",
 				"episode_ids", episodeIDs, "budget", budget)
 			return false
 		}
@@ -417,6 +420,8 @@ type sonarrRedownloadTarget struct {
 	seriesID      int64
 	episodeIDs    []int64
 	episodeFileID int64
+	downloadID    string
+	seasonNumbers []int64
 }
 
 // settleSonarrAutoRedownload runs between blocklisting a release and searching
@@ -431,55 +436,112 @@ type sonarrRedownloadTarget struct {
 // that window.
 func (m *Manager) settleSonarrAutoRedownload(
 	ctx context.Context,
-	client *sonarr.Sonarr,
+	client clients.SonarrClient,
 	instanceName string,
 	target sonarrRedownloadTarget,
 	failAt time.Time,
 ) (*arrCommand, redownloadState, error) {
 	budget := m.autoSearchWaitBudget()
-	if budget <= 0 {
-		m.deleteSonarrEpisodeFile(ctx, client, instanceName, target.episodeFileID)
-		return nil, redownloadProceed, nil
+	initial, err := client.GetSeriesEpisodesContext(ctx, &sonarr.GetEpisode{EpisodeIDs: target.episodeIDs})
+	if err != nil {
+		return nil, redownloadProceed, fmt.Errorf("snapshot Sonarr repair targets: %w", err)
 	}
-
-	baseline := snapshotEpisodeFileIDs(ctx, client, target.episodeIDs)
-
-	auto := m.detectSonarrAutoSearch(ctx, client, target, failAt)
-	if auto != nil {
-		slog.InfoContext(ctx, "Sonarr queued its own redownload search after the blocklist, waiting for it to finish",
-			"instance", instanceName, "command_id", auto.ID, "command", auto.Name, "trigger", auto.Trigger)
-		if _, err := waitCommandTerminal(ctx, sonarrCommandGetter(client), auto.ID, budget); err != nil {
-			return nil, redownloadProceed, err
+	baseline := map[int64]int64{}
+	for _, ep := range initial {
+		if ep != nil {
+			baseline[ep.ID] = ep.EpisodeFileID
+			found := false
+			for _, n := range target.seasonNumbers {
+				if n == int64(ep.SeasonNumber) {
+					found = true
+				}
+			}
+			if !found {
+				target.seasonNumbers = append(target.seasonNumbers, int64(ep.SeasonNumber))
+			}
 		}
 	}
-
-	if queue, err := client.GetQueueContext(ctx, 0, 500); err != nil {
-		slog.WarnContext(ctx, "Failed to read Sonarr queue while checking for an automatic replacement",
-			"instance", instanceName, "error", err)
-	} else if queueHasEpisode(queue, target.episodeIDs) {
-		slog.InfoContext(ctx, "Sonarr's automatic redownload already grabbed a replacement, skipping delete and search",
-			"instance", instanceName, "episode_ids", target.episodeIDs)
-		return nil, redownloadHandled, nil
+	var auto *arrCommand
+	if budget > 0 {
+		auto = m.detectSonarrAutoSearch(ctx, client, target, failAt)
+		if auto != nil {
+			// Snapshot all matching active commands before waiting; a pack may
+			// have separate replacement searches for several subsets.
+			list, listErr := sonarrCommands(ctx, client)
+			if listErr != nil {
+				return nil, redownloadProceed, listErr
+			}
+			matches := findSonarrAutoCommands(list, target, failAt)
+			if len(matches) == 0 {
+				matches = []*arrCommand{auto}
+			}
+			deadline := time.Now().Add(budget)
+			for _, cmd := range matches {
+				remaining := time.Until(deadline)
+				if remaining <= 0 {
+					return nil, redownloadProceed, fmt.Errorf("sonarr automatic replacement still active; deferring repair")
+				}
+				last, waitErr := waitCommandTerminal(ctx, sonarrCommandGetter(client), cmd.ID, remaining)
+				if waitErr != nil {
+					return nil, redownloadProceed, waitErr
+				}
+				if !commandIsTerminal(last) {
+					return nil, redownloadProceed, fmt.Errorf("sonarr automatic replacement %d still active; deferring repair", cmd.ID)
+				}
+			}
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, redownloadProceed, err
 	}
 
+	queue, err := client.GetQueueContext(ctx, 0, 500)
+	if err != nil {
+		return nil, redownloadProceed, fmt.Errorf("refresh Sonarr queue before repair: %w", err)
+	}
 	episodes, err := client.GetSeriesEpisodesContext(ctx, &sonarr.GetEpisode{EpisodeIDs: target.episodeIDs})
 	if err != nil {
-		slog.WarnContext(ctx, "Failed to re-read Sonarr episodes after the automatic redownload search",
-			"instance", instanceName, "error", err)
-	} else {
-		if anyEpisodeFileReplaced(episodes, baseline) {
-			slog.InfoContext(ctx, "Sonarr's automatic redownload already imported a replacement file, skipping repair",
-				"instance", instanceName, "episode_ids", target.episodeIDs)
-			return nil, redownloadSatisfied, nil
+		return nil, redownloadProceed, fmt.Errorf("refresh Sonarr episodes before repair: %w", err)
+	}
+	queued, replaced, present := map[int64]bool{}, map[int64]bool{}, map[int64]bool{}
+	for _, row := range queue.Records {
+		if model.SonarrQueueIsReplacement(row, target.downloadID) {
+			queued[row.EpisodeID] = true
 		}
-		if target.episodeFileID > 0 && !anyEpisodeLinkedTo(episodes, target.episodeFileID) {
-			return auto, redownloadProceed, nil
+	}
+	for _, ep := range episodes {
+		if ep == nil {
+			continue
 		}
+		present[ep.ID] = true
+		old := baseline[ep.ID]
+		replaced[ep.ID] = ep.EpisodeFileID > 0 && ep.EpisodeFileID != old && ep.EpisodeFileID != target.episodeFileID
+	}
+	allCovered, allReplaced := len(target.episodeIDs) > 0, len(target.episodeIDs) > 0
+	for _, id := range target.episodeIDs {
+		if !present[id] {
+			return nil, redownloadProceed, fmt.Errorf("sonarr omitted episode %d; deferring repair", id)
+		}
+		allCovered = allCovered && (queued[id] || replaced[id])
+		allReplaced = allReplaced && replaced[id]
+	}
+	if allReplaced {
+		return nil, redownloadSatisfied, nil
+	}
+	if allCovered {
+		return nil, redownloadHandled, nil
+	}
+	if target.episodeFileID > 0 && !anyEpisodeLinkedTo(episodes, target.episodeFileID) {
+		return auto, redownloadProceed, nil
 	}
 
 	if target.episodeFileID > 0 {
-		m.deleteSonarrEpisodeFile(ctx, client, instanceName, target.episodeFileID)
-		waitEpisodeFileCleared(ctx, client, target.episodeIDs, m.fileDeleteConfirmBudget())
+		if err := m.deleteSonarrEpisodeFile(ctx, client, instanceName, target.episodeFileID); err != nil {
+			return nil, redownloadProceed, err
+		}
+		if budget := m.fileDeleteConfirmBudget(); budget > 0 && !waitEpisodeFileCleared(ctx, client, target.episodeIDs, budget, target.episodeFileID) {
+			return nil, redownloadProceed, fmt.Errorf("sonarr still links the removed file; deferring search")
+		}
 	}
 
 	return auto, redownloadProceed, nil
@@ -487,22 +549,18 @@ func (m *Manager) settleSonarrAutoRedownload(
 
 func (m *Manager) detectSonarrAutoSearch(
 	ctx context.Context,
-	client *sonarr.Sonarr,
+	client clients.SonarrClient,
 	target sonarrRedownloadTarget,
 	failAt time.Time,
 ) *arrCommand {
-	targets := map[string][]int64{"episodeIds": target.episodeIDs}
-	if target.seriesID > 0 {
-		targets["seriesId"] = []int64{target.seriesID}
-	}
 
 	deadline := time.Now().Add(autoSearchDetectWindow)
 	for {
 		list, err := sonarrCommands(ctx, client)
 		if err != nil {
 			slog.DebugContext(ctx, "Failed to list Sonarr commands while detecting the automatic redownload search", "error", err)
-		} else if cmd := findAutoRedownloadCommand(list, []string{"EpisodeSearch", "SeasonSearch"}, targets, failAt); cmd != nil {
-			return cmd
+		} else if matches := findSonarrAutoCommands(list, target, failAt); len(matches) > 0 {
+			return matches[0]
 		}
 
 		if time.Now().After(deadline) {
@@ -517,19 +575,24 @@ func (m *Manager) detectSonarrAutoSearch(
 	}
 }
 
-func (m *Manager) deleteSonarrEpisodeFile(ctx context.Context, client *sonarr.Sonarr, instanceName string, episodeFileID int64) {
+func (m *Manager) deleteSonarrEpisodeFile(ctx context.Context, client clients.SonarrClient, instanceName string, episodeFileID int64) error {
 	if episodeFileID <= 0 {
-		return
+		return nil
 	}
-	if err := client.DeleteEpisodeFileContext(ctx, episodeFileID); err != nil {
-		slog.WarnContext(ctx, "Failed to delete episode file from Sonarr, continuing with search",
-			"instance", instanceName, "episode_file_id", episodeFileID, "error", err)
+	err := client.DeleteEpisodeFileContext(ctx, episodeFileID)
+	var request *starr.ReqError
+	if errors.As(err, &request) && request.Code == 404 {
+		return nil
 	}
+	if err != nil {
+		return fmt.Errorf("delete original Sonarr episode file: %w", err)
+	}
+	return nil
 }
 
 // sendSonarrSearch issues the targeted replacement search and retries once if
 // Sonarr collapsed it into an existing command.
-func (m *Manager) sendSonarrSearch(ctx context.Context, client *sonarr.Sonarr, instanceName string, searchIDs []int64, auto *arrCommand) (*arrCommand, error) {
+func (m *Manager) sendSonarrSearch(ctx context.Context, client clients.SonarrClient, instanceName string, searchIDs []int64, auto *arrCommand) (*arrCommand, error) {
 	body := sonarrSearchBody{Name: "EpisodeSearch", EpisodeIDs: searchIDs, Trigger: manualTrigger}
 
 	resp, err := sendSearchCommandWithTrigger(ctx, client, body)
@@ -544,8 +607,12 @@ func (m *Manager) sendSonarrSearch(ctx context.Context, client *sonarr.Sonarr, i
 
 	slog.InfoContext(ctx, "Sonarr merged the repair search into a running command, retrying once it finishes",
 		"instance", instanceName, "command_id", resp.ID, "trigger", resp.Trigger)
-	if _, err := waitCommandTerminal(ctx, sonarrCommandGetter(client), resp.ID, budget); err != nil {
-		return nil, err
+	last, waitErr := waitCommandTerminal(ctx, sonarrCommandGetter(client), resp.ID, budget)
+	if waitErr != nil {
+		return nil, waitErr
+	}
+	if !commandIsTerminal(last) {
+		return nil, fmt.Errorf("sonarr search is still active; deferring duplicate submission")
 	}
 
 	resp, err = sendSearchCommandWithTrigger(ctx, client, body)
@@ -555,63 +622,15 @@ func (m *Manager) sendSonarrSearch(ctx context.Context, client *sonarr.Sonarr, i
 	return resp, nil
 }
 
-func sonarrCommandGetter(client *sonarr.Sonarr) commandGetter {
+func sonarrCommandGetter(client clients.SonarrClient) commandGetter {
 	return func(ctx context.Context, id int64) (*arrCommand, error) {
 		return sonarrCommandByID(ctx, client, id)
 	}
 }
 
-func snapshotEpisodeFileIDs(ctx context.Context, client *sonarr.Sonarr, episodeIDs []int64) map[int64]int64 {
-	out := make(map[int64]int64, len(episodeIDs))
-	if len(episodeIDs) == 0 {
-		return out
-	}
-	episodes, err := client.GetSeriesEpisodesContext(ctx, &sonarr.GetEpisode{EpisodeIDs: episodeIDs})
-	if err != nil {
-		return out
-	}
-	for _, ep := range episodes {
-		if ep != nil {
-			out[ep.ID] = ep.EpisodeFileID
-		}
-	}
-	return out
-}
-
-func anyEpisodeFileReplaced(episodes []*sonarr.Episode, baseline map[int64]int64) bool {
-	for _, ep := range episodes {
-		if ep == nil || ep.EpisodeFileID == 0 {
-			continue
-		}
-		if before, ok := baseline[ep.ID]; !ok || before != ep.EpisodeFileID {
-			return true
-		}
-	}
-	return false
-}
-
 func anyEpisodeLinkedTo(episodes []*sonarr.Episode, episodeFileID int64) bool {
 	for _, ep := range episodes {
 		if ep != nil && ep.EpisodeFileID == episodeFileID {
-			return true
-		}
-	}
-	return false
-}
-
-func queueHasEpisode(queue *sonarr.Queue, episodeIDs []int64) bool {
-	if queue == nil {
-		return false
-	}
-	wanted := make(map[int64]struct{}, len(episodeIDs))
-	for _, id := range episodeIDs {
-		wanted[id] = struct{}{}
-	}
-	for _, record := range queue.Records {
-		if record == nil {
-			continue
-		}
-		if _, ok := wanted[record.EpisodeID]; ok {
 			return true
 		}
 	}

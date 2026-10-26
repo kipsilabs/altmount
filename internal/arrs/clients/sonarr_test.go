@@ -16,7 +16,7 @@ import (
 	"golift.io/starr/sonarr"
 )
 
-// Sonarr v5 retains these v3 response shapes and controllers. In particular,
+// Forced legacy compatibility must remain available on both Sonarr majors. In particular,
 // /api/v3/queue still returns one episodeId per record, unlike /api/v5/queue.
 // See Sonarr/Sonarr, v5-develop, src/Sonarr.Api.V3/{openapi.json,Queue/QueueController.cs}.
 // Exercise both versions through one manager to cover mixed-version setups.
@@ -27,10 +27,10 @@ func TestSonarrV4AndV5Compatibility(t *testing.T) {
 		t.Run(version, func(t *testing.T) {
 			srv := sonarrCompatibilityServer(t, version)
 			instanceURL := srv.URL + "/sonarr"
-			require.NoError(t, m.TestConnection(ctx, "sonarr", instanceURL, "test-key"))
-			client, err := m.GetOrCreateSonarrClient(version, instanceURL, "test-key")
+			require.NoError(t, m.TestConnection(ctx, "sonarr", instanceURL, "test-key", "v3"))
+			client, err := m.GetOrCreateSonarrClient(version, instanceURL, "test-key", "v3")
 			require.NoError(t, err)
-			cached, err := m.GetOrCreateSonarrClient(version, instanceURL, "test-key")
+			cached, err := m.GetOrCreateSonarrClient(version, instanceURL, "test-key", "v3")
 			require.NoError(t, err)
 			require.Same(t, client, cached)
 			status, err := client.GetSystemStatusContext(ctx)
