@@ -176,14 +176,16 @@ type ImportAPIResponse struct {
 
 // SABnzbdAPIResponse sanitizes SABnzbd config for API responses
 type SABnzbdAPIResponse struct {
-	Enabled                 bool                     `json:"enabled"`
-	CompleteDir             string                   `json:"complete_dir"`
-	DownloadClientBaseURL   string                   `json:"download_client_base_url"`
-	Categories              []config.SABnzbdCategory `json:"categories"`
-	HistoryRetentionMinutes int                      `json:"history_retention_minutes"`
-	FallbackHost            string                   `json:"fallback_host"`
-	FallbackAPIKey          string                   `json:"fallback_api_key"`     // Obfuscated if set
-	FallbackAPIKeySet       bool                     `json:"fallback_api_key_set"` // Indicates if API key is set
+	Enabled                  bool                     `json:"enabled"`
+	CompleteDir              string                   `json:"complete_dir"`
+	DownloadClientBaseURL    string                   `json:"download_client_base_url"`
+	Categories               []config.SABnzbdCategory `json:"categories"`
+	HistoryRetentionMinutes  int                      `json:"history_retention_minutes"`
+	DeleteGuardMaxFolders    int                      `json:"delete_guard_max_folders"`
+	DeleteGuardWindowMinutes int                      `json:"delete_guard_window_minutes"`
+	FallbackHost             string                   `json:"fallback_host"`
+	FallbackAPIKey           string                   `json:"fallback_api_key"`     // Obfuscated if set
+	FallbackAPIKeySet        bool                     `json:"fallback_api_key_set"` // Indicates if API key is set
 }
 
 // ArrsAPIResponse sanitizes Arrs config for API responses
@@ -407,14 +409,16 @@ func ToConfigAPIResponse(cfg *config.Config, apiKey string) *ConfigAPIResponse {
 	}
 
 	sabnzbdResp := SABnzbdAPIResponse{
-		Enabled:                 cfg.SABnzbd.Enabled != nil && *cfg.SABnzbd.Enabled,
-		CompleteDir:             cfg.SABnzbd.CompleteDir,
-		DownloadClientBaseURL:   cfg.SABnzbd.DownloadClientBaseURL,
-		Categories:              cfg.SABnzbd.Categories,
-		HistoryRetentionMinutes: cfg.SABnzbd.HistoryRetentionMinutes,
-		FallbackHost:            cfg.SABnzbd.FallbackHost,
-		FallbackAPIKey:          fallbackAPIKey,
-		FallbackAPIKeySet:       cfg.SABnzbd.FallbackAPIKey != "",
+		Enabled:                  cfg.SABnzbd.Enabled != nil && *cfg.SABnzbd.Enabled,
+		CompleteDir:              cfg.SABnzbd.CompleteDir,
+		DownloadClientBaseURL:    cfg.SABnzbd.DownloadClientBaseURL,
+		Categories:               cfg.SABnzbd.Categories,
+		HistoryRetentionMinutes:  cfg.SABnzbd.HistoryRetentionMinutes,
+		DeleteGuardMaxFolders:    cfg.SABnzbd.DeleteGuardMaxFolders,
+		DeleteGuardWindowMinutes: cfg.SABnzbd.DeleteGuardWindowMinutes,
+		FallbackHost:             cfg.SABnzbd.FallbackHost,
+		FallbackAPIKey:           fallbackAPIKey,
+		FallbackAPIKeySet:        cfg.SABnzbd.FallbackAPIKey != "",
 	}
 
 	webdavResp := WebDAVAPIResponse{

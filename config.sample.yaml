@@ -222,6 +222,8 @@ mount_path: '' # WebDAV mount path, Example: '/mnt/remotes/altmount' or '/mnt/un
 sabnzbd:
   enabled: false # Enable SABnzbd-compatible API
   complete_dir: '/' # Base virtual directory (relative to mount point, defaults to root)
+  delete_guard_max_folders: 50 # Distinct release folders deleted per category in the window
+  delete_guard_window_minutes: 10 # Refusals block the category until this long without a refusal; either negative setting disables the guard
   categories: # Download categories
     - name: 'Default' # System default category (name cannot be changed)
       order: 0

@@ -352,6 +352,8 @@ export interface SABnzbdConfig {
 	download_client_base_url?: string;
 	categories: SABnzbdCategory[];
 	history_retention_minutes: number;
+	delete_guard_max_folders?: number;
+	delete_guard_window_minutes?: number;
 	fallback_host?: string;
 	fallback_api_key?: string; // Obfuscated when returned from API
 	fallback_api_key_set?: boolean; // For display purposes only
@@ -570,6 +572,8 @@ export interface SABnzbdUpdateRequest {
 	complete_dir?: string;
 	categories?: SABnzbdCategory[];
 	history_retention_minutes?: number;
+	delete_guard_max_folders?: number;
+	delete_guard_window_minutes?: number;
 	fallback_host?: string;
 	fallback_api_key?: string;
 }

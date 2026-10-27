@@ -172,7 +172,9 @@ func (h *webdavMethods) handleDelete(w http.ResponseWriter, r *http.Request) {
 
 	slog.DebugContext(ctx, "WebDAV DELETE", "path", reqPath)
 	if err := h.fs.RemoveAll(ctx, reqPath); err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, os.ErrPermission) {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+		} else if os.IsNotExist(err) {
 			http.Error(w, "Not Found", http.StatusNotFound)
 		} else {
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)

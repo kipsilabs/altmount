@@ -885,6 +885,9 @@ type SABnzbdConfig struct {
 	// nzo_id filter. Older entries are still returned when *arr asks for them by
 	// nzo_id. Defaults to 10080 (7 days).
 	HistoryRetentionMinutes int `yaml:"history_retention_minutes" mapstructure:"history_retention_minutes" json:"history_retention_minutes,omitempty"`
+	// Zero uses the default; either negative value disables the delete guard.
+	DeleteGuardMaxFolders    int `yaml:"delete_guard_max_folders" mapstructure:"delete_guard_max_folders" json:"delete_guard_max_folders"`
+	DeleteGuardWindowMinutes int `yaml:"delete_guard_window_minutes" mapstructure:"delete_guard_window_minutes" json:"delete_guard_window_minutes"`
 	// Fallback configuration for sending failed imports to external SABnzbd
 	FallbackHost   string `yaml:"fallback_host" mapstructure:"fallback_host" json:"fallback_host"`
 	FallbackAPIKey string `yaml:"fallback_api_key" mapstructure:"fallback_api_key" json:"fallback_api_key"` // Masked in API responses
@@ -2343,9 +2346,11 @@ func DefaultConfig(configDir ...string) *Config {
 			RepairOnImport:    &par2RepairOnImport,
 		},
 		SABnzbd: SABnzbdConfig{
-			Enabled:               &sabnzbdEnabled,
-			CompleteDir:           "/complete",
-			DownloadClientBaseURL: "",
+			DeleteGuardMaxFolders:    50,
+			DeleteGuardWindowMinutes: 10,
+			Enabled:                  &sabnzbdEnabled,
+			CompleteDir:              "/complete",
+			DownloadClientBaseURL:    "",
 			Categories: []SABnzbdCategory{
 				{
 					Name:     "Movies",

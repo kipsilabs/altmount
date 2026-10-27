@@ -2,6 +2,7 @@ package nzbfilesystem
 
 import (
 	"context"
+	"errors"
 	"io/fs"
 	"os"
 
@@ -75,9 +76,11 @@ func (nfs *NzbFilesystem) Stat(ctx context.Context, name string) (fs.FileInfo, e
 }
 
 // Remove removes a file (not supported)
-func (nfs *NzbFilesystem) Remove(ctx context.Context, name string) error {
+func (nfs *NzbFilesystem) Remove(ctx context.Context, name string) (err error) {
 	defer func() {
-		_ = nfs.remoteFile.healthRepository.DeleteHealthRecord(ctx, name)
+		if !errors.Is(err, os.ErrPermission) && nfs.remoteFile.healthRepository != nil {
+			_ = nfs.remoteFile.healthRepository.DeleteHealthRecord(ctx, name)
+		}
 	}()
 
 	ok, err := nfs.remoteFile.RemoveFile(ctx, name)
@@ -126,4 +129,3 @@ func (nfs *NzbFilesystem) Mkdir(ctx context.Context, name string, perm os.FileMo
 func (nfs *NzbFilesystem) MkdirAll(ctx context.Context, name string, perm os.FileMode) error {
 	return nfs.remoteFile.MkdirAll(ctx, name, perm)
 }
-

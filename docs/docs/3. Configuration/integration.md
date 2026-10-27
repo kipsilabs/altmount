@@ -8,6 +8,24 @@ keywords: [altmount, sonarr, radarr, sabnzbd, arr, integration, download client,
 
 AltMount acts as a SABnzbd-compatible download client for Sonarr and Radarr. This guide walks through the full setup process for seamless integration with your media management applications.
 
+## Protection against recursive category deletion
+
+AltMount limits mount deletions to 50 distinct release folders per category in a rolling 10-minute window. Once the limit is exceeded, all further deletions in that category are refused until 10 minutes pass without a refusal. WebDAV reports HTTP 403, and refused files retain their metadata and health records. Successful deletions are logged at info level; guard warnings are throttled to once per minute per category.
+
+A season pack counts as one release folder regardless of its file count. A loose file directly inside a category counts as its own folder. Only successful deletions count, with in-flight operations reserving a slot. Paths outside `complete_dir` are unaffected. This limits accidental bulk deletion; it does not undo deletions already completed. Counters are held in memory and reset on restart.
+
+Direct recursive deletes of category roots and parent directories containing `complete_dir` are ignored with a warning, including categories no longer present in configuration.
+
+Configure the guard in YAML or through the configuration API:
+
+```yaml
+sabnzbd:
+  delete_guard_max_folders: 50
+  delete_guard_window_minutes: 10
+```
+
+Zero uses the default for that setting. A negative value for either setting disables the guard. The guard applies even when the SABnzbd API is disabled.
+
 ## Sonarr Version Compatibility
 
 Sonarr v4 and v5 instances can run together. AltMount selects an API independently for each instance: **Auto (default)** uses the legacy v3 API for Sonarr v4 and native v5 for a confirmed Sonarr v5 instance. Existing configurations use Auto without migration. Enter the instance URL, including any URL base such as `http://sonarr:8989/sonarr`, without an `/api/v3` or `/api/v5` suffix.

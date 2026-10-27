@@ -70,6 +70,7 @@ type MetadataRemoteFile struct {
 	patchSource      PatchSource              // Repaired-article payloads (nil = PAR2 repair disabled)
 	repairEnqueuer   RepairEnqueuer           // Queues PAR2 repairs (nil = PAR2 repair disabled)
 	renameMu         sync.Mutex               // Mutex to protect rename operations from race conditions
+	deleteGuard      deleteGuard
 }
 
 // SetPatchSource wires the PAR2 repair patch store into the read path. Call
@@ -335,7 +336,7 @@ func (mrf *MetadataRemoteFile) OpenFile(ctx context.Context, name string) (bool,
 }
 
 // RemoveFile removes a virtual file or directory from the metadata
-func (mrf *MetadataRemoteFile) RemoveFile(ctx context.Context, fileName string) (bool, error) {
+func (mrf *MetadataRemoteFile) RemoveFile(ctx context.Context, fileName string) (handled bool, err error) {
 	// Normalize the path to handle trailing slashes consistently
 	normalizedName := normalizePath(fileName)
 
@@ -351,12 +352,35 @@ func (mrf *MetadataRemoteFile) RemoveFile(ctx context.Context, fileName string) 
 	}
 
 	// Prevent removal of category folders
-	if mrf.isCategoryFolder(normalizedName) {
-		slog.DebugContext(ctx, "Silently ignored removal request for category folder", "path", normalizedName)
+	cfg := mrf.configGetter()
+	if mrf.isCategoryFolder(normalizedName) || (isDeleteGuardRoot(normalizedName, cfg) && mrf.metadataService.DirectoryExists(normalizedName)) {
+		slog.WarnContext(ctx, "Ignored removal request for protected category folder", "path", normalizedName)
 		// Return true (success) but do nothing. This prevents Sonarr/Radarr/rclone
 		// from logging "directory not empty" or "permission denied" errors.
 		return true, nil
 	}
+	limit, minutes := cfg.SABnzbd.DeleteGuardMaxFolders, cfg.SABnzbd.DeleteGuardWindowMinutes
+	if limit == 0 {
+		limit = 50
+	}
+	if minutes == 0 {
+		minutes = 10
+	}
+	if category, release := deleteGuardPath(normalizedName, cfg); category != "" && release != "" && limit > 0 && minutes > 0 {
+		reservation, warn, guardErr := mrf.deleteGuard.reserve(category, release, limit, time.Duration(minutes)*time.Minute, time.Now())
+		if guardErr != nil {
+			if warn {
+				slog.WarnContext(ctx, "Delete guard refused removal; category cooldown extended by further refusals", "path", normalizedName, "category", category, "max_folders", limit, "window_minutes", minutes)
+			}
+			return false, guardErr
+		}
+		defer func() { mrf.deleteGuard.finish(reservation, handled && err == nil, time.Now()) }()
+	}
+	defer func() {
+		if handled && err == nil {
+			slog.InfoContext(ctx, "Removed metadata", "path", normalizedName)
+		}
+	}()
 
 	// Check if this is a directory
 	if mrf.metadataService.DirectoryExists(normalizedName) {
@@ -381,10 +405,8 @@ func (mrf *MetadataRemoteFile) RemoveFile(ctx context.Context, fileName string) 
 		}
 	}
 
-	cfg := mrf.configGetter()
-
 	// Deletes the .meta and, once the last sibling is gone, the shared .nzbz store.
-	err := mrf.metadataService.DeleteFileMetadata(ctx, normalizedName)
+	err = mrf.metadataService.DeleteFileMetadata(ctx, normalizedName)
 	if err != nil {
 		return true, err
 	}
