@@ -430,6 +430,7 @@ func startPar2RepairService(
 		func() par2repair.Config {
 			c := configGetter()
 			return par2repair.Config{
+				RecoveryMargin:    c.Par2Repair.RecoveryMargin,
 				Enabled:           c.Par2Repair.Enabled != nil && *c.Par2Repair.Enabled,
 				MaxRepairRatio:    c.Par2Repair.MaxRepairRatio,
 				MaxMemoryMB:       c.Par2Repair.MaxMemoryMB,

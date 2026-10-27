@@ -49,6 +49,8 @@ type DeadArticle struct {
 
 // Caps is the repair policy: how much damage a job may fix.
 type Caps struct {
+	// RecoveryMargin overrides the baseline spare rows; nil or negative keeps eight.
+	RecoveryMargin *int
 	// MaxRepairRatio caps missing bytes over the damaged files' total bytes.
 	MaxRepairRatio float64
 	// MaxMemoryBytes bounds the solver's in-heap accumulator memory (k × slice
@@ -186,7 +188,15 @@ func BuildPlan(idx *par2.Index, files []SetFile, caps Caps) (*Plan, error) {
 	recs := make([]par2.RecoverySliceRef, len(idx.Recovery))
 	copy(recs, idx.Recovery)
 	sort.Slice(recs, func(i, j int) bool { return recs[i].Exponent < recs[j].Exponent })
-	m := min(planMargin+hiddenMarginRows(plan.Files, sliceSize, caps.ExpectedHiddenArticles), len(recs)-k)
+	margin := planMargin
+	if caps.RecoveryMargin != nil && *caps.RecoveryMargin >= 0 {
+		margin = min(*caps.RecoveryMargin, len(recs)-k)
+	}
+	// Verify-only sweeps need insurance to discover damage before they can solve.
+	if caps.VerifySweep {
+		margin = max(margin, planMargin)
+	}
+	m := min(margin+hiddenMarginRows(plan.Files, sliceSize, caps.ExpectedHiddenArticles), len(recs)-k)
 	if !plan.SpillToDisk && caps.MaxMemoryBytes > 0 {
 		for m > 0 && int64(k+m)*sliceSize > caps.MaxMemoryBytes {
 			m--

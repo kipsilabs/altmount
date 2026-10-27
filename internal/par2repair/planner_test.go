@@ -372,3 +372,43 @@ func TestBuildPlanProvisionsMarginForHiddenDamage(t *testing.T) {
 			len(plan.Recovery))
 	}
 }
+
+func TestBuildPlanRecoveryMargin(t *testing.T) {
+	content := bytes.Repeat([]byte{0x5a}, 16*1024)
+	idx := mkIndex(t, 1024, 12, map[string][]byte{"a.rar": content})
+	for _, tc := range []struct {
+		name   string
+		margin *int
+		verify bool
+		hidden int
+		want   int
+	}{
+		{name: "default", want: 9},
+		{name: "zero", margin: new(int), want: 1},
+		{name: "two", margin: intPointer(2), want: 3},
+		{name: "negative defaults", margin: intPointer(-1), want: 9},
+		{name: "verify keeps insurance", margin: new(int), verify: true, want: 8},
+		{name: "hidden damage keeps insurance", margin: new(int), hidden: 1, want: 6},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var dead []int
+			if !tc.verify {
+				dead = []int{0}
+			}
+			files := []SetFile{mkSetFile(t, idx, "a.rar", int64(len(content)), 1024, dead...)}
+			caps := defaultCaps()
+			caps.RecoveryMargin = tc.margin
+			caps.VerifySweep = tc.verify
+			caps.ExpectedHiddenArticles = tc.hidden
+			plan, err := BuildPlan(idx, files, caps)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(plan.Recovery) != tc.want {
+				t.Fatalf("rows=%d want=%d", len(plan.Recovery), tc.want)
+			}
+		})
+	}
+}
+
+func intPointer(n int) *int { return &n }

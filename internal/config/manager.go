@@ -91,7 +91,10 @@ type Config struct {
 // articles. Repaired article payloads are persisted under
 // <metadata_root>/patches and served on the read path's hole branch.
 type Par2RepairConfig struct {
-	Enabled *bool `yaml:"enabled" mapstructure:"enabled" json:"enabled,omitempty"`
+	// RecoveryMargin is the baseline number of spare recovery rows. Nil keeps
+	// eight; zero minimizes arithmetic but may require another full sweep.
+	RecoveryMargin *int  `yaml:"recovery_margin,omitempty" mapstructure:"recovery_margin" json:"recovery_margin,omitempty"`
+	Enabled        *bool `yaml:"enabled" mapstructure:"enabled" json:"enabled,omitempty"`
 	// MaxRepairRatio caps how large a fraction of a file's bytes a repair may
 	// reconstruct. The release's PAR2 redundancy is always the hard ceiling.
 	MaxRepairRatio float64 `yaml:"max_repair_ratio" mapstructure:"max_repair_ratio" json:"max_repair_ratio,omitempty"`

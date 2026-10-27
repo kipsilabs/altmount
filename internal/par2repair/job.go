@@ -10,7 +10,9 @@ import (
 	"log/slog"
 	"slices"
 	"sort"
+	"time"
 
+	"github.com/javi11/gopar-turbo/gf16"
 	"github.com/javi11/nntppool/v5"
 
 	"github.com/kipsilabs/altmount/internal/importer/parser/par2"
@@ -224,6 +226,13 @@ func RunJob(
 	for _, opt := range opts {
 		opt(&o)
 	}
+	started := time.Now()
+	var downloadTime, solveTime, verifyTime, persistTime time.Duration
+	defer func() {
+		log.InfoContext(ctx, "PAR2 job performance", "elapsed", time.Since(started),
+			"recovery_download_time", downloadTime, "solve_time", solveTime,
+			"verify_time", verifyTime, "persist_time", persistTime, "spill_to_disk", plan.SpillToDisk)
+	}()
 	sliceSize := int64(plan.SliceSize)
 	k := len(plan.Missing)
 
@@ -273,12 +282,20 @@ func RunJob(
 	// payloads, solver accumulators and recovered slices; fresh file pages
 	// arrive zeroed, so a re-sweep never sees a stale accumulator.
 	var attemptArena *arena
+	var attemptSolver *Solver
 	defer func() {
+		if attemptSolver != nil {
+			attemptSolver.Close()
+		}
 		if attemptArena != nil {
 			_ = attemptArena.Close()
 		}
 	}()
 	for {
+		if attemptSolver != nil {
+			attemptSolver.Close()
+			attemptSolver = nil
+		}
 		if attemptArena != nil {
 			_ = attemptArena.Close()
 			attemptArena = nil
@@ -303,8 +320,10 @@ func RunJob(
 
 		var payloads [][]byte
 		var err error
+		downloadStarted := time.Now()
 		refs, payloads, spares, err = loadRecoveryPayloads(
 			ctx, fetch, par2Files, refs, spares, len(missing), sliceSize, alloc, plan.SpillToDisk, o.fetchDepth(), o.progress, log)
+		downloadTime += time.Since(downloadStarted)
 		if err != nil {
 			return err
 		}
@@ -317,10 +336,13 @@ func RunJob(
 		if err != nil {
 			return err
 		}
+		log.InfoContext(ctx, "PAR2 solver backend", "accelerated", gf16.Accelerated(),
+			"method", solver.ctx.MethodName(), "workers", solver.workers,
+			"missing_slices", len(missing), "recovery_rows", len(refs),
+			"slice_bytes", plan.SliceSize, "accumulator_bytes", int64(len(refs))*int64(solver.ctx.BufSize()))
 		solver.WorkerLimit = o.foldWorkerLimit()
-		// Attempts are bounded (spares and the corrupt-replan budget), so a
-		// deferred close per attempt cannot pile up.
-		defer solver.Close()
+		// Close this solver before its arena is unmapped or an attempt restarts.
+		attemptSolver = solver
 		// The payload buffers were read for this attempt alone, so they are
 		// donated: seeding consumes them into the accumulators' prepared
 		// layout and nothing reads them again.
@@ -328,6 +350,7 @@ func RunJob(
 			if err := solver.SeedRecoveryOwning(i, p); err != nil {
 				return err
 			}
+			payloads[i] = nil
 		}
 
 		// Absorb callbacks: a slice discovered dead or corrupt mid-sweep
@@ -426,7 +449,9 @@ func RunJob(
 			return ErrNothingToRepair
 		}
 
+		solveStarted := time.Now()
 		recovered, err := solver.Solve()
+		solveTime += time.Since(solveStarted)
 		if errors.Is(err, ErrSingularMatrix) {
 			// Solve already tried every loaded row: no invertible subset
 			// exists. A spare brings a genuinely new exponent into play, at
@@ -446,15 +471,22 @@ func RunJob(
 		}
 
 		// Verify every recovered slice against its IFSC MD5 before storing.
-		if err := verifyRecovered(plan, idx, recovered, startSlice, missingPos); err != nil {
+		verifyStarted := time.Now()
+		err = verifyRecovered(plan, idx, recovered, startSlice, missingPos)
+		verifyTime += time.Since(verifyStarted)
+		if err != nil {
 			return err
 		}
 
+		persistStarted := time.Now()
 		if err := emitPatches(plan, discovered, recovered, sliceSize, startSlice, missingPos, store, log); err != nil {
+			persistTime += time.Since(persistStarted)
 			return err
 		}
-		return emitCorruptArticlePatches(ctx, plan, corruptSlices, discoveredIDs, recovered,
+		err = emitCorruptArticlePatches(ctx, plan, corruptSlices, discoveredIDs, recovered,
 			sliceSize, startSlice, missingPos, fetch, store, log)
+		persistTime += time.Since(persistStarted)
+		return err
 	}
 }
 
@@ -719,7 +751,38 @@ func sweep(
 	slots, stop := prefetchArticles(ctx, fetch, all, depth)
 	defer stop()
 
-	buf := make([]byte, sliceSize)
+	// Raw batch buffers are capped at 32 MiB (except a single large slice).
+	// Prepared buffers use the same bounded batch width inside the solver.
+	batchSize := max(1, min(4, (32<<20)/sliceSize))
+	if plan.SpillToDisk {
+		// Avoid extra resident buffers on memory-constrained jobs.
+		batchSize = 1
+	}
+	buffers := make([][]byte, batchSize)
+	for i := range buffers {
+		buffers[i] = make([]byte, sliceSize)
+	}
+	buf := buffers[0]
+	indices := make([]int, 0, batchSize)
+	inputs := make([][]byte, 0, batchSize)
+	var foldTime, checksumTime, waitTime time.Duration
+	var bytesRead int64
+	started := time.Now()
+	defer func() {
+		log.InfoContext(ctx, "PAR2 sweep performance", "elapsed", time.Since(started),
+			"fetch_wait", waitTime, "checksum_time", checksumTime, "fold_time", foldTime,
+			"bytes_read", bytesRead, "batch_slices", batchSize, "recovery_rows", len(solver.exps))
+	}()
+	flush := func() {
+		if len(indices) == 0 {
+			return
+		}
+		started := time.Now()
+		solver.FoldPresentBatch(indices, inputs)
+		foldTime += time.Since(started)
+		indices = indices[:0]
+		inputs = inputs[:0]
+	}
 	for fi, f := range plan.Files {
 		checks := idx.SliceChecks[f.FileID]
 		fill := 0
@@ -728,7 +791,10 @@ func sweep(
 		completeSlice := func() error {
 			global := int(startSlice[fi]) + local
 			if _, isMissing := missingPos[global]; !isMissing {
-				if local < len(checks) && crc32.ChecksumIEEE(buf) != checks[local].CRC32 {
+				checksumStarted := time.Now()
+				intact := local >= len(checks) || crc32.ChecksumIEEE(buf) == checks[local].CRC32
+				checksumTime += time.Since(checksumStarted)
+				if !intact {
 					// Present but corrupt: another unknown, absorbed on a
 					// margin row — or, with none left, signalled to the
 					// attempt loop for a replan.
@@ -738,7 +804,12 @@ func sweep(
 					log.WarnContext(ctx, "present slice failed CRC32, absorbed as missing on a margin row",
 						"global_slice", global)
 				} else {
-					solver.FoldPresent(global, buf)
+					indices = append(indices, global)
+					inputs = append(inputs, buf)
+					if len(indices) == batchSize {
+						flush()
+					}
+					buf = buffers[len(indices)]
 				}
 			}
 			local++
@@ -777,12 +848,15 @@ func sweep(
 				artOff += a.Size
 				continue
 			}
+			waitStarted := time.Now()
 			slot, ok := <-slots
 			if !ok {
 				// The prefetcher only closes early when the context ended.
 				return ctx.Err()
 			}
 			res := <-slot
+			waitTime += time.Since(waitStarted)
+			bytesRead += int64(len(res.data))
 			if res.err != nil {
 				if errors.Is(res.err, nntppool.ErrArticleNotFound) {
 					// An article that died between planning and sweeping:
@@ -821,6 +895,7 @@ func sweep(
 		}
 		log.DebugContext(ctx, "swept recovery-set file", "file_index", fi, "slices", local)
 	}
+	flush()
 	return nil
 }
 

@@ -21,6 +21,7 @@ import (
 // Config is the repair policy snapshot the service reads per job (so config
 // hot-reloads apply to the next job without a restart).
 type Config struct {
+	RecoveryMargin    *int
 	Enabled           bool
 	MaxRepairRatio    float64
 	MaxMemoryMB       int
@@ -39,6 +40,7 @@ type Config struct {
 // caps translates the service policy into planner caps.
 func (c Config) caps() Caps {
 	return Caps{
+		RecoveryMargin:      c.RecoveryMargin,
 		MaxRepairRatio:      c.MaxRepairRatio,
 		MaxMemoryBytes:      int64(c.MaxMemoryMB) << 20,
 		MinReleaseSizeBytes: int64(c.MinReleaseSizeMB) << 20,
@@ -557,11 +559,14 @@ func (s *Service) executeJob(ctx context.Context, job *database.Par2RepairJob) e
 	defer s.clearProgress(job.ID)
 	progress := s.jobProgress(job.ID)
 	fetch := s.fetcherFor(metaArticleDate(fm))
-	res, err := Resolve(ctx, fm, store, deadIDs, fetch, caps, s.log, progress)
+	log := s.log.With("job", job.ID, "file", job.FilePath)
+	planningStarted := time.Now()
+	res, err := Resolve(ctx, fm, store, deadIDs, fetch, caps, log, progress)
+	log.InfoContext(ctx, "PAR2 planning performance", "elapsed", time.Since(planningStarted), "error", err)
 	if err != nil {
 		return err
 	}
-	return RunJob(ctx, res.Plan, res.Index, res.Par2Files, fetch, s.store, s.log,
+	return RunJob(ctx, res.Plan, res.Index, res.Par2Files, fetch, s.store, log,
 		WithProgress(progress), WithLiveConcurrency(func() int { return s.cfg().MaxConnections }),
 		WithYieldToStreams(s.streamsActive))
 }
@@ -650,11 +655,14 @@ func (s *Service) executeNzbJob(ctx context.Context, job *database.Par2RepairJob
 	}
 	defer s.clearProgress(job.ID)
 	progress := s.jobProgress(job.ID)
+	log := s.log.With("job", job.ID, "nzb", job.NzbPath.String)
+	planningStarted := time.Now()
 	res, err := s.resolveNzb(ctx, job.NzbPath.String, deadIDs, progress)
+	log.InfoContext(ctx, "PAR2 planning performance", "elapsed", time.Since(planningStarted), "error", err)
 	if err != nil {
 		return err
 	}
-	return RunJob(ctx, res.Plan, res.Index, res.Par2Files, s.fetcher, s.store, s.log,
+	return RunJob(ctx, res.Plan, res.Index, res.Par2Files, s.fetcher, s.store, log,
 		WithProgress(progress), WithLiveConcurrency(func() int { return s.cfg().MaxConnections }),
 		WithYieldToStreams(s.streamsActive))
 }

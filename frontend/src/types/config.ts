@@ -34,6 +34,7 @@ export interface ConfigResponse {
 
 // Background PAR2 repair of missing usenet articles
 export interface Par2RepairConfig {
+	recovery_margin?: number; // baseline spare rows; omitted = 8, zero trades retry insurance for speed
 	enabled?: boolean;
 	max_repair_ratio?: number; // fraction of a file's bytes repairable; PAR2 redundancy is the hard ceiling
 	max_memory_mb?: number; // in-heap solver budget per job; larger repairs spill to disk

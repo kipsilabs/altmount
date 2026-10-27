@@ -58,9 +58,13 @@ type Solver struct {
 	// Set before folding begins; not synchronized against concurrent folds.
 	WorkerLimit func() int
 
-	ctx  *gf16.Context   // primary context: Prepare/Finish and single-threaded folds
-	wctx []*gf16.Context // per-worker contexts for the parallel fold (lazy)
-	prep []byte          // scratch prepared-input buffer, reused across folds
+	ctx          *gf16.Context   // primary context: Prepare/Finish and single-threaded folds
+	wctx         []*gf16.Context // per-worker contexts for the parallel fold (lazy)
+	prep         []byte          // first prepared-input buffer
+	prepared     [][]byte
+	coefficients [][]uint16
+	tasks        chan foldTask
+	workerWG     sync.WaitGroup
 }
 
 // bufAlloc returns a zeroed buffer of n bytes. The heap allocator is the
@@ -116,9 +120,13 @@ func NewSolverAlloc(missingIdx []int, recoveryExp []uint32, sliceSize int, alloc
 }
 
 // Close releases the backend contexts. The solver must not be used after.
-// Contexts also carry finalizers, so a leaked solver is reclaimed eventually;
-// Close makes it deterministic.
+// Callers must close the solver: persistent workers retain their contexts.
 func (s *Solver) Close() {
+	if s.tasks != nil {
+		close(s.tasks)
+		s.workerWG.Wait()
+		s.tasks = nil
+	}
 	if s.ctx != nil {
 		s.ctx.Close()
 		s.ctx = nil
@@ -212,44 +220,64 @@ func (s *Solver) AddMissing(globalIdx int) error {
 // every accumulator. Slices may arrive in any order. All accumulators must be
 // seeded first.
 func (s *Solver) FoldPresent(globalIdx int, slice []byte) {
-	if len(slice) == 0 {
+	s.FoldPresentBatch([]int{globalIdx}, [][]byte{slice})
+}
+
+// FoldPresentBatch synchronously folds present slices into every recovery row.
+// Indices and inputs must have equal lengths; inputs may be reused on return.
+// The caller bounds batch memory. Empty inputs contribute zero.
+func (s *Solver) FoldPresentBatch(indices []int, inputs [][]byte) {
+	if len(indices) != len(inputs) {
+		panic("par2repair: batch indices and inputs differ")
+	}
+	if len(inputs) == 0 {
 		return
 	}
-	g := VandermondeBase(globalIdx)
-	// One transform per input, shared by every accumulator and worker
-	// (Prepare/reads of s.prep are safe concurrently; only Mul* mutate
-	// context scratch).
-	s.ctx.Prepare(s.prep, slice)
-
+	if len(s.prepared) == 0 {
+		s.prepared = append(s.prepared, s.prep)
+	}
+	for len(s.prepared) < len(inputs) {
+		s.prepared = append(s.prepared, s.ctx.NewBuffer())
+	}
+	srcs := s.prepared[:len(inputs)]
+	bases := make([]gf2p16.T, len(inputs))
+	for i, input := range inputs {
+		// Prepare pads partial slices; an empty slice has an all-zero layout.
+		if len(input) == 0 {
+			clear(srcs[i])
+		} else {
+			s.ctx.Prepare(srcs[i], input)
+		}
+		bases[i] = VandermondeBase(indices[i])
+	}
+	if len(s.coefficients) != len(s.exps) {
+		s.coefficients = make([][]uint16, len(s.exps))
+	}
+	for r, exp := range s.exps {
+		if cap(s.coefficients[r]) < len(inputs) {
+			s.coefficients[r] = make([]uint16, len(inputs))
+		}
+		s.coefficients[r] = s.coefficients[r][:len(inputs)]
+		for i, g := range bases {
+			s.coefficients[r][i] = uint16(g.Pow(exp))
+		}
+	}
 	bufSize := s.ctx.BufSize()
-	workers := s.foldWorkers()
-	if workers > 1 && len(slice) >= minParallelFold && s.workerContexts() {
-		// The accumulators are independent, so the fold parallelises cleanly.
-		// Splitting by stride-aligned byte range rather than by row keeps
-		// every worker on one span of the source across all rows — that span
-		// stays in cache for the whole pass — and keeps all cores busy even
-		// when there are fewer recovery rows than cores. Each worker uses its
-		// own context: Mul* calls share per-context scratch.
+	// Keep useful work per worker; too many tiny ranges lose to dispatch cost.
+	workers := min(s.foldWorkers(), max(1, s.sliceSize/minParallelFold))
+	if workers > 1 && s.workerContexts(workers) {
 		stride := s.ctx.Stride()
 		chunk := (bufSize + workers - 1) / workers
 		chunk = (chunk + stride - 1) / stride * stride
-
 		var wg sync.WaitGroup
-		w := 0
 		for from := 0; from < bufSize; from += chunk {
-			to := min(from+chunk, bufSize)
 			wg.Add(1)
-			go func(ctx *gf16.Context, from, to int) {
-				defer wg.Done()
-				s.foldRange(ctx, g, from, to-from)
-			}(s.wctx[w], from, to)
-			w++
+			s.tasks <- foldTask{srcs: srcs, coeffs: s.coefficients, offset: from, length: min(chunk, bufSize-from), done: &wg}
 		}
 		wg.Wait()
 		return
 	}
-
-	s.foldRange(s.ctx, g, 0, bufSize)
+	s.foldRange(s.ctx, srcs, s.coefficients, 0, bufSize)
 }
 
 // foldWorkers is the fold width for the next FoldPresent call: the full
@@ -263,31 +291,43 @@ func (s *Solver) foldWorkers() int {
 	return s.workers
 }
 
-// workerContexts lazily creates one gf16 context per worker, reporting
-// whether the parallel path is available. On failure the fold degrades to
-// the single-threaded path.
-func (s *Solver) workerContexts() bool {
-	if len(s.wctx) == s.workers {
-		return true
+// foldTask describes one independent byte range of a synchronous batch.
+type foldTask struct {
+	srcs           [][]byte
+	coeffs         [][]uint16
+	offset, length int
+	done           *sync.WaitGroup
+}
+
+// workerContexts grows the persistent pool lazily, falling back to the primary
+// context if another backend context cannot be created.
+func (s *Solver) workerContexts(workers int) bool {
+	if s.tasks == nil {
+		s.tasks = make(chan foldTask)
 	}
-	for len(s.wctx) < s.workers {
+	for len(s.wctx) < workers {
 		c, err := gf16.NewContext(s.sliceSize)
 		if err != nil {
 			return false
 		}
 		s.wctx = append(s.wctx, c)
+		tasks := s.tasks
+		s.workerWG.Add(1)
+		go func() {
+			defer s.workerWG.Done()
+			for task := range tasks {
+				s.foldRange(c, task.srcs, task.coeffs, task.offset, task.length)
+				task.done.Done()
+			}
+		}()
 	}
 	return true
 }
 
-// foldRange folds one prepared-layout span of the current input into every
-// accumulator.
-func (s *Solver) foldRange(ctx *gf16.Context, g gf2p16.T, offset, length int) {
-	srcs := [][]byte{s.prep}
-	coeffs := []uint16{0}
+// foldRange applies a batch with one backend call per recovery row and range.
+func (s *Solver) foldRange(ctx *gf16.Context, srcs [][]byte, coeffs [][]uint16, offset, length int) {
 	for r := range s.acc {
-		coeffs[0] = uint16(g.Pow(s.exps[r]))
-		ctx.MulAddMulti(s.acc[r], srcs, offset, length, coeffs)
+		ctx.MulAddMulti(s.acc[r], srcs, offset, length, coeffs[r])
 	}
 }
 

@@ -268,6 +268,7 @@ func TestSolverLargeSliceRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer s.Close()
 	for i, r := range rec {
 		if err := s.AddRecovery(i, r); err != nil {
 			t.Fatal(err)
@@ -368,6 +369,7 @@ func BenchmarkFoldPresent(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
+	defer s.Close()
 	for i := range exps {
 		if err := s.AddRecovery(i, slice); err != nil {
 			b.Fatal(err)
@@ -377,5 +379,77 @@ func BenchmarkFoldPresent(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; b.Loop(); i++ {
 		s.FoldPresent(8+i, slice)
+	}
+}
+
+func TestSolverBatchRoundTrip(t *testing.T) {
+	for _, size := range []int{512, 256 << 10} {
+		t.Run(strconv.Itoa(size), func(t *testing.T) {
+			const n = 9
+			data := make([][]byte, n)
+			rng := rand.New(rand.NewSource(90))
+			for i := range data {
+				data[i] = make([]byte, size)
+				rng.Read(data[i])
+			}
+			exps := []uint32{1, 3, 7}
+			rec := buildRecovery(data, exps, size)
+			s, err := NewSolver([]int{2}, exps, size)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer s.Close()
+			for i := range rec {
+				if err := s.AddRecovery(i, rec[i]); err != nil {
+					t.Fatal(err)
+				}
+			}
+			limit := 1
+			s.WorkerLimit = func() int { return limit }
+			s.FoldPresentBatch([]int{0, 1, 3}, [][]byte{data[0], data[1], data[3]})
+			if err := s.AddMissing(5); err != nil {
+				t.Fatal(err)
+			}
+			limit = 2
+			s.FoldPresentBatch([]int{4, 6, 7}, [][]byte{data[4], data[6], data[7]})
+			s.FoldPresentBatch([]int{8, 9}, [][]byte{data[8], nil})
+			s.FoldPresentBatch(nil, nil)
+			got, err := s.Solve()
+			if err != nil {
+				t.Fatal(err)
+			}
+			for i, m := range []int{2, 5} {
+				if !bytes.Equal(got[i], data[m]) {
+					t.Fatalf("missing slice %d differs", m)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkFoldPresentBatch(b *testing.B) {
+	const size = 4 << 20
+	data := make([][]byte, 4)
+	rng := rand.New(rand.NewSource(23))
+	for i := range data {
+		data[i] = make([]byte, size)
+		rng.Read(data[i])
+	}
+	exps := []uint32{0, 1, 2, 3, 4, 5, 6, 7}
+	s, err := NewSolver([]int{0, 1, 2, 3, 4, 5, 6, 7}, exps, size)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer s.Close()
+	for i := range exps {
+		if err := s.AddRecovery(i, data[0]); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.SetBytes(4 * size)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		s.FoldPresentBatch([]int{8, 9, 10, 11}, data)
 	}
 }

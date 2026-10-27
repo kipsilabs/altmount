@@ -234,6 +234,27 @@ export function Par2RepairConfigSection({
 				</fieldset>
 
 				<fieldset className="fieldset">
+					<legend className="fieldset-legend">Recovery Margin</legend>
+					<input
+						aria-label="Recovery Margin"
+						type="number"
+						className="input input-bordered w-full max-w-48 bg-base-100 font-mono text-sm"
+						min={0}
+						step={1}
+						value={data.recovery_margin ?? 8}
+						disabled={isReadOnly}
+						onChange={(e) =>
+							handleChange("recovery_margin", Math.max(0, Math.trunc(Number(e.target.value))))
+						}
+					/>
+					<p className="label whitespace-normal">
+						Extra recovery slices for unexpected damage. Default: 8. Lower values reduce repair work
+						but increase the chance of downloading the release again. Estimated hidden damage and
+						verification-only repairs keep additional protection. Applies to the next repair.
+					</p>
+				</fieldset>
+
+				<fieldset className="fieldset">
 					<legend className="fieldset-legend">Min Release Size (MB)</legend>
 					<input
 						type="number"
