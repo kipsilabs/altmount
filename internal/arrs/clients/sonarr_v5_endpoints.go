@@ -31,7 +31,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"path"
 
@@ -215,8 +217,9 @@ func (s *nativeSonarr) AddDownloadClientContext(ctx context.Context,
 		body   bytes.Buffer
 	)
 
-	client.ID = 0
-	if err := json.NewEncoder(&body).Encode(client); err != nil {
+	payload := nativeDownloadClientInput(client)
+	payload.ID = 0
+	if err := json.NewEncoder(&body).Encode(payload); err != nil {
 		return nil, fmt.Errorf("json.Marshal(%s): %w", "/v5/downloadclient", err)
 	}
 
@@ -229,15 +232,15 @@ func (s *nativeSonarr) AddDownloadClientContext(ctx context.Context,
 }
 
 func (s *nativeSonarr) TestDownloadClientContext(ctx context.Context, client *sonarr.DownloadClientInput) error {
-	var output interface{} // any ok
-
+	var output any
 	var body bytes.Buffer
-	if err := json.NewEncoder(&body).Encode(client); err != nil {
+	if err := json.NewEncoder(&body).Encode(nativeDownloadClientInput(client)); err != nil {
 		return fmt.Errorf("json.Marshal(%s): %w", "/v5/downloadclient", err)
 	}
 
 	req := starr.Request{URI: path.Join("/v5/downloadclient", "test"), Body: &body}
-	if err := s.PostInto(ctx, req, &output); err != nil {
+	// V5 returns 204 No Content on success; there is no JSON to decode.
+	if err := s.PostInto(ctx, req, &output); err != nil && !errors.Is(err, io.EOF) {
 		return fmt.Errorf("api.Post(%s): %w", &req, err)
 	}
 
@@ -251,7 +254,7 @@ func (s *nativeSonarr) UpdateDownloadClientContext(ctx context.Context,
 	var output sonarr.DownloadClientOutput
 
 	var body bytes.Buffer
-	if err := json.NewEncoder(&body).Encode(client); err != nil {
+	if err := json.NewEncoder(&body).Encode(nativeDownloadClientInput(client)); err != nil {
 		return nil, fmt.Errorf("json.Marshal(%s): %w", "/v5/downloadclient", err)
 	}
 
@@ -265,6 +268,16 @@ func (s *nativeSonarr) UpdateDownloadClientContext(ctx context.Context,
 	}
 
 	return &output, nil
+}
+
+// V5 provider resources declare Tags as a non-nullable collection. The legacy
+// starr input serializes nil slices as null, which MVC rejects with HTTP 400.
+func nativeDownloadClientInput(client *sonarr.DownloadClientInput) sonarr.DownloadClientInput {
+	payload := *client
+	if payload.Tags == nil {
+		payload.Tags = []int{}
+	}
+	return payload
 }
 
 func (s *nativeSonarr) GetSystemStatusContext(ctx context.Context) (*sonarr.SystemStatus, error) {
