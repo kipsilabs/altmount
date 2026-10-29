@@ -77,10 +77,10 @@ type Server struct {
 	duplicateLookup     duplicateLookupService
 	duplicateLookupOnce sync.Once
 
-	// stremioPlayGroup coalesces concurrent Stremio plays of the same title (download once).
+	// stremioPlayGroup coalesces concurrent Stremio plays of the same release (download once).
 	stremioPlayGroup singleflight.Group
-	// stremioContentGroup closes the check-then-enqueue race across different
-	// releases for the same movie or episode.
+	// stremioContentGroup closes the check-then-enqueue race for the same release
+	// of the same movie or episode.
 	stremioContentGroup singleflight.Group
 	stremioReleaseMu    sync.Mutex
 	stremioReleaseRefs  map[string]stremioReleaseRef
