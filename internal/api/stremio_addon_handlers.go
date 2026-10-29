@@ -1165,8 +1165,8 @@ func (s *Server) handleStremioAddonPlay(c *fiber.Ctx) error {
 	if !ok {
 		// Stremio saves the stream a title was played with and replays that
 		// link on resume, long after its release token expired. Recover from
-		// the content id (and the release name, when the link carries one)
-		// instead of failing: play an already-imported copy, or search again.
+		// the content id, and from the NZB URL when the link still carries one,
+		// instead of failing.
 		if imdbID == "" {
 			return RespondBadRequest(c, "Invalid or expired release parameter", "")
 		}
@@ -1174,16 +1174,27 @@ func (s *Server) handleStremioAddonPlay(c *fiber.Ctx) error {
 		if title := c.Query("title"); title != "" {
 			cand.SafeTitle = sanitizeFilename(title)
 		}
+		// A recovered link that still carries the indexer URL keeps release
+		// identity. Filling it in here keys the release key, queue filename,
+		// singleflight key and cached-row match off the URL exactly as an
+		// explicit request does, so the recovery can never resolve to a
+		// different release that merely shares the title.
+		if downloadURL := strings.TrimSpace(c.Query("url")); downloadURL != "" {
+			cand.DownloadURL = downloadURL
+			cand.Indexer = c.Query("indexer")
+			cand.Source = c.Query("source")
+		}
 		slog.InfoContext(ctx, "Recovering Stremio play link with an expired release token",
-			"imdb_id", imdbID, "title", cand.SafeTitle)
+			"imdb_id", imdbID, "title", cand.SafeTitle, "has_release_url", cand.DownloadURL != "")
 	}
 
 	baseURL := resolveBaseURL(c, cfg.Stremio.BaseURL)
 	selector := stremioEpisodeSelectorFromRequest(c)
 
-	// A live release token names one exact release. An expired token recovery
-	// only knows the content (and possibly the release name), so it has no
-	// release identity to match cached rows against.
+	// A live release token names one exact release, and so does a recovered
+	// link that still carries its NZB URL. A link recovered from the release
+	// name alone names only the content, so it has no release identity to
+	// match a cached file against.
 	explicitRelease := cand.DownloadURL != ""
 	releaseKey := stremioReleaseKey(cand)
 
@@ -1209,7 +1220,12 @@ func (s *Server) handleStremioAddonPlay(c *fiber.Ctx) error {
 			}
 		}
 	}
-	if normTarget != "" {
+	// Only a request with release identity may reuse cached bytes: the queued
+	// file of the exact release it names, matched by the release key stored on
+	// the row. A sanitized title is not identity (mirrored releases share it
+	// while serving different files), so a link recovered from its title alone
+	// searches again instead of redirecting to a title-matched file.
+	if normTarget != "" && explicitRelease {
 		if cachedItems, err := s.queueRepo.GetCachedStremioQueueItems(ctx, cfg.Stremio.EffectiveIncludeLibraryStreams(), cfg.Stremio.NzbTTLHours); err == nil {
 			for _, prev := range cachedItems {
 				if prev == nil || prev.StoragePath == nil || *prev.StoragePath == "" {
@@ -1218,27 +1234,11 @@ func (s *Server) handleStremioAddonPlay(c *fiber.Ctx) error {
 				if ttlHours > 0 && prev.CompletedAt != nil && time.Since(*prev.CompletedAt) >= time.Duration(ttlHours)*time.Hour {
 					continue
 				}
-				// An explicit request may only reuse the queued bytes of that
-				// exact release. A matching sanitized title is not identity:
-				// mirrored releases share it while serving different files.
-				if explicitRelease {
-					storedKey, keyed := stremioQueueItemReleaseKey(prev)
-					if !keyed || storedKey != releaseKey {
-						continue
-					}
-				} else {
-					normNzb := normalizeTitleForMatching(prev.NzbPath)
-					normStorage := ""
-					if prev.StoragePath != nil {
-						normStorage = normalizeTitleForMatching(*prev.StoragePath)
-					}
-					normRel := ""
-					if prev.RelativePath != nil {
-						normRel = normalizeTitleForMatching(*prev.RelativePath)
-					}
-					if normNzb != normTarget && (normStorage == "" || normStorage != normTarget) && (normRel == "" || normRel != normTarget) {
-						continue
-					}
+				// Rows written before release keys existed cannot prove which
+				// release they hold, so they are skipped as well.
+				storedKey, keyed := stremioQueueItemReleaseKey(prev)
+				if !keyed || storedKey != releaseKey {
+					continue
 				}
 
 				if streams, err := s.buildStremioStreams(ctx, prev, baseURL, key, cand.SafeTitle, selector); err == nil && len(streams) > 0 {
@@ -1251,7 +1251,9 @@ func (s *Server) handleStremioAddonPlay(c *fiber.Ctx) error {
 	}
 
 	if cand.DownloadURL == "" {
-		// A recovered link has no release to download: find it again.
+		// A recovered link has no release to download: find it again. This is
+		// preferred over serving a title-matched cached file, whose release
+		// cannot be verified.
 		found, _ := s.findStremioCandidate(ctx, cfg, streamType, imdbID, selector, cand.SafeTitle)
 		if found == nil {
 			return RespondServiceUnavailable(c, "No playable release found", "the play link expired and a new search found nothing")
