@@ -350,7 +350,7 @@ func (p *Parser) ParseNzb(ctx context.Context, n *nzbparser.Nzb, nzbPath string,
 		}
 	}
 
-	p.trimDeadArticlesPastEnd(ctx, firstSegmentCache, firstSegmentSizeCache)
+	p.trimDeadArticlesPastEnd(ctx, firstSegmentCache, firstSegmentSizeCache, warmReleaseDate(n.Files))
 
 	// Extract file information using priority-based filename selection
 	// Convert firstSegmentCache to fileinfo format

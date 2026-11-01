@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"time"
 
 	"github.com/javi11/nntppool/v5"
 	"github.com/javi11/nzbparser"
@@ -12,14 +13,28 @@ import (
 	"github.com/kipsilabs/altmount/internal/pool"
 )
 
-// deadArticlesPastEnd reports how many leading articles of file to keep when
-// it lists articles past the end of the file and every one of those is
-// confirmed gone. They carry none of the file's bytes, so they are not damage.
-//
-// The yEnc size alone is not trusted: it can be wrong, and trimming on a wrong
-// size would cut real data. An article that is alive, or whose state is
-// unknown, leaves the file untouched.
-func deadArticlesPastEnd(ctx context.Context, cp pool.NntpClient, file *nzbparser.NzbFile, partSize, fileSize int64) (keep int, ok bool) {
+// pastEndStatTimeout is the per-article budget for checking extras, scaled to
+// the whole batch by pool.StatManyTimeout.
+const pastEndStatTimeout = 10 * time.Second
+
+const (
+	pastEndStatAttempts       = 5
+	pastEndStatsPerConnection = 2
+)
+
+// pastEndRetryBackoff is multiplied by the attempt number between retries.
+var pastEndRetryBackoff = time.Second
+
+// pastEndCandidate is a file listing more articles than its size needs.
+type pastEndCandidate struct {
+	index int // position in the caller's list
+	file  *nzbparser.NzbFile
+	keep  int
+}
+
+// articlesNeeded reports how many articles a file of fileSize needs when it
+// lists more than that. ok is false when the sizes are unknown or nothing is extra.
+func articlesNeeded(file *nzbparser.NzbFile, partSize, fileSize int64) (keep int, ok bool) {
 	if partSize <= 0 || fileSize <= 0 {
 		return 0, false
 	}
@@ -27,14 +42,77 @@ func deadArticlesPastEnd(ctx context.Context, cp pool.NntpClient, file *nzbparse
 	if needed < 1 || needed >= int64(len(file.Segments)) {
 		return 0, false
 	}
-	at := articleDateOf(file)
-	for _, seg := range file.Segments[needed:] {
-		_, err := cp.Exists(ctx, nntppool.Req{MessageID: seg.ID, ArticleDate: at})
-		if !errors.Is(err, nntppool.ErrArticleNotFound) {
-			return 0, false
+	return int(needed), true
+}
+
+// confirmDeadPastEnd returns the candidates whose extra articles are all
+// confirmed gone. They carry none of the file's bytes, so they are not damage.
+//
+// The yEnc size alone is not trusted: it can be wrong, and trimming on a wrong
+// size would cut real data. An article that is alive, or whose state is
+// unknown, leaves its file untouched.
+//
+// A release can list hundreds of extras and a 430 is slow to answer, so every
+// file's extras go out as one batch rather than one at a time.
+func (p *Parser) confirmDeadPastEnd(ctx context.Context, cp pool.NntpClient, candidates []pastEndCandidate, articleDate time.Time) []pastEndCandidate {
+	var ids []string
+	for _, c := range candidates {
+		for _, seg := range c.file.Segments[c.keep:] {
+			ids = append(ids, seg.ID)
 		}
 	}
-	return int(needed), true
+	if len(ids) == 0 {
+		return nil
+	}
+	// A 430 holds its connection's pipeline slot for a while, so a batch sized for
+	// a wider pool swamps a small one and most checks expire unanswered.
+	cfg := p.getConfig()
+	concurrency := min(p.poolManager.StatSweepConcurrency(cfg.StatConcurrency()), max(cfg.TotalProviderConnections()*pastEndStatsPerConnection, 1))
+	dead := make(map[string]bool, len(ids))
+	alive := make(map[string]bool)
+	remaining := ids
+	for attempt := 1; attempt <= pastEndStatAttempts && len(remaining) > 0; attempt++ {
+		statCtx, cancel := context.WithTimeout(ctx, pool.StatManyTimeout(len(remaining), concurrency, pastEndStatTimeout))
+		for result := range cp.ExistsMany(statCtx, remaining, nntppool.ManyOptions{Concurrency: concurrency, ArticleDate: articleDate}) {
+			switch {
+			case errors.Is(result.Err, nntppool.ErrArticleNotFound):
+				dead[result.MessageID] = true
+			case result.Err == nil:
+				alive[result.MessageID] = true
+			}
+		}
+		cancel()
+
+		// A big batch of slow 430s makes some STATs expire unanswered. That
+		// says nothing about the article, so ask again, less hard.
+		unanswered := remaining[:0:0]
+		for _, id := range remaining {
+			if !dead[id] && !alive[id] {
+				unanswered = append(unanswered, id)
+			}
+		}
+		remaining = unanswered
+		concurrency = max(concurrency/2, 1)
+		if len(remaining) > 0 && attempt < pastEndStatAttempts {
+			select {
+			case <-ctx.Done():
+				remaining = nil
+			case <-time.After(time.Duration(attempt) * pastEndRetryBackoff):
+			}
+		}
+	}
+
+	confirmed := make([]pastEndCandidate, 0, len(candidates))
+	for _, c := range candidates {
+		allDead := true
+		for _, seg := range c.file.Segments[c.keep:] {
+			allDead = allDead && dead[seg.ID]
+		}
+		if allDead {
+			confirmed = append(confirmed, c)
+		}
+	}
+	return confirmed
 }
 
 // FindDeadArticlesPastEnd returns, by file index, how many articles to keep for
@@ -51,7 +129,7 @@ func (p *Parser) FindDeadArticlesPastEnd(ctx context.Context, files []nzbparser.
 		return nil
 	}
 	var mu sync.Mutex
-	found := make(map[int]int)
+	var candidates []pastEndCandidate
 	maxFetch := max(min(min(len(files), p.getConfig().TotalProviderConnections()), maxFetchGoroutines), 1)
 	work := concpool.New().WithMaxGoroutines(maxFetch).WithContext(ctx)
 	for i := range files {
@@ -64,15 +142,20 @@ func (p *Parser) FindDeadArticlesPastEnd(ctx context.Context, files []nzbparser.
 			if err != nil {
 				return nil
 			}
-			if keep, ok := deadArticlesPastEnd(ctx, cp, file, int64(head.PartSize), int64(head.FileSize)); ok {
+			if keep, ok := articlesNeeded(file, int64(head.PartSize), int64(head.FileSize)); ok {
 				mu.Lock()
-				found[i] = keep
+				candidates = append(candidates, pastEndCandidate{index: i, file: file, keep: keep})
 				mu.Unlock()
 			}
 			return nil
 		})
 	}
 	_ = work.Wait()
+
+	found := make(map[int]int)
+	for _, c := range p.confirmDeadPastEnd(ctx, cp, candidates, warmReleaseDate(files)) {
+		found[c.index] = c.keep
+	}
 	return found
 }
 
@@ -97,7 +180,7 @@ func (p *Parser) trimArticles(ctx context.Context, file *nzbparser.NzbFile, keep
 // availability check did not happen to hit, before normalization tries to read
 // a last article that does not exist. Sizes come from what the parse already
 // holds, so this costs nothing unless a file lists too many articles.
-func (p *Parser) trimDeadArticlesPastEnd(ctx context.Context, cache []*FirstSegmentData, sizes map[string]firstSegmentYencInfo) {
+func (p *Parser) trimDeadArticlesPastEnd(ctx context.Context, cache []*FirstSegmentData, sizes map[string]firstSegmentYencInfo, articleDate time.Time) {
 	if p.poolManager == nil || !p.poolManager.HasPool() {
 		return
 	}
@@ -105,6 +188,7 @@ func (p *Parser) trimDeadArticlesPastEnd(ctx context.Context, cache []*FirstSegm
 	if err != nil {
 		return
 	}
+	var candidates []pastEndCandidate
 	for _, data := range cache {
 		if data == nil || data.File == nil || len(data.File.Segments) < 2 {
 			continue
@@ -113,8 +197,11 @@ func (p *Parser) trimDeadArticlesPastEnd(ctx context.Context, cache []*FirstSegm
 		if !ok {
 			continue
 		}
-		if keep, ok := deadArticlesPastEnd(ctx, cp, data.File, int64(info.PartSize), int64(info.FileSize)); ok {
-			p.trimArticles(ctx, data.File, keep)
+		if keep, ok := articlesNeeded(data.File, int64(info.PartSize), int64(info.FileSize)); ok {
+			candidates = append(candidates, pastEndCandidate{file: data.File, keep: keep})
 		}
+	}
+	for _, c := range p.confirmDeadPastEnd(ctx, cp, candidates, articleDate) {
+		p.trimArticles(ctx, c.file, c.keep)
 	}
 }
