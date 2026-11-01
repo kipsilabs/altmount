@@ -307,7 +307,7 @@ func TestGetFileInfo_Par2NameSurvivesGap5(t *testing.T) {
 		First16KB: content,
 	}
 
-	info := getFileInfo(file, par2DescFor(content, "yay.rar"), "Example.Show.S01E01.1080p.WEB-DL-GRP")
+	info := getFileInfo(file, newDescriptorPicker(par2DescFor(content, "yay.rar")), "Example.Show.S01E01.1080p.WEB-DL-GRP")
 	if info.Filename != "yay.rar" {
 		t.Errorf("Filename = %q, want %q (PAR2 name was clobbered by Gap 5)", info.Filename, "yay.rar")
 	}
@@ -338,5 +338,80 @@ func TestGetFileInfo_Gap5DoesNotDoubleExtension(t *testing.T) {
 	info := getFileInfo(file, nil, "The.Movie.2024.mkv")
 	if info.Filename != "The.Movie.2024.mkv" {
 		t.Errorf("Filename = %q, want %q", info.Filename, "The.Movie.2024.mkv")
+	}
+}
+
+// sameHeadDescriptors is a PAR2 set of three volumes that share their first
+// 16KB, plus one that doesn't.
+func sameHeadDescriptors(head []byte) map[[16]byte]*par2.FileDescriptor {
+	padded := make([]byte, 16384)
+	copy(padded, head)
+	hash := md5.Sum(padded)
+	descs := map[[16]byte]*par2.FileDescriptor{}
+	descs[hash] = &par2.FileDescriptor{
+		Hash16k: hash, Length: 100, Name: "set.part02.rar",
+		SameHead: []*par2.FileDescriptor{
+			{Hash16k: hash, Length: 100, Name: "set.part03.rar"},
+			{Hash16k: hash, Length: 100, Name: "set.part04.rar"},
+		},
+	}
+	return descs
+}
+
+// Volumes sharing their first 16KB must each get their own PAR2 name, or the set
+// looks fully obfuscated and the real first volume is lost.
+func TestGetFileInfosGivesRarVolumesWithTheSameHeadTheirOwnNames(t *testing.T) {
+	head := append([]byte("Rar!\x1a\x07\x00"), make([]byte, 64)...)
+	var files []*NzbFileWithFirstSegment
+	for i := range 3 {
+		files = append(files, &NzbFileWithFirstSegment{
+			NzbFile:   &nzbparser.NzbFile{Filename: "3fefe1fb9d2632bed19c026e37af5f9" + string(rune('0'+i))},
+			First16KB: head,
+		})
+	}
+
+	infos := GetFileInfos(files, sameHeadDescriptors(head), "Release")
+
+	seen := map[string]bool{}
+	for _, info := range infos {
+		seen[info.Filename] = true
+	}
+	for _, want := range []string{"set.part02.rar", "set.part03.rar", "set.part04.rar"} {
+		if !seen[want] {
+			t.Errorf("no volume named %q, got %v", want, seen)
+		}
+	}
+}
+
+// More files than names must not panic or invent a name.
+func TestGetFileInfosReusesFirstNameWhenSameHeadNamesRunOut(t *testing.T) {
+	head := append([]byte("Rar!\x1a\x07\x00"), make([]byte, 64)...)
+	var files []*NzbFileWithFirstSegment
+	for range 4 {
+		files = append(files, &NzbFileWithFirstSegment{NzbFile: &nzbparser.NzbFile{Filename: "x"}, First16KB: head})
+	}
+
+	infos := GetFileInfos(files, sameHeadDescriptors(head), "Release")
+
+	if infos[3].Filename != "set.part02.rar" {
+		t.Errorf("fourth file = %q, want the first name", infos[3].Filename)
+	}
+}
+
+// Files that aren't RAR volumes have no data checksum in their header, so sharing
+// a first 16KB says nothing about the rest. They must not be handed out in turn.
+func TestGetFileInfosKeepsFirstMatchForNonRarFiles(t *testing.T) {
+	head := make([]byte, 64)
+	var files []*NzbFileWithFirstSegment
+	for range 2 {
+		files = append(files, &NzbFileWithFirstSegment{NzbFile: &nzbparser.NzbFile{Filename: "x"}, First16KB: head})
+	}
+
+	infos := GetFileInfos(files, sameHeadDescriptors(head), "Release")
+
+	for _, info := range infos {
+		if info.Filename != "set.part02.rar" {
+			t.Errorf("Filename = %q, want the first match", info.Filename)
+		}
 	}
 }

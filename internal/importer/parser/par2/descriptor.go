@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"slices"
 	"time"
 
 	"github.com/kipsilabs/altmount/internal/pool"
@@ -80,15 +81,31 @@ func GetFileDescriptors(
 				"error", err, "segments", len(cachedData.File.Segments))
 			continue
 		}
-		for i := range fileDescriptors {
-			desc := &fileDescriptors[i]
-			if _, exists := descriptors[desc.Hash16k]; !exists {
-				descriptors[desc.Hash16k] = desc // first occurrence wins (identical across set files)
-			}
-		}
+		mergeFileDescriptors(descriptors, fileDescriptors)
 	}
 
 	return descriptors, nil
+}
+
+// mergeFileDescriptors adds descs to descriptors by Hash16k. The same file seen
+// again in another PAR2 file is ignored; a different file with the same first
+// 16KB and length is kept on SameHead.
+func mergeFileDescriptors(descriptors map[[16]byte]*FileDescriptor, descs []FileDescriptor) {
+	for i := range descs {
+		desc := &descs[i]
+		first, exists := descriptors[desc.Hash16k]
+		if !exists {
+			descriptors[desc.Hash16k] = desc
+			continue
+		}
+		if first.FileID == desc.FileID || first.Length != desc.Length {
+			continue
+		}
+		known := slices.ContainsFunc(first.SameHead, func(d *FileDescriptor) bool { return d.FileID == desc.FileID })
+		if !known {
+			first.SameHead = append(first.SameHead, desc)
+		}
+	}
 }
 
 // readFileDescriptors streams through a PAR2 file and extracts all file descriptors

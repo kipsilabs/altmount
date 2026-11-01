@@ -30,36 +30,71 @@ func GetFileInfos(
 	// Strip .nzb extension for use as last-resort filename stem
 	nzbStem := nzbtrim.TrimNzbExtension(nzbFilename)
 
+	picker := newDescriptorPicker(par2Descriptors)
 	fileInfos := make([]*FileInfo, 0, len(files))
 	for _, file := range files {
-		info := getFileInfo(file, par2Descriptors, nzbStem)
+		info := getFileInfo(file, picker, nzbStem)
 		fileInfos = append(fileInfos, info)
 	}
 
 	return fileInfos
 }
 
+// descriptorPicker matches files to their PAR2 descriptors across one NZB.
+type descriptorPicker struct {
+	byHash map[[16]byte]*par2.FileDescriptor
+	used   map[[16]byte]int
+}
+
+func newDescriptorPicker(byHash map[[16]byte]*par2.FileDescriptor) *descriptorPicker {
+	return &descriptorPicker{byHash: byHash, used: make(map[[16]byte]int)}
+}
+
+// pick returns file's descriptor, or nil when PAR2 doesn't list it.
+//
+// RAR volumes of a long run of identical data (padding, for example) can share
+// their first 16KB, so Hash16k alone cannot tell them apart. Giving them all one
+// name makes the set look fully obfuscated and loses the volume order. RAR headers
+// carry the volume data's checksum, so the same first 16KB means the same data, and
+// any one-to-one assignment assembles the same file. Other files keep the first
+// match: nothing says their contents are interchangeable.
+func (p *descriptorPicker) pick(file *NzbFileWithFirstSegment) *par2.FileDescriptor {
+	if p == nil || len(p.byHash) == 0 {
+		return nil
+	}
+	// Gap 1: PAR2 Hash16k is MD5 of the first 16384 bytes, zero-padded if file is shorter.
+	// Without zero-padding, md5.Sum(file.First16KB) produces a wrong hash for files < 16KB.
+	padded := make([]byte, 16384)
+	copy(padded, file.First16KB)
+	md5Hash := md5.Sum(padded)
+
+	desc, ok := p.byHash[md5Hash]
+	if !ok {
+		return nil
+	}
+	if !HasRarMagic(file.First16KB) {
+		return desc
+	}
+	n := p.used[md5Hash]
+	p.used[md5Hash]++
+	if n > 0 && n <= len(desc.SameHead) {
+		return desc.SameHead[n-1]
+	}
+	return desc
+}
+
 // getFileInfo extracts information for a single file
 func getFileInfo(
 	file *NzbFileWithFirstSegment,
-	hashToDescMap map[[16]byte]*par2.FileDescriptor,
+	picker *descriptorPicker,
 	nzbFilenameStem string,
 ) *FileInfo {
 	par2Filename := ""
 	par2FileSize := int64(0)
 
-	if len(hashToDescMap) > 0 {
-		// Gap 1: PAR2 Hash16k is MD5 of the first 16384 bytes, zero-padded if file is shorter.
-		// Without zero-padding, md5.Sum(file.First16KB) produces a wrong hash for files < 16KB.
-		padded := make([]byte, 16384)
-		copy(padded, file.First16KB)
-		md5Hash := md5.Sum(padded)
-
-		desc, ok := hashToDescMap[md5Hash]
-		if ok {
-			par2Filename = desc.Name
-			par2FileSize = int64(desc.Length)
-		}
+	if desc := picker.pick(file); desc != nil {
+		par2Filename = desc.Name
+		par2FileSize = int64(desc.Length)
 	}
 
 	subjectFilename := file.NzbFile.Filename

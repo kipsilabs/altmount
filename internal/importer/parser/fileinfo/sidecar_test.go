@@ -66,7 +66,7 @@ func TestGetFileInfoPar2SidecarAuthoritative(t *testing.T) {
 				NzbFile:   &nzbparser.NzbFile{Filename: "Release.Movie.2024.mkv"},
 				Headers:   &nntppool.YEncMeta{FileName: "Release.Movie.2024.mkv", FileSize: 1024},
 				First16KB: data,
-			}, map[[16]byte]*par2.FileDescriptor{md5.Sum(data): {Name: name, Length: 1024}}, "Release.Movie.2024")
+			}, newDescriptorPicker(map[[16]byte]*par2.FileDescriptor{md5.Sum(data): {Name: name, Length: 1024}}), "Release.Movie.2024")
 			if info.Filename != name {
 				t.Errorf("Filename = %q, want authoritative PAR2 name %q", info.Filename, name)
 			}
@@ -97,7 +97,7 @@ func TestGetFileInfoSubjectSidecarDoesNotOverridePar2Media(t *testing.T) {
 		NzbFile:   &nzbparser.NzbFile{Filename: mediaName + ".nfo"},
 		Headers:   &nntppool.YEncMeta{FileName: mediaName, FileSize: 1024},
 		First16KB: data,
-	}, map[[16]byte]*par2.FileDescriptor{md5.Sum(data): {Name: mediaName, Length: 1024}}, "Release.Movie.2024")
+	}, newDescriptorPicker(map[[16]byte]*par2.FileDescriptor{md5.Sum(data): {Name: mediaName, Length: 1024}}), "Release.Movie.2024")
 	if info.Filename != mediaName {
 		t.Errorf("Filename = %q, want PAR2 media name %q", info.Filename, mediaName)
 	}

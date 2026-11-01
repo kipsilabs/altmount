@@ -41,6 +41,9 @@ type FileDescriptor struct {
 	Hash16k [16]byte // MD5 hash of first 16KB of file (for matching)
 	Length  uint64   // File length in bytes
 	Name    string   // Original filename (variable length, null-terminated, 4-byte aligned)
+	// SameHead lists other set members of the same length whose first 16KB hash
+	// identically. Lookups are keyed by Hash16k, so they would otherwise be lost.
+	SameHead []*FileDescriptor
 }
 
 const (
