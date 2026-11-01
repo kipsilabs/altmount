@@ -34,8 +34,8 @@ func TestParseIndexRoundTrip(t *testing.T) {
 	if len(idx.RecoveryIDs) != 2 {
 		t.Fatalf("recovery set size = %d", len(idx.RecoveryIDs))
 	}
-	if bytes.Compare(idx.RecoveryIDs[0][:], idx.RecoveryIDs[1][:]) >= 0 {
-		t.Fatal("RecoveryIDs not sorted ascending")
+	if !bytes.Contains(set.Index, append(idx.RecoveryIDs[0][:16:16], idx.RecoveryIDs[1][:]...)) {
+		t.Fatal("RecoveryIDs not in Main packet order")
 	}
 	total := 0
 	for _, id := range idx.RecoveryIDs {

@@ -84,7 +84,7 @@ type Plan struct {
 	Missing       []int // global slice indices, ascending
 	Recovery      []par2.RecoverySliceRef
 	SpareRecovery []par2.RecoverySliceRef
-	Files         []SetFile // recovery-set order (FileID ascending)
+	Files         []SetFile // recovery-set order (Main packet order)
 	DeadArticles  []DeadArticle
 	// SpillToDisk marks a plan whose solver buffers exceed the memory budget:
 	// the job backs accumulators, recovery payloads and recovered slices with
