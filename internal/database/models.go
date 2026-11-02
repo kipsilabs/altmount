@@ -57,6 +57,10 @@ type ImportQueueItem struct {
 	SkipArrNotification bool          `db:"skip_arr_notification"`
 	SkipPostImportLinks bool          `db:"skip_post_import_links"`
 	Indexer             *string       `db:"indexer"`
+	// ContentIdentity fingerprints the release's largest payload file from its
+	// size and ordered Usenet message-IDs. It is used only for queue-admission
+	// de-duplication, so most row reads leave it unset.
+	ContentIdentity *string `db:"content_identity"`
 	// PeerHold is set while the item's files (from a peer bundle) owe their
 	// full health check. Only the active-queue list and the single-item lookups
 	// fill it; every other read leaves it false.

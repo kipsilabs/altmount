@@ -198,8 +198,8 @@ func (r *QueueRepository) RestartQueueItemsBulk(ctx context.Context, ids []int64
 // AddToQueue adds a new NZB file to the import queue
 func (r *QueueRepository) AddToQueue(ctx context.Context, item *ImportQueueItem) error {
 	query := `
-		INSERT INTO import_queue (download_id, nzb_path, relative_path, category, priority, status, retry_count, max_retries, batch_id, metadata, file_size, target_path, skip_arr_notification, skip_post_import_links, indexer, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+		INSERT INTO import_queue (download_id, nzb_path, relative_path, storage_path, category, priority, status, retry_count, max_retries, batch_id, metadata, file_size, target_path, skip_arr_notification, skip_post_import_links, indexer, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
 		ON CONFLICT(nzb_path) DO UPDATE SET
 		download_id = COALESCE(excluded.download_id, import_queue.download_id),
 		priority = CASE WHEN excluded.priority < import_queue.priority THEN excluded.priority ELSE import_queue.priority END,
@@ -212,6 +212,7 @@ func (r *QueueRepository) AddToQueue(ctx context.Context, item *ImportQueueItem)
 		skip_post_import_links = excluded.skip_post_import_links,
 		status = excluded.status,
 		indexer = COALESCE(excluded.indexer, import_queue.indexer),
+		storage_path = COALESCE(excluded.storage_path, import_queue.storage_path),
 		retry_count = 0,
 		started_at = NULL,
 		updated_at = datetime('now'),
@@ -219,7 +220,7 @@ func (r *QueueRepository) AddToQueue(ctx context.Context, item *ImportQueueItem)
 		WHERE import_queue.status NOT IN ('processing', 'pending')
 	`
 
-	args := []any{item.DownloadID, item.NzbPath, item.RelativePath, item.Category, item.Priority, item.Status,
+	args := []any{item.DownloadID, item.NzbPath, item.RelativePath, item.StoragePath, item.Category, item.Priority, item.Status,
 		item.RetryCount, item.MaxRetries, item.BatchID, item.Metadata, item.FileSize, item.TargetPath, item.SkipArrNotification, item.SkipPostImportLinks, item.Indexer}
 
 	if r.dialect.IsPostgres() {
@@ -267,6 +268,74 @@ func (r *QueueRepository) AddStoragePath(ctx context.Context, itemID int64, stor
 	}
 
 	return nil
+}
+
+// CompletedContentMatch identifies an already-completed import that holds the
+// release a new admission is asking for.
+type CompletedContentMatch struct {
+	ID          int64
+	NzbPath     string
+	StoragePath string
+}
+
+// SetContentIdentity records the admission fingerprint for a queue row.
+func (r *QueueRepository) SetContentIdentity(ctx context.Context, itemID int64, identity string) error {
+	_, err := r.db.ExecContext(ctx,
+		`UPDATE import_queue SET content_identity = ?, updated_at = datetime('now') WHERE id = ?`,
+		identity, itemID)
+	if err != nil {
+		return fmt.Errorf("failed to set content identity: %w", err)
+	}
+	return nil
+}
+
+// GetContentIdentity returns the stored admission fingerprint, or "" when the
+// row predates the column or was admitted through a path that does not compute
+// one (e.g. a directory scan).
+func (r *QueueRepository) GetContentIdentity(ctx context.Context, itemID int64) (string, error) {
+	var identity sql.NullString
+	err := r.db.QueryRowContext(ctx,
+		`SELECT content_identity FROM import_queue WHERE id = ?`, itemID).Scan(&identity)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("failed to get content identity: %w", err)
+	}
+	return identity.String, nil
+}
+
+// FindCompletedByContentIdentity returns the most recent completed import with
+// the same payload fingerprint and total size. The caller must pass its own
+// nzb_path as excludeNzbPath: re-queueing the same path is an explicit retry or
+// reprocess and must keep the normal admission behaviour instead of being
+// short-circuited back to completed.
+func (r *QueueRepository) FindCompletedByContentIdentity(ctx context.Context, identity string, fileSize int64, excludeNzbPath string) (*CompletedContentMatch, error) {
+	if identity == "" {
+		return nil, nil
+	}
+	query := `
+		SELECT id, nzb_path, storage_path
+		FROM import_queue
+		WHERE status = 'completed'
+		  AND content_identity = ?
+		  AND file_size = ?
+		  AND storage_path IS NOT NULL
+		  AND storage_path <> ''
+		  AND nzb_path <> ?
+		ORDER BY COALESCE(completed_at, updated_at, created_at) DESC, id DESC
+		LIMIT 1
+	`
+	var match CompletedContentMatch
+	err := r.db.QueryRowContext(ctx, query, identity, fileSize, excludeNzbPath).Scan(
+		&match.ID, &match.NzbPath, &match.StoragePath)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to find completed import by content identity: %w", err)
+	}
+	return &match, nil
 }
 
 // IsFileInQueue checks if a file is already in the queue (pending, processing, or paused).

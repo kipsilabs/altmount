@@ -10,7 +10,7 @@ import (
 func TestExpandNzbWrapper(t *testing.T) {
 	for _, fail := range []bool{false, true} {
 		t.Run(map[bool]string{false: "commit and retry", true: "rollback"}[fail], func(t *testing.T) {
-			db := openMigratedTo(t, 40)
+			db := openMigratedTo(t, 66)
 			repo := NewQueueRepository(db, DialectSQLite)
 			ctx := context.Background()
 			parent := &ImportQueueItem{NzbPath: "parent.nzb", Status: QueueStatusProcessing, Priority: QueuePriorityNormal, MaxRetries: 3}

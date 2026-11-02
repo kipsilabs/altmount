@@ -36,6 +36,7 @@ func setupQueueSchema(t *testing.T, db *sql.DB) {
 			skip_post_import_links BOOLEAN NOT NULL DEFAULT FALSE,
 			peer_hold INTEGER NOT NULL DEFAULT 0,
 			indexer TEXT DEFAULT NULL,
+			content_identity TEXT DEFAULT NULL,
 			UNIQUE(nzb_path)
 		);
 

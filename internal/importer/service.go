@@ -762,10 +762,14 @@ func (s *Service) AddToQueue(ctx context.Context, filePath string, relativePath 
 	default:
 	}
 
-	// Calculate file size before adding to queue
+	// Calculate file size before adding to queue and, when the NZB carries
+	// message-IDs, the admission identity used to spot the same release queued
+	// under another NZB name.
 	var fileSize *int64
-	if size, err := s.CalculateFileSizeOnly(filePath); err == nil {
+	var contentIdentity string
+	if size, identity, err := s.analyzeNzbForQueue(filePath); err == nil {
 		fileSize = &size
+		contentIdentity = identity
 	} else {
 		s.log.WarnContext(ctx, "Failed to calculate file size", "file", filePath, "error", err)
 		// Continue with NULL file size - don't fail the queue addition
@@ -791,19 +795,49 @@ func (s *Service) AddToQueue(ctx context.Context, filePath string, relativePath 
 		indexerName = &name
 	}
 
+	// If a completed import already holds this exact payload, admit the new row
+	// as completed against that storage instead of downloading the same release
+	// again. An nzb_path already in the queue is an explicit retry/reprocess and
+	// keeps its normal requeue behaviour.
+	allowDedup := false
+	if existing, err := s.database.Repository.GetQueueItemByNzbPath(ctx, filePath); err != nil {
+		s.log.WarnContext(ctx, "Failed to check whether NZB path is already queued",
+			"file", filePath, "error", err)
+	} else {
+		allowDedup = existing == nil
+	}
+	var duplicate *database.CompletedContentMatch
+	if allowDedup && contentIdentity != "" && fileSize != nil {
+		match, err := s.database.Repository.FindCompletedByContentIdentity(ctx, contentIdentity, *fileSize, filePath)
+		if err != nil {
+			s.log.WarnContext(ctx, "Failed to look up completed import for queue de-duplication",
+				"file", filePath, "error", err)
+		} else {
+			duplicate = match
+		}
+	}
+
+	itemStatus := database.QueueStatusPending
+	var duplicateStoragePath *string
+	if duplicate != nil {
+		itemStatus = database.QueueStatusCompleted
+		duplicateStoragePath = &duplicate.StoragePath
+	}
 	item := &database.ImportQueueItem{
-		DownloadID:   downloadID,
-		NzbPath:      filePath,
-		RelativePath: relativePath,
-		Category:     category,
-		Priority:     itemPriority,
-		Status:       database.QueueStatusPending,
-		RetryCount:   0,
-		MaxRetries:   3,
-		FileSize:     fileSize,
-		Metadata:     metadata,
-		Indexer:      indexerName,
-		CreatedAt:    time.Now(),
+		DownloadID:      downloadID,
+		NzbPath:         filePath,
+		RelativePath:    relativePath,
+		StoragePath:     duplicateStoragePath,
+		Category:        category,
+		Priority:        itemPriority,
+		Status:          itemStatus,
+		RetryCount:      0,
+		MaxRetries:      3,
+		FileSize:        fileSize,
+		Metadata:        metadata,
+		Indexer:         indexerName,
+		ContentIdentity: nilIfEmpty(contentIdentity),
+		CreatedAt:       time.Now(),
 	}
 
 	// Insert the DB row first so item.ID is available for the persistent filename
@@ -823,6 +857,56 @@ func (s *Service) AddToQueue(ctx context.Context, filePath string, relativePath 
 		return nil, fmt.Errorf("failed to make NZB persistent: %w", err)
 	}
 
+	if contentIdentity != "" {
+		if err := s.database.Repository.SetContentIdentity(ctx, item.ID, contentIdentity); err != nil {
+			s.log.WarnContext(ctx, "Failed to record content identity for queue item",
+				"queue_id", item.ID, "error", err)
+		}
+	}
+
+	if duplicate != nil {
+		if err := s.database.Repository.AddStoragePath(ctx, item.ID, duplicate.StoragePath); err != nil {
+			// The existing path could not be attached; fall back to a normal
+			// import rather than leaving a completed row with no storage.
+			s.log.WarnContext(ctx, "Failed to attach existing storage path to de-duplicated queue item; importing normally",
+				"queue_id", item.ID, "error", err)
+			duplicate = nil
+			item.Status = database.QueueStatusPending
+			if err := s.database.Repository.UpdateQueueItemStatus(ctx, item.ID, database.QueueStatusPending, nil); err != nil {
+				s.log.WarnContext(ctx, "Failed to return de-duplicated queue item to pending",
+					"queue_id", item.ID, "error", err)
+			}
+		}
+	}
+
+	if duplicate != nil {
+		if err := s.database.Repository.UpdateQueueItemStatus(ctx, item.ID, database.QueueStatusCompleted, nil); err != nil {
+			s.log.WarnContext(ctx, "Failed to mark de-duplicated queue item completed",
+				"queue_id", item.ID, "error", err)
+		}
+		item.StoragePath = &duplicate.StoragePath
+		item.CompletedAt = timePtr(time.Now())
+
+		// The raw NZB is not needed: the new row points at storage the existing
+		// completed import already owns. Mirror handleProcessingSuccess and drop it.
+		if item.NzbPath != "" {
+			if err := os.Remove(item.NzbPath); err != nil && !os.IsNotExist(err) {
+				s.log.WarnContext(ctx, "Failed to delete NZB after de-duplicated import",
+					"queue_id", item.ID, "nzb_path", item.NzbPath, "error", err)
+			}
+		}
+
+		s.log.InfoContext(ctx, "De-duplicated queue admission to existing completed import",
+			"file", filePath, "queue_id", item.ID, "existing_queue_id", duplicate.ID,
+			"storage_path", duplicate.StoragePath, "file_size", *fileSize)
+
+		if s.broadcaster != nil {
+			s.broadcaster.NotifyComplete(int(item.ID), "completed")
+			s.broadcaster.BroadcastQueueChanged()
+		}
+		return item, nil
+	}
+
 	if s.broadcaster != nil {
 		s.broadcaster.BroadcastQueueChanged()
 	}
@@ -838,6 +922,18 @@ func (s *Service) AddToQueue(ctx context.Context, filePath string, relativePath 
 	}
 
 	return item, nil
+}
+
+// nilIfEmpty returns a pointer only for a non-empty string.
+func nilIfEmpty(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
+}
+
+func timePtr(t time.Time) *time.Time {
+	return &t
 }
 
 // FindAndUpdatePendingUpload de-duplicates manual NZB re-uploads. UNIQUE(nzb_path) can't catch them
@@ -1399,6 +1495,11 @@ func (s *Service) handleProcessingSuccess(ctx context.Context, item *database.Im
 		return err
 	}
 
+	// Record the admission identity for rows that arrived through a path which
+	// does not compute one at admission (e.g. directory scans), so future
+	// duplicates of this release can be admitted against this storage.
+	s.recordContentIdentity(ctx, item)
+
 	// Signal streamable as early as possible — files are accessible via VFS now.
 	// Stremio waiters listening on the broadcaster can return stream URLs without
 	// waiting for post-processing (symlinks, STRM, health scheduling) to complete.
@@ -1953,28 +2054,8 @@ func (s *Service) calculateNzbFileSize(r io.Reader) (int64, error) {
 		return 0, NewNonRetryableError("failed to parse NZB XML for size calculation", err)
 	}
 
-	if len(n.Files) == 0 {
-		return 0, NewNonRetryableError("NZB file contains no files", nil)
-	}
-
-	parser.SanitizeNzbFilenames(n)
-
-	var totalSize int64
-	par2Pattern := regexp.MustCompile(`(?i)\.par2$|\.p\d+$|\.vol\d+\+\d+\.par2$`)
-
-	for _, file := range n.Files {
-		// Skip PAR2 files (same logic as existing parser)
-		if par2Pattern.MatchString(file.Filename) {
-			continue
-		}
-
-		// Sum all segment bytes directly
-		for _, segment := range file.Segments {
-			totalSize += int64(segment.Bytes)
-		}
-	}
-
-	return totalSize, nil
+	totalSize, _, err := analyzeParsedNzb(n)
+	return totalSize, err
 }
 
 // calculateStrmFileSize extracts file size from STRM file NXG link

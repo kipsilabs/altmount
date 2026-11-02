@@ -11,7 +11,7 @@ import (
 
 func TestAddToQueue_SkipFlags(t *testing.T) {
 	t.Run("SQLite", func(t *testing.T) {
-		testAddToQueueSkipFlags(t, openMigratedTo(t, 40), DialectSQLite)
+		testAddToQueueSkipFlags(t, openMigratedTo(t, 66), DialectSQLite)
 	})
 	t.Run("Postgres", func(t *testing.T) {
 		testAddToQueueSkipFlags(t, openPostgresLatest(t), DialectPostgres)
