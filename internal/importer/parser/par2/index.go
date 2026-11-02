@@ -64,6 +64,14 @@ const maxMetadataPacketBody = 64 << 20
 // not hashed here — that would download every payload — so their refs carry
 // the packet MD5 for verification at fetch time instead.
 func ParseIndex(streams []io.Reader) (*Index, error) {
+	return ParseIndexUntil(streams, nil)
+}
+
+// ParseIndexUntil is ParseIndex that stops opening streams once enough reports
+// the set is planable. enough is asked between streams, and only once idx has
+// complete metadata; nil reads every stream. A parse that stops early lists only
+// the recovery slices it has read.
+func ParseIndexUntil(streams []io.Reader, enough func(*Index) bool) (*Index, error) {
 	idx := &Index{
 		Files:       make(map[[16]byte]FileDescriptor),
 		SliceChecks: make(map[[16]byte][]SliceCheck),
@@ -80,6 +88,9 @@ func ParseIndex(streams []io.Reader) (*Index, error) {
 	for fi, stream := range streams {
 		if err := parseIndexStream(stream, fi, idx, seenExp, &mainSeen); err != nil {
 			streamErrs = append(streamErrs, fmt.Sprintf("stream %d: %v", fi, err))
+		}
+		if enough != nil && mainSeen && validateIndex(idx) == nil && enough(idx) {
+			break
 		}
 	}
 

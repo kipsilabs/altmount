@@ -125,7 +125,7 @@ func Resolve(
 		}
 	}
 
-	idx, files, err := planSet(ctx, fetch, store, par2Files, dead, cache, log, progress)
+	idx, files, err := planSet(ctx, fetch, store, par2Files, dead, cache, caps, log, progress)
 	if err != nil {
 		return nil, err
 	}
@@ -151,6 +151,7 @@ func planSet(
 	par2Files []SetFile,
 	dead map[string]bool,
 	cache *articleCache,
+	caps Caps,
 	log *slog.Logger,
 	progress JobProgress,
 ) (*par2.Index, []SetFile, error) {
@@ -171,7 +172,7 @@ func planSet(
 		streams[i] = &planningStream{lazy: s.(*lazyFileReader), start: func() { report(i, len(par2Files)) }}
 	}
 
-	idx, err := par2.ParseIndex(streams)
+	idx, err := par2.ParseIndexUntil(streams, recoveryEnough(store, par2Files, dead, caps))
 	if err != nil {
 		return nil, nil, fmt.Errorf("%w: parse PAR2 set: %v", ErrUnrepairable, err)
 	}
@@ -1155,3 +1156,46 @@ func (l *lazyFileReader) Seek(offset int64, whence int) (int64, error) {
 // full-release STAT. Beyond it the exact census is worth its minutes: the
 // margin rows it would take exceed maxHiddenMarginRows.
 const maxHiddenAbsorbArticles = 64
+
+// parseStopSlack is the recovery rows read beyond what the plan wants, as spares
+// for rows found unreachable or singular during the job.
+const parseStopSlack = 16
+
+// recoveryEnough lets the PAR2 parse stop once it has found enough live recovery
+// slices for this repair. Finding every slice in the set means one fetch per
+// slice, nearly all of them for rows the plan never uses. A repair that runs out
+// of rows ends as any other: a dead article found mid-sweep is persisted and the
+// retry reads further, and otherwise the verdict is unrepairable.
+//
+// Returns nil (read everything) when no article is known dead: a verify sweep
+// has nothing to size against.
+func recoveryEnough(store *metapb.NzbStore, par2Files []SetFile, dead map[string]bool, caps Caps) func(*par2.Index) bool {
+	if len(dead) == 0 || caps.VerifySweep {
+		return nil
+	}
+	var biggest int64
+	for _, f := range store.Files {
+		for _, seg := range f.Segments {
+			biggest = max(biggest, seg.Bytes)
+		}
+	}
+	margin := int64(planMargin)
+	if caps.RecoveryMargin != nil && *caps.RecoveryMargin > 0 {
+		margin = int64(*caps.RecoveryMargin)
+	}
+	return func(idx *par2.Index) bool {
+		sliceSize := int64(idx.SliceSize)
+		// The most slices one article can touch: it may straddle both ends.
+		span := biggest/sliceSize + 2
+		hidden := min(int64(max(caps.ExpectedHiddenArticles, 0))*span, maxHiddenMarginRows)
+		want := int64(len(dead))*span + hidden + margin + parseStopSlack
+
+		var live int64
+		for _, ref := range idx.Recovery {
+			if payloadArticlesLive(par2Files[ref.FileIndex], ref.BodyOffset, sliceSize, dead) {
+				live++
+			}
+		}
+		return live >= want
+	}
+}

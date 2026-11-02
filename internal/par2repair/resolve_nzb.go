@@ -124,7 +124,7 @@ func ResolveFromNzb(
 		return nil, err
 	}
 
-	idx, files, err := planSet(ctx, fetch, store, par2Files, dead, cache, log, progress)
+	idx, files, err := planSet(ctx, fetch, store, par2Files, dead, cache, caps, log, progress)
 	if err != nil {
 		return nil, err
 	}
