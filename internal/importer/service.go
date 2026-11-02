@@ -873,13 +873,6 @@ func (s *Service) AddToQueue(ctx context.Context, filePath string, relativePath 
 		return nil, fmt.Errorf("failed to make NZB persistent: %w", err)
 	}
 
-	if contentIdentity != "" {
-		if err := s.database.Repository.SetContentIdentity(ctx, item.ID, contentIdentity); err != nil {
-			s.log.WarnContext(ctx, "Failed to record content identity for queue item",
-				"queue_id", item.ID, "error", err)
-		}
-	}
-
 	if duplicate != nil {
 		if err := s.completeAsDuplicate(ctx, item, duplicate); err != nil {
 			// The existing storage could not be attached; fall back to a normal
@@ -888,6 +881,16 @@ func (s *Service) AddToQueue(ctx context.Context, filePath string, relativePath 
 				"queue_id", item.ID, "error", err)
 			duplicate = nil
 			item.Status = database.QueueStatusPending
+			item.StoragePath = nil
+			item.CompletedAt = nil
+			// The row was inserted as completed, and completeAsDuplicate may
+			// have attached the source storage before failing. Reset the stored
+			// row too, otherwise it stays completed (with stale or missing
+			// storage) and is never claimed or re-downloaded.
+			if resetErr := s.database.Repository.ResetDuplicateAdmission(ctx, item.ID); resetErr != nil {
+				s.log.ErrorContext(ctx, "Failed to reset de-duplicated queue item for a normal import",
+					"queue_id", item.ID, "error", resetErr)
+			}
 		}
 	}
 

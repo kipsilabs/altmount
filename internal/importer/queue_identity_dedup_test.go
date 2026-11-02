@@ -231,6 +231,58 @@ func TestConcurrentIdenticalAdmissionsAreSerialisedAndAdopted(t *testing.T) {
 	require.NoError(t, err)
 }
 
+// TestAddToQueueFallbackResetsDuplicateAdmission covers the fallback when an
+// admission is inserted as completed but cannot be attached to the completed
+// import. The stored row must return to pending with no storage path, otherwise
+// it stays completed (with stale or missing storage) and is never claimed.
+func TestAddToQueueFallbackResetsDuplicateAdmission(t *testing.T) {
+	s, configDir := newDedupTestService(t)
+	ctx := context.Background()
+
+	firstPath := writeNzb(t, filepath.Join(configDir, "uploads"),
+		"Fallback.nzb",
+		nzbWithSegmentBytes("Fallback.mkv", 100, "seg-fallback-a@example", "seg-fallback-b@example"))
+	first, err := s.AddToQueue(ctx, firstPath, nil, nil, nil, nil, nil, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.Remove(first.NzbPath) })
+	completeWithStorage(t, s, first, filepath.Join(configDir, "complete", "Fallback"))
+
+	// Fail the status write inside completeAsDuplicate after AddStoragePath has
+	// already attached the source storage: the interleave the fallback must undo.
+	_, err = s.database.Connection().ExecContext(ctx, `
+		CREATE TRIGGER reject_duplicate_completion
+		BEFORE UPDATE ON import_queue
+		WHEN NEW.status = 'completed' AND NEW.completed_at IS NOT NULL
+		BEGIN
+			SELECT RAISE(ABORT, 'simulated status update failure');
+		END`)
+	require.NoError(t, err)
+
+	secondPath := writeNzb(t, filepath.Join(configDir, "uploads"),
+		"Fallback.1.nzb",
+		nzbWithSegmentBytes("obfuscated.bin", 100, "seg-fallback-a@example", "seg-fallback-b@example"))
+	second, err := s.AddToQueue(ctx, secondPath, nil, nil, nil, nil, nil, nil)
+	require.NoError(t, err, "admission falls back to a normal import instead of failing")
+	t.Cleanup(func() { _ = os.Remove(second.NzbPath) })
+
+	stored, err := s.database.Repository.GetQueueItem(ctx, second.ID)
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	require.Equal(t, database.QueueStatusPending, stored.Status,
+		"a failed duplicate completion must reset the stored row to pending")
+	require.Nil(t, stored.StoragePath,
+		"a failed duplicate completion must not leave the source storage attached")
+	require.Nil(t, stored.CompletedAt)
+
+	require.Equal(t, database.QueueStatusPending, second.Status)
+	require.Nil(t, second.StoragePath)
+
+	claimed, err := s.database.Repository.ClaimNextQueueItem(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	require.Equal(t, second.ID, claimed.ID, "the fallback row must be claimable for a normal import")
+}
+
 func TestAddToQueueDoesNotMergeDifferentSizes(t *testing.T) {
 	s, configDir := newDedupTestService(t)
 	ctx := context.Background()

@@ -112,7 +112,42 @@ func TestFindCompletedByContentIdentity(t *testing.T) {
 	require.Equal(t, "cafebabe", got)
 }
 
-func strPtr(s string) *string { return &s }
+// TestAddToQueuePersistsContentIdentityImmediately covers the admission race:
+// the row must carry its identity as soon as it is visible, with no follow-up
+// UPDATE in between. Otherwise a concurrent identical admission finds nothing in
+// flight, is admitted pending, and downloads the same articles a second time.
+func TestAddToQueuePersistsContentIdentityImmediately(t *testing.T) {
+	sqlDB, err := sql.Open("sqlite3", ":memory:")
+	require.NoError(t, err)
+	defer sqlDB.Close()
+	setupQueueSchema(t, sqlDB)
+
+	repo := NewQueueRepository(sqlDB, DialectSQLite)
+	ctx := context.Background()
+
+	size := int64(2048)
+	identity := "immediate-identity"
+	item := &ImportQueueItem{
+		NzbPath:         "/queue/immediate.nzb",
+		Status:          QueueStatusPending,
+		Priority:        QueuePriorityNormal,
+		MaxRetries:      3,
+		FileSize:        &size,
+		ContentIdentity: &identity,
+	}
+	require.NoError(t, repo.AddToQueue(ctx, item))
+
+	// No SetContentIdentity call: the insert alone must expose the identity to
+	// both admission lookups.
+	got, err := repo.GetContentIdentity(ctx, item.ID)
+	require.NoError(t, err)
+	require.Equal(t, identity, got)
+
+	inflight, err := repo.FindInFlightByContentIdentity(ctx, identity, size, "/queue/concurrent.nzb")
+	require.NoError(t, err)
+	require.NotNil(t, inflight)
+	require.Equal(t, item.ID, inflight.ID)
+}
 
 // TestClaimNextQueueItemSerialisesIdenticalReleases pins the claim-time half of
 // admission de-duplication: two pending rows with the same identity and size are

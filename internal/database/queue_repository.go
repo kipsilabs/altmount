@@ -197,9 +197,13 @@ func (r *QueueRepository) RestartQueueItemsBulk(ctx context.Context, ids []int64
 
 // AddToQueue adds a new NZB file to the import queue
 func (r *QueueRepository) AddToQueue(ctx context.Context, item *ImportQueueItem) error {
+	// content_identity is written in the same statement as the row so a
+	// concurrent admission can see it as soon as the row exists. Writing it in a
+	// follow-up UPDATE leaves a window where FindInFlightByContentIdentity and
+	// the claim gate are blind and two identical admissions both download.
 	query := `
-		INSERT INTO import_queue (download_id, nzb_path, relative_path, storage_path, category, priority, status, retry_count, max_retries, batch_id, metadata, file_size, target_path, skip_arr_notification, skip_post_import_links, indexer, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+		INSERT INTO import_queue (download_id, nzb_path, relative_path, storage_path, category, priority, status, retry_count, max_retries, batch_id, metadata, file_size, target_path, skip_arr_notification, skip_post_import_links, indexer, content_identity, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
 		ON CONFLICT(nzb_path) DO UPDATE SET
 		download_id = COALESCE(excluded.download_id, import_queue.download_id),
 		priority = CASE WHEN excluded.priority < import_queue.priority THEN excluded.priority ELSE import_queue.priority END,
@@ -212,6 +216,7 @@ func (r *QueueRepository) AddToQueue(ctx context.Context, item *ImportQueueItem)
 		skip_post_import_links = excluded.skip_post_import_links,
 		status = excluded.status,
 		indexer = COALESCE(excluded.indexer, import_queue.indexer),
+		content_identity = COALESCE(excluded.content_identity, import_queue.content_identity),
 		storage_path = COALESCE(excluded.storage_path, import_queue.storage_path),
 		retry_count = 0,
 		started_at = NULL,
@@ -221,7 +226,7 @@ func (r *QueueRepository) AddToQueue(ctx context.Context, item *ImportQueueItem)
 	`
 
 	args := []any{item.DownloadID, item.NzbPath, item.RelativePath, item.StoragePath, item.Category, item.Priority, item.Status,
-		item.RetryCount, item.MaxRetries, item.BatchID, item.Metadata, item.FileSize, item.TargetPath, item.SkipArrNotification, item.SkipPostImportLinks, item.Indexer}
+		item.RetryCount, item.MaxRetries, item.BatchID, item.Metadata, item.FileSize, item.TargetPath, item.SkipArrNotification, item.SkipPostImportLinks, item.Indexer, item.ContentIdentity}
 
 	if r.dialect.IsPostgres() {
 		err := r.db.QueryRowContext(ctx, query+" RETURNING id", args...).Scan(&item.ID)
@@ -265,6 +270,28 @@ func (r *QueueRepository) AddStoragePath(ctx context.Context, itemID int64, stor
 	_, err := r.db.ExecContext(ctx, query, storagePath, itemID)
 	if err != nil {
 		return fmt.Errorf("failed to add storage path: %w", err)
+	}
+
+	return nil
+}
+
+// ResetDuplicateAdmission returns a row that could not be completed against an
+// existing import to the normal pending path. completeAsDuplicate attaches the
+// existing storage before marking the row completed, so a failure after the
+// attach leaves a completed row that would never be claimed. Status and storage
+// are reset in one statement: either failure ordering must not leave a row
+// completed without storage, or pending while pointing at another import's
+// storage.
+func (r *QueueRepository) ResetDuplicateAdmission(ctx context.Context, itemID int64) error {
+	query := `
+		UPDATE import_queue
+		SET status = 'pending', storage_path = NULL, completed_at = NULL,
+		    started_at = NULL, error_message = NULL, updated_at = datetime('now')
+		WHERE id = ?
+	`
+
+	if _, err := r.db.ExecContext(ctx, query, itemID); err != nil {
+		return fmt.Errorf("failed to reset de-duplicated queue admission: %w", err)
 	}
 
 	return nil
