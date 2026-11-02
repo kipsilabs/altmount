@@ -322,7 +322,7 @@ func RunJob(
 		var err error
 		downloadStarted := time.Now()
 		refs, payloads, spares, err = loadRecoveryPayloads(
-			ctx, fetch, par2Files, refs, spares, len(missing), sliceSize, alloc, plan.SpillToDisk, o.fetchDepth(), o.progress, log)
+			ctx, fetch, plan, par2Files, refs, spares, len(missing), sliceSize, alloc, plan.SpillToDisk, o.fetchDepth(), o.progress, log)
 		downloadTime += time.Since(downloadStarted)
 		if err != nil {
 			return err
@@ -427,7 +427,7 @@ func RunJob(
 					ErrUnrepairable, corrupt, maxCorruptReplans)
 			}
 			if len(spares) == 0 {
-				return fmt.Errorf("%w: %v and no spare recovery slices remain", ErrUnrepairable, corrupt)
+				return plan.outOfRecovery(nil, fmt.Sprintf("%v and no spare recovery slices remain", corrupt))
 			}
 			log.WarnContext(ctx, "present slice failed CRC32, reclassifying as missing",
 				"global_slice", corrupt.global, "spare_exponent", spares[0].Exponent)
@@ -457,7 +457,7 @@ func RunJob(
 			// exists. A spare brings a genuinely new exponent into play, at
 			// the cost of a fresh sweep.
 			if len(spares) == 0 {
-				return fmt.Errorf("%w: recovery matrix singular and no spare recovery slices remain", ErrUnrepairable)
+				return plan.outOfRecovery(nil, "recovery matrix singular and no spare recovery slices remain")
 			}
 			swap := len(refs) - 1
 			log.WarnContext(ctx, "recovery matrix singular, retrying with spare recovery slice",
@@ -610,6 +610,7 @@ func patchCorruptArticle(
 func loadRecoveryPayloads(
 	ctx context.Context,
 	fetch ArticleFetcher,
+	plan *Plan,
 	par2Files []SetFile,
 	refs, spares []par2.RecoverySliceRef,
 	minRows int,
@@ -634,6 +635,7 @@ func loadRecoveryPayloads(
 
 	payloads := make([][]byte, len(refs))
 	kept := make([]bool, len(refs))
+	var unusable []string
 	if progress != nil {
 		progress(StageDownloading, 0, len(refs))
 	}
@@ -653,6 +655,7 @@ func loadRecoveryPayloads(
 			}
 			if err != nil {
 				if errors.Is(err, nntppool.ErrArticleNotFound) {
+					unusable = append(unusable, recoveryArticleIDs(par2Files, []par2.RecoverySliceRef{ref}, []int{0}, sliceSize)...)
 					if len(spares) > 0 {
 						log.WarnContext(ctx, "recovery slice unreachable or corrupt, swapping in spare",
 							"exponent", ref.Exponent, "spare_exponent", spares[0].Exponent, "reason", err)
@@ -693,8 +696,8 @@ func loadRecoveryPayloads(
 		}
 	}
 	if len(outRefs) < minRows {
-		return nil, nil, nil, fmt.Errorf("%w: %d slice(s) missing but only %d recovery slice(s) reachable",
-			ErrUnrepairable, minRows, len(outRefs))
+		return nil, nil, nil, plan.outOfRecovery(unusable,
+			fmt.Sprintf("%d slice(s) missing but only %d recovery slice(s) reachable", minRows, len(outRefs)))
 	}
 	return outRefs, outPayloads, spares, nil
 }

@@ -477,7 +477,7 @@ func TestServiceExecutesNzbModeJob(t *testing.T) {
 	s := testService(t, repo, true)
 
 	var sawNzbPath string
-	s.resolveNzb = func(_ context.Context, nzbPath string, _ []string, _ JobProgress) (*Resolution, error) {
+	s.resolveNzb = func(_ context.Context, nzbPath string, _ []string, _ int, _ JobProgress) (*Resolution, error) {
 		sawNzbPath = nzbPath
 		return nil, ErrNothingToRepair // terminal, keeps the test focused on routing
 	}

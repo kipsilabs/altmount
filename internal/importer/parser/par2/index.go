@@ -41,6 +41,9 @@ type Index struct {
 	Files       map[[16]byte]FileDescriptor
 	SliceChecks map[[16]byte][]SliceCheck
 	Recovery    []RecoverySliceRef
+	// Partial is set when the parse stopped before reading every stream, so
+	// the set may hold recovery slices that Recovery doesn't list.
+	Partial bool
 }
 
 // maxIndexPacketSize bounds a packet's declared length; anything larger is a
@@ -89,7 +92,8 @@ func ParseIndexUntil(streams []io.Reader, enough func(*Index) bool) (*Index, err
 		if err := parseIndexStream(stream, fi, idx, seenExp, &mainSeen); err != nil {
 			streamErrs = append(streamErrs, fmt.Sprintf("stream %d: %v", fi, err))
 		}
-		if enough != nil && mainSeen && validateIndex(idx) == nil && enough(idx) {
+		if enough != nil && fi < len(streams)-1 && mainSeen && validateIndex(idx) == nil && enough(idx) {
+			idx.Partial = true
 			break
 		}
 	}

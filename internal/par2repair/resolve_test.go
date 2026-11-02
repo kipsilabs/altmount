@@ -911,3 +911,86 @@ func TestResolveReadsWholeSetForVerifySweep(t *testing.T) {
 		t.Fatalf("fetched %d of %d PAR2 articles, want all", got, len(par2IDs))
 	}
 }
+
+// serveOnceFetcher serves its ids once, as a recovery article that dies after the
+// parse has read it does.
+type serveOnceFetcher struct {
+	*fakeFetcher
+	once map[string]bool
+	seen map[string]bool
+}
+
+func (f *serveOnceFetcher) Fetch(ctx context.Context, id string) ([]byte, error) {
+	f.mu.Lock()
+	again := f.once[id] && f.seen[id]
+	f.seen[id] = true
+	f.mu.Unlock()
+	if again {
+		return nil, nntppool.ErrArticleNotFound
+	}
+	return f.fakeFetcher.Fetch(ctx, id)
+}
+
+// A repair whose recovery rows die after planning must read further into the set
+// rather than give up while volumes are unread, and must end up byte-exact.
+func TestRepairReadsFurtherWhenChosenRecoveryDies(t *testing.T) {
+	fm, store, inner, want, deadID, par2IDs := mkManyRecoveryFixture(t, 90)
+	once := map[string]bool{}
+	for _, id := range par2IDs[1:45] {
+		once[id] = true
+	}
+	fetch := &serveOnceFetcher{fakeFetcher: inner, once: once, seen: map[string]bool{}}
+	caps := Caps{MaxRepairRatio: 0.5, MaxMemoryBytes: 64 << 20}
+	ps := NewPatchStore(t.TempDir())
+	dead := []string{deadID}
+
+	res, err := Resolve(context.Background(), fm, store, dead, fetch, caps, testLogger(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = RunJob(context.Background(), res.Plan, res.Index, res.Par2Files, fetch, ps, testLogger())
+	var short *RecoveryShortError
+	if !errors.As(err, &short) {
+		t.Fatalf("err = %v, want RecoveryShortError", err)
+	}
+	if errors.Is(err, ErrUnrepairable) {
+		t.Fatal("must not be final while volumes are unread")
+	}
+	if len(short.Dead) == 0 {
+		t.Fatal("unusable recovery articles were not reported")
+	}
+
+	caps.RecoveryAttempt = 1
+	res, err = Resolve(context.Background(), fm, store, append(dead, short.Dead...), fetch, caps, testLogger(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := RunJob(context.Background(), res.Plan, res.Index, res.Par2Files, fetch, ps, testLogger()); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := ps.Get(deadID); !ok || !bytes.Equal(got, want) {
+		t.Fatal("repair did not reproduce the dead article")
+	}
+}
+
+// Once the whole set has been read there is nothing further to try.
+func TestRepairIsFinalOnceWholeSetRead(t *testing.T) {
+	fm, store, inner, _, deadID, par2IDs := mkManyRecoveryFixture(t, 20)
+	once := map[string]bool{}
+	for _, id := range par2IDs[1:] {
+		once[id] = true
+	}
+	fetch := &serveOnceFetcher{fakeFetcher: inner, once: once, seen: map[string]bool{}}
+	res, err := Resolve(context.Background(), fm, store, []string{deadID}, fetch,
+		Caps{MaxRepairRatio: 0.5, MaxMemoryBytes: 64 << 20}, testLogger(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Plan.PartialRecovery {
+		t.Fatal("a 20-slice set is smaller than the parse target, so all of it should be read")
+	}
+	err = RunJob(context.Background(), res.Plan, res.Index, res.Par2Files, fetch, NewPatchStore(t.TempDir()), testLogger())
+	if !errors.Is(err, ErrUnrepairable) {
+		t.Fatalf("err = %v, want ErrUnrepairable", err)
+	}
+}

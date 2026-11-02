@@ -1164,8 +1164,8 @@ const parseStopSlack = 16
 // recoveryEnough lets the PAR2 parse stop once it has found enough live recovery
 // slices for this repair. Finding every slice in the set means one fetch per
 // slice, nearly all of them for rows the plan never uses. A repair that runs out
-// of rows ends as any other: a dead article found mid-sweep is persisted and the
-// retry reads further, and otherwise the verdict is unrepairable.
+// of rows retries with RecoveryAttempt raised, which doubles what this asks for,
+// so nothing is given up on until the whole set has been read.
 //
 // Returns nil (read everything) when no article is known dead: a verify sweep
 // has nothing to size against.
@@ -1189,6 +1189,7 @@ func recoveryEnough(store *metapb.NzbStore, par2Files []SetFile, dead map[string
 		span := biggest/sliceSize + 2
 		hidden := min(int64(max(caps.ExpectedHiddenArticles, 0))*span, maxHiddenMarginRows)
 		want := int64(len(dead))*span + hidden + margin + parseStopSlack
+		want <<= min(max(caps.RecoveryAttempt, 0), 20)
 
 		var live int64
 		for _, ref := range idx.Recovery {
