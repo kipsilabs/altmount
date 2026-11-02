@@ -21,6 +21,14 @@ type QueueEventListener interface {
 	OnItemClaimed(ctx context.Context, item *database.ImportQueueItem)
 }
 
+// ItemAdopter is optionally implemented by an ItemProcessor that can satisfy a
+// claimed item from an already-completed import instead of processing it. It is
+// used to close the admission race where the same release is queued twice before
+// either copy finishes: the loser is claimed and adopted, not downloaded.
+type ItemAdopter interface {
+	AdoptCompletedItem(ctx context.Context, item *database.ImportQueueItem) (bool, error)
+}
+
 // ItemProcessor defines the interface for processing queue items
 type ItemProcessor interface {
 	// ProcessItem processes a single queue item and returns the resulting path or an error
@@ -372,6 +380,20 @@ func (m *Manager) processNextItem(ctx context.Context, workerID int) bool {
 	}
 
 	m.log.DebugContext(ctx, "Processing claimed queue item", "worker_id", workerID, "queue_id", item.ID, "file", item.NzbPath)
+
+	// Re-verify the payload identity after the claim: a completed import may have
+	// appeared since admission, in which case this copy does not need downloading.
+	if adopter, ok := m.processor.(ItemAdopter); ok {
+		adopted, adoptErr := adopter.AdoptCompletedItem(ctx, item)
+		if adoptErr != nil {
+			m.log.WarnContext(ctx, "Failed to adopt a completed duplicate import; processing normally",
+				"worker_id", workerID, "queue_id", item.ID, "error", adoptErr)
+		} else if adopted {
+			m.log.InfoContext(ctx, "Claimed item was satisfied by an existing completed import",
+				"worker_id", workerID, "queue_id", item.ID)
+			return true
+		}
+	}
 
 	itemCtx, cancelItem := context.WithCancelCause(ctx)
 	defer cancelItem(nil)

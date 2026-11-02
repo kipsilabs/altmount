@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/kipsilabs/altmount/internal/database"
+	"github.com/kipsilabs/altmount/internal/metadata"
 	"github.com/stretchr/testify/require"
 )
 
@@ -87,6 +88,147 @@ func TestAddToQueueDeduplicatesSameReleaseUnderDifferentNzbNames(t *testing.T) {
 	require.NoError(t, s.database.Connection().QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM import_queue WHERE status = 'pending'`).Scan(&pending))
 	require.Zero(t, pending)
+}
+
+// TestDedupedAdmissionCanRegenerateNzbForRetry covers B1: the de-duplicated row
+// drops its raw NZB but must leave a .nzbz store at the path its own retry reads,
+// otherwise POST /queue/{id}/retry fails forever.
+func TestDedupedAdmissionCanRegenerateNzbForRetry(t *testing.T) {
+	s, configDir := newDedupTestService(t)
+	s.metadataService = metadata.NewMetadataService(filepath.Join(configDir, "metadata"))
+	ctx := context.Background()
+
+	firstPath := writeNzb(t, filepath.Join(configDir, "uploads"),
+		"RetryStore.nzb",
+		nzbWithSegmentBytes("RetryStore.mkv", 100, "seg-a@example", "seg-b@example"))
+	first, err := s.AddToQueue(ctx, firstPath, nil, nil, nil, nil, nil, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.Remove(first.NzbPath) })
+
+	// The raw NZB is dropped after a successful import, so the store is what a
+	// retry regenerates from.
+	firstStore := nzbStoreRef(configDir, first.Category, first.ID, first.NzbPath)
+	require.NotEmpty(t, firstStore)
+	require.NoError(t, s.metadataService.Store().WriteStore(firstStore, sampleNzbStoreForTest()))
+
+	storage := filepath.Join(configDir, "complete", "RetryStore")
+	completeWithStorage(t, s, first, storage)
+
+	secondPath := writeNzb(t, filepath.Join(configDir, "uploads"),
+		"RetryStore.1.nzb",
+		nzbWithSegmentBytes("obfuscated.bin", 100, "seg-a@example", "seg-b@example"))
+	second, err := s.AddToQueue(ctx, secondPath, nil, nil, nil, nil, nil, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.Remove(second.NzbPath) })
+
+	require.Equal(t, database.QueueStatusCompleted, second.Status)
+	require.NotNil(t, second.StoragePath)
+
+	_, err = os.Stat(second.NzbPath)
+	require.True(t, os.IsNotExist(err), "de-duplicated admission should drop the raw NZB")
+
+	secondStore := nzbStoreRef(configDir, second.Category, second.ID, second.NzbPath)
+	require.NotEmpty(t, secondStore)
+	require.NotEqual(t, firstStore, secondStore)
+	_, err = os.Stat(secondStore)
+	require.NoError(t, err, "store must be copied to the de-duplicated row's own retry path")
+
+	// Retry path: the raw NZB is missing, so ensurePersistentNzb regenerates it
+	// from the copied store.
+	require.NoError(t, s.ensurePersistentNzb(ctx, second))
+	regenerated, err := os.ReadFile(second.NzbPath)
+	require.NoError(t, err)
+	require.Contains(t, string(regenerated), "Movie.mkv")
+}
+
+// TestAddToQueueSameBasenameReuploadKeepsNormalAdmission covers B3: the same
+// release uploaded again under the same filename is an explicit reprocess and
+// must not be short-circuited to the completed row, even though
+// ensurePersistentNzb has rewritten the completed row's nzb_path.
+func TestAddToQueueSameBasenameReuploadKeepsNormalAdmission(t *testing.T) {
+	s, configDir := newDedupTestService(t)
+	ctx := context.Background()
+
+	firstPath := writeNzb(t, filepath.Join(configDir, "uploads-a"),
+		"Reupload.nzb",
+		nzbWithSegmentBytes("Reupload.mkv", 100, "seg-a@example", "seg-b@example"))
+	first, err := s.AddToQueue(ctx, firstPath, nil, nil, nil, nil, nil, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.Remove(first.NzbPath) })
+	completeWithStorage(t, s, first, filepath.Join(configDir, "complete", "Reupload"))
+
+	// New temp directory, same basename: a re-upload from the queue UI.
+	secondPath := writeNzb(t, filepath.Join(configDir, "uploads-b"),
+		"Reupload.nzb",
+		nzbWithSegmentBytes("Reupload.mkv", 100, "seg-a@example", "seg-b@example"))
+	second, err := s.AddToQueue(ctx, secondPath, nil, nil, nil, nil, nil, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.Remove(second.NzbPath) })
+
+	require.Equal(t, database.QueueStatusPending, second.Status,
+		"same-basename re-upload is an explicit reprocess and must import normally")
+	require.Nil(t, second.StoragePath)
+}
+
+// TestConcurrentIdenticalAdmissionsAreSerialisedAndAdopted covers B2: the second
+// admission of an identical payload stays pending while the first processes, and
+// after the first completes the worker adopts its storage instead of downloading
+// the same articles again.
+func TestConcurrentIdenticalAdmissionsAreSerialisedAndAdopted(t *testing.T) {
+	s, configDir := newDedupTestService(t)
+	s.metadataService = metadata.NewMetadataService(filepath.Join(configDir, "metadata"))
+	ctx := context.Background()
+
+	firstPath := writeNzb(t, filepath.Join(configDir, "uploads"),
+		"RaceOne.nzb",
+		nzbWithSegmentBytes("Race.mkv", 100, "seg-race-a@example", "seg-race-b@example"))
+	first, err := s.AddToQueue(ctx, firstPath, nil, nil, nil, nil, nil, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.Remove(first.NzbPath) })
+
+	secondPath := writeNzb(t, filepath.Join(configDir, "uploads"),
+		"RaceTwo.nzb",
+		nzbWithSegmentBytes("Race.mkv", 100, "seg-race-a@example", "seg-race-b@example"))
+	second, err := s.AddToQueue(ctx, secondPath, nil, nil, nil, nil, nil, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.Remove(second.NzbPath) })
+	require.Equal(t, database.QueueStatusPending, second.Status)
+	require.Equal(t, *first.ContentIdentity, *second.ContentIdentity)
+
+	claimedFirst, err := s.database.Repository.ClaimNextQueueItem(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, claimedFirst)
+	require.Equal(t, first.ID, claimedFirst.ID)
+
+	claimed, err := s.database.Repository.ClaimNextQueueItem(ctx)
+	require.NoError(t, err)
+	require.Nil(t, claimed, "identical release must not be claimed while its sibling is processing")
+
+	storage := filepath.Join(configDir, "complete", "Race")
+	firstStore := nzbStoreRef(configDir, first.Category, first.ID, first.NzbPath)
+	require.NoError(t, s.metadataService.Store().WriteStore(firstStore, sampleNzbStoreForTest()))
+	completeWithStorage(t, s, first, storage)
+
+	claimedSecond, err := s.database.Repository.ClaimNextQueueItem(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, claimedSecond)
+	require.Equal(t, second.ID, claimedSecond.ID)
+	require.NotNil(t, claimedSecond.ContentIdentity)
+
+	adopted, err := s.AdoptCompletedItem(ctx, claimedSecond)
+	require.NoError(t, err)
+	require.True(t, adopted)
+
+	stored, err := s.database.Repository.GetQueueItem(ctx, second.ID)
+	require.NoError(t, err)
+	require.Equal(t, database.QueueStatusCompleted, stored.Status)
+	require.NotNil(t, stored.StoragePath)
+	require.Equal(t, storage, *stored.StoragePath)
+
+	// Adoption also leaves a retryable store for the adopted row.
+	secondStore := nzbStoreRef(configDir, second.Category, second.ID, second.NzbPath)
+	_, err = os.Stat(secondStore)
+	require.NoError(t, err)
 }
 
 func TestAddToQueueDoesNotMergeDifferentSizes(t *testing.T) {

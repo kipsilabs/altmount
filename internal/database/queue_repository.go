@@ -275,7 +275,16 @@ func (r *QueueRepository) AddStoragePath(ctx context.Context, itemID int64, stor
 type CompletedContentMatch struct {
 	ID          int64
 	NzbPath     string
+	Category    *string
 	StoragePath string
+}
+
+// ContentIdentityMatch identifies another queue row that already carries the
+// same admission identity and payload size.
+type ContentIdentityMatch struct {
+	ID      int64
+	NzbPath string
+	Status  QueueStatus
 }
 
 // SetContentIdentity records the admission fingerprint for a queue row.
@@ -305,35 +314,95 @@ func (r *QueueRepository) GetContentIdentity(ctx context.Context, itemID int64) 
 	return identity.String, nil
 }
 
+// nzbBasenameLikePatterns returns LIKE patterns matching any queue path ending
+// in filename. They cover the plain "<dir>/<basename>" form as well as the
+// "<id>-<basename>" form ensurePersistentNzb applies when the plain destination
+// is taken, and both slash styles because a migrated database can retain paths
+// written on another platform.
+func nzbBasenameLikePatterns(filename string) []string {
+	escaped := escapeLikePattern(filename)
+	return []string{"%-" + escaped, "%/" + escaped, `%\` + escaped}
+}
+
+// excludeNzbPathClause returns the SQL that excludes the admission's own NZB
+// path and every row that already carries the same basename. The basename match
+// is load-bearing: ensurePersistentNzb rewrites nzb_path right after insert, so
+// a manual re-upload arrives with a new temp path but the same basename and must
+// keep its normal admission (explicit reprocess) behaviour instead of being
+// short-circuited to the completed row.
+func excludeNzbPathClause(excludeNzbPath string) (string, []any) {
+	clauses := []string{"nzb_path <> ?"}
+	args := []any{excludeNzbPath}
+	for _, pattern := range nzbBasenameLikePatterns(filepath.Base(excludeNzbPath)) {
+		clauses = append(clauses, `nzb_path NOT LIKE ? ESCAPE '\'`)
+		args = append(args, pattern)
+	}
+	return " AND " + strings.Join(clauses, " AND "), args
+}
+
 // FindCompletedByContentIdentity returns the most recent completed import with
 // the same payload fingerprint and total size. The caller must pass its own
-// nzb_path as excludeNzbPath: re-queueing the same path is an explicit retry or
-// reprocess and must keep the normal admission behaviour instead of being
-// short-circuited back to completed.
+// nzb_path as excludeNzbPath: re-queueing the same path or basename is an
+// explicit retry or reprocess and must keep the normal admission behaviour
+// instead of being short-circuited back to completed.
 func (r *QueueRepository) FindCompletedByContentIdentity(ctx context.Context, identity string, fileSize int64, excludeNzbPath string) (*CompletedContentMatch, error) {
 	if identity == "" {
 		return nil, nil
 	}
+	exclusion, exclusionArgs := excludeNzbPathClause(excludeNzbPath)
 	query := `
-		SELECT id, nzb_path, storage_path
+		SELECT id, nzb_path, category, storage_path
 		FROM import_queue
 		WHERE status = 'completed'
 		  AND content_identity = ?
 		  AND file_size = ?
 		  AND storage_path IS NOT NULL
-		  AND storage_path <> ''
-		  AND nzb_path <> ?
+		  AND storage_path <> ''` + exclusion + `
 		ORDER BY COALESCE(completed_at, updated_at, created_at) DESC, id DESC
 		LIMIT 1
 	`
+	args := append([]any{identity, fileSize}, exclusionArgs...)
+
 	var match CompletedContentMatch
-	err := r.db.QueryRowContext(ctx, query, identity, fileSize, excludeNzbPath).Scan(
-		&match.ID, &match.NzbPath, &match.StoragePath)
+	err := r.db.QueryRowContext(ctx, query, args...).Scan(
+		&match.ID, &match.NzbPath, &match.Category, &match.StoragePath)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to find completed import by content identity: %w", err)
+	}
+	return &match, nil
+}
+
+// FindInFlightByContentIdentity returns the oldest pending, processing, or
+// paused row carrying the same payload fingerprint and total size. Admission
+// uses it to recognise the same release arriving again while a download is
+// still in flight; the row is kept pending so the worker can adopt the first
+// completed import instead of downloading the payload a second time.
+func (r *QueueRepository) FindInFlightByContentIdentity(ctx context.Context, identity string, fileSize int64, excludeNzbPath string) (*ContentIdentityMatch, error) {
+	if identity == "" {
+		return nil, nil
+	}
+	exclusion, exclusionArgs := excludeNzbPathClause(excludeNzbPath)
+	query := `
+		SELECT id, nzb_path, status
+		FROM import_queue
+		WHERE status IN ('pending', 'processing', 'paused')
+		  AND content_identity = ?
+		  AND file_size = ?` + exclusion + `
+		ORDER BY id ASC
+		LIMIT 1
+	`
+	args := append([]any{identity, fileSize}, exclusionArgs...)
+
+	var match ContentIdentityMatch
+	err := r.db.QueryRowContext(ctx, query, args...).Scan(&match.ID, &match.NzbPath, &match.Status)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to find in-flight queue item by content identity: %w", err)
 	}
 	return &match, nil
 }
@@ -367,12 +436,27 @@ func (r *QueueRepository) ClaimNextQueueItem(ctx context.Context) (*ImportQueueI
 	var claimedItem *ImportQueueItem
 
 	err := r.withQueueTransaction(ctx, func(txRepo *QueueRepository) error {
-		// First, get the next available item ID within the transaction
+		// First, get the next available item ID within the transaction. Identical
+		// releases (same content identity and size) are serialised: a pending row
+		// is skipped while a sibling is already processing, and only the oldest
+		// pending row of a group is claimable. That collapses the admission race
+		// where two copies of the same NZB would otherwise both start downloading.
 		var itemID int64
 		selectQuery := `
-			SELECT id FROM import_queue
-			WHERE status = 'pending'
-			ORDER BY priority ASC, created_at ASC
+			SELECT q.id FROM import_queue q
+			WHERE q.status = 'pending'
+			  AND NOT EXISTS (
+			      SELECT 1 FROM import_queue sibling
+			      WHERE sibling.content_identity IS NOT NULL
+			        AND sibling.content_identity = q.content_identity
+			        AND sibling.file_size = q.file_size
+			        AND sibling.id <> q.id
+			        AND (
+			            sibling.status = 'processing'
+			            OR (sibling.status = 'pending' AND sibling.id < q.id)
+			        )
+			  )
+			ORDER BY q.priority ASC, q.created_at ASC
 			LIMIT 1
 		`
 
@@ -410,7 +494,7 @@ func (r *QueueRepository) ClaimNextQueueItem(ctx context.Context) (*ImportQueueI
 		// Get the complete claimed item data
 		getQuery := `
 			SELECT id, download_id, nzb_path, relative_path, category, priority, status, created_at, updated_at,
-			       started_at, completed_at, retry_count, max_retries, error_message, batch_id, metadata, file_size, storage_path, target_path, skip_arr_notification, skip_post_import_links, indexer
+			       started_at, completed_at, retry_count, max_retries, error_message, batch_id, metadata, file_size, storage_path, target_path, skip_arr_notification, skip_post_import_links, indexer, content_identity
 			FROM import_queue
 			WHERE id = ?
 		`
@@ -419,7 +503,7 @@ func (r *QueueRepository) ClaimNextQueueItem(ctx context.Context) (*ImportQueueI
 		err = txRepo.db.QueryRowContext(ctx, getQuery, itemID).Scan(
 			&item.ID, &item.DownloadID, &item.NzbPath, &item.RelativePath, &item.Category, &item.Priority, &item.Status,
 			&item.CreatedAt, &item.UpdatedAt, &item.StartedAt, &item.CompletedAt,
-			&item.RetryCount, &item.MaxRetries, &item.ErrorMessage, &item.BatchID, &item.Metadata, &item.FileSize, &item.StoragePath, &item.TargetPath, &item.SkipArrNotification, &item.SkipPostImportLinks, &item.Indexer,
+			&item.RetryCount, &item.MaxRetries, &item.ErrorMessage, &item.BatchID, &item.Metadata, &item.FileSize, &item.StoragePath, &item.TargetPath, &item.SkipArrNotification, &item.SkipPostImportLinks, &item.Indexer, &item.ContentIdentity,
 		)
 		if err != nil {
 			return fmt.Errorf("failed to get claimed item: %w", err)

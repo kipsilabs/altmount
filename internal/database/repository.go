@@ -193,15 +193,26 @@ func (r *Repository) ClaimNextQueueItem(ctx context.Context) (*ImportQueueItem, 
 			    started_at = datetime('now'),
 			    updated_at = datetime('now')
 			WHERE id = (
-				SELECT id FROM import_queue
-				WHERE status = 'pending'
-				  AND (started_at IS NULL OR %s < datetime('now'))
-				ORDER BY priority ASC, created_at ASC
+				SELECT q.id FROM import_queue q
+				WHERE q.status = 'pending'
+				  AND (q.started_at IS NULL OR %s < datetime('now'))
+				  AND NOT EXISTS (
+				      SELECT 1 FROM import_queue sibling
+				      WHERE sibling.content_identity IS NOT NULL
+				        AND sibling.content_identity = q.content_identity
+				        AND sibling.file_size = q.file_size
+				        AND sibling.id <> q.id
+				        AND (
+				            sibling.status = 'processing'
+				            OR (sibling.status = 'pending' AND sibling.id < q.id)
+				        )
+				  )
+				ORDER BY q.priority ASC, q.created_at ASC
 				LIMIT 1
 			) AND status = 'pending'
 			RETURNING id, download_id, nzb_path, relative_path, category, priority, status,
 			          created_at, updated_at, started_at, completed_at,
-			          retry_count, max_retries, error_message, batch_id, metadata, file_size, target_path
+			          retry_count, max_retries, error_message, batch_id, metadata, file_size, storage_path, target_path, content_identity
 		`, r.dialect.ColumnPlusMinutes("started_at", 10))
 
 		var item ImportQueueItem
@@ -210,7 +221,7 @@ func (r *Repository) ClaimNextQueueItem(ctx context.Context) (*ImportQueueItem, 
 			&item.Priority, &item.Status, &item.CreatedAt, &item.UpdatedAt,
 			&item.StartedAt, &item.CompletedAt, &item.RetryCount,
 			&item.MaxRetries, &item.ErrorMessage, &item.BatchID,
-			&item.Metadata, &item.FileSize, &item.TargetPath,
+			&item.Metadata, &item.FileSize, &item.StoragePath, &item.TargetPath, &item.ContentIdentity,
 		)
 		if err != nil {
 			if err == sql.ErrNoRows {

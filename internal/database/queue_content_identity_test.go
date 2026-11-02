@@ -21,7 +21,7 @@ func TestFindCompletedByContentIdentity(t *testing.T) {
 	size := int64(1234)
 	identity := "deadbeef"
 	completed := &ImportQueueItem{
-		NzbPath:         "/queue/completed.nzb",
+		NzbPath:         "/queue/7-completed.nzb",
 		StoragePath:     strPtr("/complete/Release"),
 		Status:          QueueStatusCompleted,
 		Priority:        QueuePriorityNormal,
@@ -76,6 +76,32 @@ func TestFindCompletedByContentIdentity(t *testing.T) {
 	require.NoError(t, err)
 	require.Nil(t, match)
 
+	// A re-upload keeps its basename but gets a new temp path. That is an
+	// explicit reprocess and must not be short-circuited to the completed row.
+	match, err = repo.FindCompletedByContentIdentity(ctx, identity, size, "/uploads/completed.nzb")
+	require.NoError(t, err)
+	require.Nil(t, match)
+	// The plain "<dir>/<basename>" suffix matches too.
+	match, err = repo.FindCompletedByContentIdentity(ctx, identity, size, "/uploads/7-completed.nzb")
+	require.NoError(t, err)
+	require.Nil(t, match)
+
+	// In-flight rows are visible to admission so a duplicate can be kept pending
+	// until the first download finishes.
+	inflight, err := repo.FindInFlightByContentIdentity(ctx, identity, size, "/queue/new.nzb")
+	require.NoError(t, err)
+	require.NotNil(t, inflight)
+	require.Equal(t, pending.ID, inflight.ID)
+	require.Equal(t, QueueStatusPending, inflight.Status)
+
+	inflight, err = repo.FindInFlightByContentIdentity(ctx, identity, size, "/queue/pending.nzb")
+	require.NoError(t, err)
+	require.Nil(t, inflight, "same path is an explicit retry, not an in-flight duplicate")
+
+	inflight, err = repo.FindInFlightByContentIdentity(ctx, "", size, "/queue/new.nzb")
+	require.NoError(t, err)
+	require.Nil(t, inflight)
+
 	got, err := repo.GetContentIdentity(ctx, completed.ID)
 	require.NoError(t, err)
 	require.Equal(t, identity, got)
@@ -87,3 +113,75 @@ func TestFindCompletedByContentIdentity(t *testing.T) {
 }
 
 func strPtr(s string) *string { return &s }
+
+// TestClaimNextQueueItemSerialisesIdenticalReleases pins the claim-time half of
+// admission de-duplication: two pending rows with the same identity and size are
+// never claimed together, so the second cannot start a duplicate download. Once
+// the first completes, the second becomes claimable again so it can be adopted
+// (or, if the first failed, retried).
+func TestClaimNextQueueItemSerialisesIdenticalReleases(t *testing.T) {
+	sqlDB, err := sql.Open("sqlite3", ":memory:")
+	require.NoError(t, err)
+	defer sqlDB.Close()
+	setupQueueSchema(t, sqlDB)
+
+	repo := NewQueueRepository(sqlDB, DialectSQLite)
+	ctx := context.Background()
+	size := int64(4096)
+	identity := "same-release"
+
+	first := &ImportQueueItem{
+		NzbPath:         "/queue/first.nzb",
+		Status:          QueueStatusPending,
+		Priority:        QueuePriorityHigh,
+		MaxRetries:      3,
+		FileSize:        &size,
+		ContentIdentity: &identity,
+	}
+	second := &ImportQueueItem{
+		NzbPath:         "/queue/second.nzb",
+		Status:          QueueStatusPending,
+		Priority:        QueuePriorityHigh,
+		MaxRetries:      3,
+		FileSize:        &size,
+		ContentIdentity: &identity,
+	}
+	other := &ImportQueueItem{
+		NzbPath:    "/queue/other.nzb",
+		Status:     QueueStatusPending,
+		Priority:   QueuePriorityLow,
+		MaxRetries: 3,
+	}
+
+	require.NoError(t, repo.AddToQueue(ctx, first))
+	require.NoError(t, repo.SetContentIdentity(ctx, first.ID, identity))
+	require.NoError(t, repo.AddToQueue(ctx, second))
+	require.NoError(t, repo.SetContentIdentity(ctx, second.ID, identity))
+	require.NoError(t, repo.AddToQueue(ctx, other))
+
+	claimed, err := repo.ClaimNextQueueItem(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	require.Equal(t, first.ID, claimed.ID, "only the oldest pending row of an identical group is claimable")
+	require.Equal(t, identity, *claimed.ContentIdentity)
+
+	// While the first is processing, the identical second is held back. The
+	// unrelated row is still claimable.
+	claimed, err = repo.ClaimNextQueueItem(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	require.Equal(t, other.ID, claimed.ID)
+
+	claimed, err = repo.ClaimNextQueueItem(ctx)
+	require.NoError(t, err)
+	require.Nil(t, claimed, "identical release must not be claimed while its sibling is processing")
+
+	// Completing the first releases the second for adoption.
+	require.NoError(t, repo.AddStoragePath(ctx, first.ID, "/complete/Release"))
+	require.NoError(t, repo.UpdateQueueItemStatus(ctx, first.ID, QueueStatusCompleted, nil))
+
+	claimed, err = repo.ClaimNextQueueItem(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	require.Equal(t, second.ID, claimed.ID)
+}

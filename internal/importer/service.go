@@ -817,6 +817,22 @@ func (s *Service) AddToQueue(ctx context.Context, filePath string, relativePath 
 		}
 	}
 
+	// A second admission of the same payload can arrive while the first is
+	// still downloading. Recognise it here and keep the new row pending
+	// deliberately: the claim gate serialises identical releases, and the
+	// worker adopts the first completed import instead of downloading the same
+	// articles twice.
+	var inflight *database.ContentIdentityMatch
+	if allowDedup && duplicate == nil && contentIdentity != "" && fileSize != nil {
+		match, err := s.database.Repository.FindInFlightByContentIdentity(ctx, contentIdentity, *fileSize, filePath)
+		if err != nil {
+			s.log.WarnContext(ctx, "Failed to look up in-flight import for queue de-duplication",
+				"file", filePath, "error", err)
+		} else {
+			inflight = match
+		}
+	}
+
 	itemStatus := database.QueueStatusPending
 	var duplicateStoragePath *string
 	if duplicate != nil {
@@ -865,37 +881,17 @@ func (s *Service) AddToQueue(ctx context.Context, filePath string, relativePath 
 	}
 
 	if duplicate != nil {
-		if err := s.database.Repository.AddStoragePath(ctx, item.ID, duplicate.StoragePath); err != nil {
-			// The existing path could not be attached; fall back to a normal
+		if err := s.completeAsDuplicate(ctx, item, duplicate); err != nil {
+			// The existing storage could not be attached; fall back to a normal
 			// import rather than leaving a completed row with no storage.
-			s.log.WarnContext(ctx, "Failed to attach existing storage path to de-duplicated queue item; importing normally",
+			s.log.WarnContext(ctx, "Failed to complete de-duplicated queue item; importing normally",
 				"queue_id", item.ID, "error", err)
 			duplicate = nil
 			item.Status = database.QueueStatusPending
-			if err := s.database.Repository.UpdateQueueItemStatus(ctx, item.ID, database.QueueStatusPending, nil); err != nil {
-				s.log.WarnContext(ctx, "Failed to return de-duplicated queue item to pending",
-					"queue_id", item.ID, "error", err)
-			}
 		}
 	}
 
 	if duplicate != nil {
-		if err := s.database.Repository.UpdateQueueItemStatus(ctx, item.ID, database.QueueStatusCompleted, nil); err != nil {
-			s.log.WarnContext(ctx, "Failed to mark de-duplicated queue item completed",
-				"queue_id", item.ID, "error", err)
-		}
-		item.StoragePath = &duplicate.StoragePath
-		item.CompletedAt = timePtr(time.Now())
-
-		// The raw NZB is not needed: the new row points at storage the existing
-		// completed import already owns. Mirror handleProcessingSuccess and drop it.
-		if item.NzbPath != "" {
-			if err := os.Remove(item.NzbPath); err != nil && !os.IsNotExist(err) {
-				s.log.WarnContext(ctx, "Failed to delete NZB after de-duplicated import",
-					"queue_id", item.ID, "nzb_path", item.NzbPath, "error", err)
-			}
-		}
-
 		s.log.InfoContext(ctx, "De-duplicated queue admission to existing completed import",
 			"file", filePath, "queue_id", item.ID, "existing_queue_id", duplicate.ID,
 			"storage_path", duplicate.StoragePath, "file_size", *fileSize)
@@ -907,11 +903,19 @@ func (s *Service) AddToQueue(ctx context.Context, filePath string, relativePath 
 		return item, nil
 	}
 
+	if inflight != nil {
+		s.log.InfoContext(ctx, "Identical release already in flight; keeping duplicate admission pending until it completes",
+			"file", filePath, "queue_id", item.ID, "in_flight_queue_id", inflight.ID,
+			"in_flight_status", inflight.Status)
+	}
+
 	if s.broadcaster != nil {
 		s.broadcaster.BroadcastQueueChanged()
 	}
 
-	if s.queueManager != nil {
+	// No point waking a worker for a row the claim gate will hold back while its
+	// in-flight sibling owns the identity.
+	if s.queueManager != nil && inflight == nil {
 		s.queueManager.NotifyNewItem()
 	}
 
@@ -1338,28 +1342,12 @@ func (s *Service) regenerateNzbFile(ctx context.Context, item *database.ImportQu
 		return fmt.Errorf("raw NZB file is missing and no metadata service is available to regenerate it")
 	}
 
-	cfg := s.configGetter()
-	configDir := filepath.Dir(cfg.Database.Path)
-	if !filepath.IsAbs(configDir) {
-		if abs, err := filepath.Abs(configDir); err == nil {
-			configDir = abs
-		}
-	}
-
-	var categoryStr string
-	if item.Category != nil && *item.Category != "" {
-		categoryStr = strings.ReplaceAll(*item.Category, `\`, "/")
-		categoryStr = strings.Trim(categoryStr, "/")
-		for _, part := range strings.Split(categoryStr, "/") {
-			if part == ".." || part == "." {
-				categoryStr = ""
-				break
-			}
-		}
-	}
-
+	configDir := s.nzbConfigDir()
 	nzbBase := nzbtrim.TrimNzbExtension(filepath.Base(item.NzbPath))
-	storeRef := filepath.Join(configDir, ".nzbs", categoryStr, fmt.Sprintf("%d-%s.nzbz", item.ID, nzbBase))
+	storeRef := nzbStoreRef(configDir, item.Category, item.ID, item.NzbPath)
+	if storeRef == "" {
+		return fmt.Errorf("cannot derive the .nzbz store path for queue item %d", item.ID)
+	}
 
 	nzbXML, err := s.metadataService.Store().RegenerateNZB(storeRef)
 	if err != nil {
@@ -1399,6 +1387,167 @@ func (s *Service) regenerateNzbFile(ctx context.Context, item *database.ImportQu
 
 	s.log.InfoContext(ctx, "Regenerated raw NZB from metadata store", "old_path", oldPath, "new_path", newPath, "store_ref", storeRef)
 	return nil
+}
+
+// nzbConfigDir returns the absolute config directory that holds the .nzbs store.
+func (s *Service) nzbConfigDir() string {
+	cfg := s.configGetter()
+	if cfg == nil {
+		return ""
+	}
+	configDir := filepath.Dir(cfg.Database.Path)
+	if !filepath.IsAbs(configDir) {
+		if abs, err := filepath.Abs(configDir); err == nil {
+			configDir = abs
+		}
+	}
+	return configDir
+}
+
+// sanitizedNzbStoreCategory mirrors the category handling in processor.go so a
+// computed store path matches the one the importer writes.
+func sanitizedNzbStoreCategory(category *string) string {
+	if category == nil || *category == "" {
+		return ""
+	}
+	categoryStr := strings.ReplaceAll(*category, `\`, "/")
+	categoryStr = strings.Trim(categoryStr, "/")
+	for _, part := range strings.Split(categoryStr, "/") {
+		if part == ".." || part == "." {
+			return ""
+		}
+	}
+	return categoryStr
+}
+
+// nzbStoreRef returns the .nzbz path for a queue row, matching the layout
+// processor.go writes and regenerateNzbFile reads:
+// <configDir>/.nzbs/<category>/<queueID>-<nzbBase>.nzbz.
+func nzbStoreRef(configDir string, category *string, itemID int64, nzbPath string) string {
+	if configDir == "" || itemID <= 0 || nzbPath == "" {
+		return ""
+	}
+	base := nzbtrim.TrimNzbExtension(filepath.Base(nzbPath))
+	return filepath.Join(configDir, ".nzbs", sanitizedNzbStoreCategory(category), fmt.Sprintf("%d-%s.nzbz", itemID, base))
+}
+
+// copyNzbStoreForDuplicate copies the source row's .nzbz store to the path this
+// queue row will read when a retry has to regenerate its raw NZB. It reports
+// whether the copy succeeded; on failure the caller keeps the raw NZB so retry
+// still works.
+//
+// The copy is deliberately not ref-counted: ref counts track .meta files that
+// reference a store, and no metadata refers to this copy until a retry writes
+// it. Incrementing here would pin a reference that nothing ever releases, so
+// the store would survive even after the retried import is deleted.
+func (s *Service) copyNzbStoreForDuplicate(ctx context.Context, item *database.ImportQueueItem, source *database.CompletedContentMatch) bool {
+	if source == nil {
+		return false
+	}
+	configDir := s.nzbConfigDir()
+	src := nzbStoreRef(configDir, source.Category, source.ID, source.NzbPath)
+	dst := nzbStoreRef(configDir, item.Category, item.ID, item.NzbPath)
+	if src == "" || dst == "" {
+		return false
+	}
+	if src == dst {
+		return true
+	}
+	if err := copyFileContents(src, dst); err != nil {
+		s.log.WarnContext(ctx, "Could not copy NZB store for de-duplicated queue item; keeping raw NZB so retry can regenerate it",
+			"queue_id", item.ID, "source_queue_id", source.ID,
+			"source_store_ref", src, "target_store_ref", dst, "error", err)
+		return false
+	}
+	return true
+}
+
+// copyFileContents copies src to dst, creating parent directories as needed.
+func copyFileContents(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return fmt.Errorf("open source store: %w", err)
+	}
+	defer in.Close()
+
+	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+		return fmt.Errorf("create target store directory: %w", err)
+	}
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		return fmt.Errorf("create target store: %w", err)
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		_ = os.Remove(dst)
+		return fmt.Errorf("copy store: %w", err)
+	}
+	if err := out.Close(); err != nil {
+		_ = os.Remove(dst)
+		return fmt.Errorf("close target store: %w", err)
+	}
+	return nil
+}
+
+// completeAsDuplicate finishes item without downloading by pointing it at the
+// storage an already-completed import owns. It copies that import's .nzbz store
+// so POST /queue/{id}/retry can rebuild the raw NZB after it is dropped; when the
+// copy is not possible the raw NZB is kept for the same reason.
+func (s *Service) completeAsDuplicate(ctx context.Context, item *database.ImportQueueItem, source *database.CompletedContentMatch) error {
+	if source == nil {
+		return fmt.Errorf("no completed import to de-duplicate against")
+	}
+	if err := s.database.Repository.AddStoragePath(ctx, item.ID, source.StoragePath); err != nil {
+		return fmt.Errorf("attach storage path: %w", err)
+	}
+	if err := s.database.Repository.UpdateQueueItemStatus(ctx, item.ID, database.QueueStatusCompleted, nil); err != nil {
+		return fmt.Errorf("mark queue item completed: %w", err)
+	}
+
+	item.StoragePath = &source.StoragePath
+	item.CompletedAt = timePtr(time.Now())
+
+	if !s.copyNzbStoreForDuplicate(ctx, item, source) {
+		// Retry can still regenerate from the raw NZB that stays on disk.
+		return nil
+	}
+	if item.NzbPath != "" {
+		if err := os.Remove(item.NzbPath); err != nil && !os.IsNotExist(err) {
+			s.log.WarnContext(ctx, "Failed to delete NZB after de-duplicated import",
+				"queue_id", item.ID, "nzb_path", item.NzbPath, "error", err)
+		}
+	}
+	return nil
+}
+
+// AdoptCompletedItem implements queue.ItemAdopter. A claimed row whose payload
+// arrived while the same release was already in flight can be satisfied from
+// the import that won the race instead of downloading it again. The lookup uses
+// the same path/basename exclusion as admission, so an explicit re-upload keeps
+// its normal reprocess behaviour and a retry (which already has a storage path)
+// is never short-circuited.
+func (s *Service) AdoptCompletedItem(ctx context.Context, item *database.ImportQueueItem) (bool, error) {
+	if item == nil || item.StoragePath != nil || item.ContentIdentity == nil || *item.ContentIdentity == "" || item.FileSize == nil {
+		return false, nil
+	}
+	match, err := s.database.Repository.FindCompletedByContentIdentity(ctx, *item.ContentIdentity, *item.FileSize, item.NzbPath)
+	if err != nil {
+		return false, err
+	}
+	if match == nil {
+		return false, nil
+	}
+	if err := s.completeAsDuplicate(ctx, item, match); err != nil {
+		return false, err
+	}
+
+	s.log.InfoContext(ctx, "Adopted completed import instead of downloading the duplicate release",
+		"queue_id", item.ID, "existing_queue_id", match.ID, "storage_path", match.StoragePath)
+	if s.broadcaster != nil {
+		s.broadcaster.NotifyComplete(int(item.ID), "completed")
+		s.broadcaster.BroadcastQueueChanged()
+	}
+	return true, nil
 }
 
 // buildCategoryPath resolves a category name to its configured directory path (memoized).
