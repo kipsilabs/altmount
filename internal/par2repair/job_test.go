@@ -762,8 +762,10 @@ func TestRunJobCorruptOverflowFallsBackToReplan(t *testing.T) {
 		t.Fatal("repair across corrupt-overflow replans not byte-exact")
 	}
 	// The replans really happened: present articles were swept more than once.
-	if n := fx.fetch.countFetches("<a.rar-0@test>"); n < 2 {
-		t.Fatalf("article <a.rar-0@test> fetched %d times, want >=2 (replan re-sweeps)", n)
+	// Which file is read first depends on the recovery set's order, so ask about
+	// the first article of each.
+	if n := max(fx.fetch.countFetches("<a.rar-0@test>"), fx.fetch.countFetches("<b.rar-0@test>")); n < 2 {
+		t.Fatalf("first article of each file fetched at most %d times, want >=2 (replan re-sweeps)", n)
 	}
 }
 
