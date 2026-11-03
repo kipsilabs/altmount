@@ -118,8 +118,8 @@ func TestSolveAgainstRealToolRecovery(t *testing.T) {
 	idx, raw := loadRealToolSet(t)
 	sliceSize := int(idx.SliceSize)
 
-	// Build the global slice array in recovery-set order (RecoveryIDs is
-	// FileID-ascending, matching the PAR2 spec's global slice numbering).
+	// Build the global slice array in recovery-set order (RecoveryIDs keeps
+	// the Main packet's order, which is the PAR2 global slice numbering).
 	var slices [][]byte
 	for _, id := range idx.RecoveryIDs {
 		fd := idx.Files[id]

@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"sort"
 	"strings"
 )
 
@@ -37,7 +36,7 @@ type RecoverySliceRef struct {
 // needed to plan and run a repair except the recovery payloads themselves.
 type Index struct {
 	SliceSize   uint64
-	RecoveryIDs [][16]byte // recovery-set FileIDs, FileID-ascending
+	RecoveryIDs [][16]byte // recovery-set FileIDs in Main packet order, which numbers the global slices
 	Files       map[[16]byte]FileDescriptor
 	SliceChecks map[[16]byte][]SliceCheck
 	Recovery    []RecoverySliceRef
@@ -274,9 +273,6 @@ func parseMainBody(r io.Reader, bodyLen int64, idx *Index) error {
 			return fmt.Errorf("read recovery-set FileID %d: %w", i, err)
 		}
 	}
-	sort.Slice(idx.RecoveryIDs, func(i, j int) bool {
-		return bytes.Compare(idx.RecoveryIDs[i][:], idx.RecoveryIDs[j][:]) < 0
-	})
 	return nil
 }
 

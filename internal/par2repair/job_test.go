@@ -192,6 +192,80 @@ func TestRunJobRepairsDeadArticle(t *testing.T) {
 	}
 }
 
+// Solving for two or more slices depends on every slice's position in the
+// recovery set, which is defined by the Main packet's file order. A set whose
+// order differs from a byte-wise sort of the FileIDs must still repair.
+func TestRunJobRepairsSeveralSlicesInMainPacketOrder(t *testing.T) {
+	rng := rand.New(rand.NewSource(13))
+	const sliceSize, artSize, fileSize = 1024, 1024, 4096
+	entries := make([]par2gen.FileEntry, 8)
+	contents := map[string][]byte{}
+	for i := range entries {
+		name := fmt.Sprintf("r.part%d.rar", i)
+		content := make([]byte, fileSize)
+		rng.Read(content)
+		contents[name] = content
+		entries[i] = par2gen.FileEntry{Name: name, Content: content}
+	}
+	set := par2gen.BuildFull(sliceSize, entries, 8)
+
+	streams := []io.Reader{bytes.NewReader(set.Index)}
+	for _, v := range set.Volumes {
+		streams = append(streams, bytes.NewReader(v))
+	}
+	idx, err := par2.ParseIndex(streams)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slices.IsSortedFunc(idx.RecoveryIDs, func(a, b [16]byte) int { return bytes.Compare(a[:], b[:]) }) {
+		t.Fatal("fixture order matches a byte-wise sort, so it cannot catch a re-sort")
+	}
+
+	// One dead article in each of two files: two unknown slices.
+	dead := map[string][]byte{}
+	fetch := &fakeFetcher{articles: map[string][]byte{}}
+	var files []SetFile
+	for id, fd := range idx.Files {
+		sf := SetFile{FileID: id, Length: fd.Length}
+		for i := range fileSize / artSize {
+			msgID := fmt.Sprintf("<%s-%d@test>", fd.Name, i)
+			payload := contents[fd.Name][i*artSize : (i+1)*artSize]
+			isDead := i == 1 && (fd.Name == "r.part0.rar" || fd.Name == "r.part5.rar")
+			if isDead {
+				dead[msgID] = payload
+			} else {
+				fetch.articles[msgID] = payload
+			}
+			sf.Articles = append(sf.Articles, Article{MessageID: msgID, Size: artSize, Dead: isDead})
+		}
+		files = append(files, sf)
+	}
+	var par2Files []SetFile
+	for i, p := range append([][]byte{set.Index}, set.Volumes...) {
+		msgID := fmt.Sprintf("<par2-%d@test>", i)
+		fetch.articles[msgID] = p
+		par2Files = append(par2Files, SetFile{
+			Length:   uint64(len(p)),
+			Articles: []Article{{MessageID: msgID, Size: int64(len(p))}},
+		})
+	}
+
+	plan, err := BuildPlan(idx, files, Caps{MaxRepairRatio: 0.5, MaxMemoryBytes: 64 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewPatchStore(t.TempDir())
+	if err := RunJob(context.Background(), plan, idx, par2Files, fetch, store, testLogger()); err != nil {
+		t.Fatal(err)
+	}
+	for msgID, want := range dead {
+		got, ok := store.Get(msgID)
+		if !ok || !bytes.Equal(got, want) {
+			t.Fatalf("patch for %s missing or not byte-exact", msgID)
+		}
+	}
+}
+
 // concurrencyFetcher records the peak number of Fetch calls in flight.
 type concurrencyFetcher struct {
 	inner *fakeFetcher
@@ -688,8 +762,10 @@ func TestRunJobCorruptOverflowFallsBackToReplan(t *testing.T) {
 		t.Fatal("repair across corrupt-overflow replans not byte-exact")
 	}
 	// The replans really happened: present articles were swept more than once.
-	if n := fx.fetch.countFetches("<a.rar-0@test>"); n < 2 {
-		t.Fatalf("article <a.rar-0@test> fetched %d times, want >=2 (replan re-sweeps)", n)
+	// Which file is read first depends on the recovery set's order, so ask about
+	// the first article of each.
+	if n := max(fx.fetch.countFetches("<a.rar-0@test>"), fx.fetch.countFetches("<b.rar-0@test>")); n < 2 {
+		t.Fatalf("first article of each file fetched at most %d times, want >=2 (replan re-sweeps)", n)
 	}
 }
 

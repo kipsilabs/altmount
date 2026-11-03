@@ -87,7 +87,7 @@ type Plan struct {
 	Missing       []int // global slice indices, ascending
 	Recovery      []par2.RecoverySliceRef
 	SpareRecovery []par2.RecoverySliceRef
-	Files         []SetFile // recovery-set order (FileID ascending)
+	Files         []SetFile // recovery-set order (Main packet order)
 	DeadArticles  []DeadArticle
 	// PartialRecovery is set when the PAR2 parse stopped early, so running out
 	// of rows doesn't yet mean the set can't repair this file.

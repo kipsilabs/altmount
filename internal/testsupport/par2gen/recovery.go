@@ -5,6 +5,7 @@ import (
 	"crypto/md5"
 	"encoding/binary"
 	"hash/crc32"
+	"slices"
 	"sort"
 	"sync"
 
@@ -37,9 +38,13 @@ func BuildFull(sliceSize int, entries []FileEntry, numRecovery int) FullSet {
 		id, h16k := fileIdentity(e)
 		members[i] = member{entry: e, fileID: id, hash16k: h16k}
 	}
-	// Recovery-set order: FileID ascending.
+	// Recovery-set order: FileID ascending as a little-endian integer, the way
+	// par2cmdline compares them (last byte most significant).
 	sort.Slice(members, func(i, j int) bool {
-		return bytes.Compare(members[i].fileID[:], members[j].fileID[:]) < 0
+		a, b := members[i].fileID, members[j].fileID
+		slices.Reverse(a[:])
+		slices.Reverse(b[:])
+		return bytes.Compare(a[:], b[:]) < 0
 	})
 
 	// Split every file into zero-padded slices, in recovery-set order.
