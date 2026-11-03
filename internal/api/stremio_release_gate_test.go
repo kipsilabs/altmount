@@ -3,8 +3,6 @@ package api
 import (
 	"context"
 	"testing"
-
-	"github.com/kipsilabs/altmount/internal/prowlarr"
 )
 
 // Real release names captured from a live addon query for
@@ -112,45 +110,43 @@ func TestReleaseMatchesContent_FailOpenWithoutMetadata(t *testing.T) {
 	}
 }
 
-func TestTokenCoverage(t *testing.T) {
-	expected := titleTokens("Killers of the Flower Moon")
-	if len(expected) != 3 {
-		t.Fatalf("expected 3 content tokens (stopwords dropped), got %v", expected)
-	}
-	full := titleTokens("killers flower moon extras")
-	if c := tokenCoverage(full, expected); c != 1 {
-		t.Errorf("coverage = %v, want 1", c)
-	}
-	partial := titleTokens("killers moon")
-	if c := tokenCoverage(partial, expected); c >= 0.8 {
-		t.Errorf("coverage = %v, want < %v", c, minReleaseTokenCoverage)
-	}
-}
-
-// TestFilterIntegration_OrderingKeepsCachedFirst verifies the wiring shape used
-// inside searchStremioReleases: cached releases bypass the gate, uncached ones
-// are filtered.
-func TestFilterIntegration_OrderingKeepsCachedFirst(t *testing.T) {
-	cached := prowlarr.NZBResult{Title: "Some.Cached.Release.Name.2023.1080p-GROUP"}
-	fresh := prowlarr.NZBResult{Title: "Killers.of.the.Flower.Moon.2023.PROPER.BluRay.1080p-GROUP"}
-	junk := prowlarr.NZBResult{Title: "American.Dilemma.2023.1080p.WEB.h264-BAE"}
-
-	results := []prowlarr.NZBResult{cached, fresh, junk}
-	kept := make([]prowlarr.NZBResult, 0, len(results))
-	var droppedNames []string
-	for _, r := range results {
-		if r == cached { // trusted import bypasses the gate
-			kept = append(kept, r)
-			continue
-		}
-		if releaseMatchesContent("movie", r.Title, kotfmCanonicalTitle, kotfmCanonicalYear, 0, 0) {
-			kept = append(kept, r)
-			continue
-		}
-		droppedNames = append(droppedNames, r.Title)
-	}
-	if len(kept) != 2 || len(droppedNames) != 1 || droppedNames[0] != junk.Title {
-		t.Fatalf("unexpected filtering result: kept=%d dropped=%v", len(kept), droppedNames)
+func TestReleaseMatchesContentRejectsConflicts(t *testing.T) {
+	for _, tc := range []struct {
+		name, kind, release, title, year string
+		season, episode                  int
+		want                             bool
+	}{
+		{"unrelated spinoff", "series", "Fear.The.Walking.Dead.S01E01.1080p", "The Walking Dead", "", 1, 1, false},
+		{"missing series title", "series", "S02E01.1080p", "Black Clover", "", 2, 1, false},
+		{"missing movie title", "movie", "2023.1080p", kotfmCanonicalTitle, kotfmCanonicalYear, 0, 0, false},
+		{"numeric movie title", "movie", "1917.2019.1080p", "1917", "2019", 0, 0, true},
+		{"numeric movie title without year", "movie", "2012.1080p", "2012", "2009", 0, 0, true},
+		{"numeric series title", "series", "1923.S01E01.1080p", "1923", "", 1, 1, true},
+		{"different numeric title", "movie", "1917.2019.1080p", "2012", "2009", 0, 0, false},
+		{"plain movie filename", "movie", "Alien.mkv", "Alien", "1979", 0, 0, true},
+		{"plain nzb filename", "movie", "Alien.nzb.gz", "Alien", "1979", 0, 0, true},
+		{"different plain movie filename", "movie", "Alien.Covenant.mkv", "Alien", "1979", 0, 0, false},
+		{"wrong episode", "series", "Black.Clover.S02E02.1080p", "Black Clover", "", 2, 1, false},
+		{"wrong season", "series", "Black.Clover.S03E01.1080p", "Black Clover", "", 2, 1, false},
+		{"matching multi season pack", "series", "Black.Clover.S01-S03.1080p", "Black Clover", "", 2, 19, true},
+		{"outside multi season pack", "series", "Black.Clover.S01-S03.1080p", "Black Clover", "", 4, 1, false},
+		{"partial word is not alias", "series", "Dark.S01E01.1080p", "The Ark", "", 1, 1, false},
+		{"wrong season pack", "series", "Black.Clover.S03.1080p", "Black Clover", "", 2, 1, false},
+		{"different show sharing title", "series", "ARK.The.Animated.Series.S01E01.1080p", "The Ark", "", 1, 1, false},
+		{"different movie sharing title", "movie", "Alien.Covenant.2017.1080p", "Alien", "", 0, 0, false},
+		{"matching episode", "series", "Black.Clover.S02E01.1080p", "Black Clover", "", 2, 1, true},
+		{"matching season pack", "series", "Black.Clover.S02.1080p", "Black Clover", "", 2, 19, true},
+		{"matching episode range", "series", "Black.Clover.S02E01-E03.1080p", "Black Clover", "", 2, 2, true},
+		{"outside episode range", "series", "Black.Clover.S02E01-E03.1080p", "Black Clover", "", 2, 4, false},
+		{"tagged wrong episode", "series", "[Group] Black.Clover.S02E02.1080p", "Black Clover", "", 2, 1, false},
+		{"tagged correct episode", "series", "[Group] Black.Clover.S02E01.1080p", "Black Clover", "", 2, 1, true},
+		{"tagged conflicting year", "movie", "REMUX.2160p.Killers.of.the.Flower.Moon.2019.1080p", kotfmCanonicalTitle, kotfmCanonicalYear, 0, 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := releaseMatchesContent(tc.kind, tc.release, tc.title, tc.year, tc.season, tc.episode); got != tc.want {
+				t.Fatalf("releaseMatchesContent(%q) = %v, want %v", tc.release, got, tc.want)
+			}
+		})
 	}
 }
 
@@ -177,10 +173,10 @@ func TestReleaseMatchesContentAnimeAliasesAndAbsolute(t *testing.T) {
 		{"toonshub EP prefix matches catalog absolute", "Detective.Conan.EP1210.Episode.1210.1080p.NF.WEB-DL.JPN.AAC2.0.H.264.MSubs-ToonsHub", 99, 1210, absCtx, true},
 		{"english alias title match via standard path", "Detective.Conan.S01E01.The.Roller.Coaster.Murder.Case.1080p.CR.WEB-DL.VARYG", 1, 1, ctx, true},
 		{"legacy baseline without aliases or anime flag rejects", "[SubsPlease] Detective Conan - 1210 (1080p)", 99, 1210, releaseMatchContext{}, false},
-		// Known looseness (pre-existing): once an English alias exists, the
-		// token-coverage fallback accepts absolute-numbered releases even
-		// without the anime path. Documented, not introduced here.
-		{"alias coverage accepts absolute without anime flag", "[SubsPlease] Detective Conan - 1210 (1080p)", 99, 1210, ctx, true},
+		{"alias matches absolute episode", "[SubsPlease] Detective Conan - 1210 (1080p)", 99, 1210, ctx, true},
+		{"wrong absolute episode", "[SubsPlease] Detective Conan - 1211 (1080p)", 99, 1210, absCtx, false},
+		{"relative episode is not franchise absolute", "[SubsPlease] Detective Conan - 23 (1080p)", 5, 23, absCtx, false},
+		{"EP prefix wrong absolute", "Detective.Conan.EP1211.Episode.1211.1080p", 99, 1210, absCtx, false},
 		{"unrelated series sharing S/E rejected", "One.Piece.S01E01.1080p.WEB-DL.GROUP", 1, 1, absCtx, false},
 		{"ARK vs The Ark regression guarded", "ARK.The.Animated.Series.S01E01.1080p.WEB-DL.DDP5.1.H.264-GROUP", 1, 1, releaseMatchContext{}, false},
 	}
@@ -196,5 +192,14 @@ func TestReleaseMatchesContentAnimeAliasesAndAbsolute(t *testing.T) {
 func TestResolveSeriesTitleAliasesCacheNilSafe(t *testing.T) {
 	if resolveSeriesTitleAliases(context.Background(), "", "test-agent") != nil {
 		t.Fatal("empty imdb must yield nil aliases")
+	}
+}
+
+func TestReleaseMatchesContentKnownCreatorAlias(t *testing.T) {
+	ctx := releaseMatchContext{aliases: []string{"I Will Find You", "Harlan Cobens I Will Find You"}}
+	for _, name := range []string{"I.Will.Find.You.S01E01.1080p", "Harlan.Cobens.I.Will.Find.You.S01E01.1080p"} {
+		if !releaseMatchesContent("series", name, "Harlan Coben's I Will Find You", "", 1, 1, ctx) {
+			t.Fatalf("known alias rejected: %s", name)
+		}
 	}
 }

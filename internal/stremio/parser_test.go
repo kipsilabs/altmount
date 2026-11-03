@@ -112,8 +112,10 @@ func TestMatchesSeries(t *testing.T) {
 	t.Run("Accepts I Will Find You releases", func(t *testing.T) {
 		assert.True(t, MatchesSeries("I.Will.Find.You.S01E01.1080p.NF.WEB-DL.DDP5.1.Atmos.H.264-FLUX", "I Will Find You", 1, 1, 2026))
 		assert.True(t, MatchesSeries("I.Will.Find.You.S01E01.1080p.NF.WEB-DL.DD+5.1.Atmos.H.264-playWEB", "I Will Find You", 1, 1, 2026))
-		assert.True(t, MatchesSeries("I.Will.Find.You.S01E01.1080p.NF.WEB-DL.DDP5.1.Atmos.H.264-FLUX", "Harlan Coben's I Will Find You", 1, 1, 2026))
-		assert.True(t, MatchesSeries("Harlan.Cobens.I.Will.Find.You.S01E01.1080p.NF.WEB-DL-FLUX", "I Will Find You", 1, 1, 2026))
+	})
+	t.Run("Requires explicit aliases for creator-prefixed titles", func(t *testing.T) {
+		assert.False(t, MatchesSeries("I.Will.Find.You.S01E01.1080p.NF.WEB-DL.DDP5.1.Atmos.H.264-FLUX", "Harlan Coben's I Will Find You", 1, 1, 2026))
+		assert.False(t, MatchesSeries("Harlan.Cobens.I.Will.Find.You.S01E01.1080p.NF.WEB-DL-FLUX", "I Will Find You", 1, 1, 2026))
 	})
 }
 

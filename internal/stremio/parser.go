@@ -12,6 +12,7 @@ import (
 )
 
 var (
+	releaseExtensionRegex = regexp.MustCompile(`(?i)\.(?:nzb(?:\.gz)?|mkv|mp4|m4v|avi|mov|wmv|ts|m2ts|mpg|mpeg|webm)$`)
 	// Matches season/episode patterns like S01E02, S1E2, 1x02, Season 1 Episode 2,
 	// S01E01-E02, S01E01E02, 7x23-24. Seasons up to three digits are supported
 	// (One Piece S004, S011-style padding).
@@ -19,6 +20,8 @@ var (
 
 	// Matches season packs like S01, Season 1 (without trailing episode)
 	seasonPackRegex = regexp.MustCompile(`(?i)(?:^|[\. _\-\(\[]+)(?:s(\d{1,3})|season[\. _\-]?(\d{1,3}))(?:[\. _\-\)\]]+|$)`)
+
+	seasonRangeTailRegex = regexp.MustCompile(`(?i)^[ ._]*(?:-|~|to)[ ._-]*(?:s|season[ ._-]*)?(\d{1,3})(?:[ ._()\[\]-]|$)`)
 
 	// Matches 4-digit release year: (1990)-(2099)
 	yearRegex = regexp.MustCompile(`\b(19\d{2}|20\d{2})\b`)
@@ -42,7 +45,8 @@ var (
 	// Matches "Title - NN" boundaries used by absolute-numbered anime files:
 	// the episode number is dash-delimited and terminated by another dash
 	// segment, a technical bracket, or end of title.
-	absoluteEpisodeRegex = regexp.MustCompile(`(?:^|\s)-\s+(\d{1,4})(?:\s+-|\s*\[|\s*\(|$)`)
+	absoluteEpisodeRegex       = regexp.MustCompile(`(?:^|\s)-\s+(\d{1,4})(?:\s+-|\s*\[|\s*\(|$)`)
+	absoluteEpisodePrefixRegex = regexp.MustCompile(`(?i)[ ._-]ep[ ._-]?(\d{1,4})(?:[ ._-]|$)`)
 )
 
 // ParsedRelease contains parsed metadata from a scene/P2P release title.
@@ -50,6 +54,7 @@ type ParsedRelease struct {
 	SeriesTitle  string
 	CleanTitle   string
 	Season       int
+	SeasonEnd    int
 	EpisodeStart int
 	EpisodeEnd   int
 	Year         int
@@ -59,9 +64,15 @@ type ParsedRelease struct {
 // ParseReleaseTitle parses a release title into its structured components.
 func ParseReleaseTitle(title string) ParsedRelease {
 	res := ParsedRelease{}
-	clean := strings.TrimSpace(title)
+	clean := releaseExtensionRegex.ReplaceAllString(strings.TrimSpace(title), "")
 	if clean == "" {
 		return res
+	}
+
+	years := yearRegex.FindAllStringIndex(clean, -1)
+	// A leading year-shaped token can be the title itself (1917, 1923).
+	if len(years) > 0 && years[0][0] == 0 {
+		years = years[1:]
 	}
 
 	// 1. Try matching Season & Episode
@@ -96,10 +107,20 @@ func ParseReleaseTitle(title string) ParsedRelease {
 		res.IsSeasonPack = true
 
 		matches := seasonPackRegex.FindStringSubmatch(clean)
+		indices := seasonPackRegex.FindStringSubmatchIndex(clean)
+		var seasonEnd int
 		if len(matches) > 1 && matches[1] != "" {
 			res.Season, _ = strconv.Atoi(matches[1])
+			seasonEnd = indices[3]
 		} else if len(matches) > 2 && matches[2] != "" {
 			res.Season, _ = strconv.Atoi(matches[2])
+			seasonEnd = indices[5]
+		}
+		if tail := seasonRangeTailRegex.FindStringSubmatch(clean[seasonEnd:]); len(tail) > 1 {
+			end, _ := strconv.Atoi(tail[1])
+			if end >= res.Season {
+				res.SeasonEnd = end
+			}
 		}
 	} else if episode, seriesPart, ok := detectAbsoluteEpisode(clean); ok {
 		// Absolute-numbered anime release (e.g. "Naruto Shippuden - 107 - ...").
@@ -107,9 +128,9 @@ func ParseReleaseTitle(title string) ParsedRelease {
 		res.SeriesTitle = seriesPart
 		res.EpisodeStart = episode
 		res.EpisodeEnd = episode
-	} else if loc := yearRegex.FindStringSubmatchIndex(clean); loc != nil {
-		// Movie: title is before year
-		rawSeries := clean[:loc[0]]
+	} else if len(years) > 0 {
+		// Movie: title is before the release year.
+		rawSeries := clean[:years[0][0]]
 		res.SeriesTitle = strings.TrimSpace(strings.Trim(rawSeries, ".-_ ()[]"))
 	} else if loc := qualityTagsRegex.FindStringSubmatchIndex(clean); loc != nil {
 		// Unstructured: title is before quality tags
@@ -119,13 +140,13 @@ func ParseReleaseTitle(title string) ParsedRelease {
 	}
 
 	// 2. Extract Year if present
-	if yMatches := yearRegex.FindStringSubmatch(clean); len(yMatches) > 1 {
-		res.Year, _ = strconv.Atoi(yMatches[1])
+	if len(years) > 0 {
+		res.Year, _ = strconv.Atoi(clean[years[0][0]:years[0][1]])
 	}
 
 	// Strip trailing year from series title if present (e.g., "The Ark (2023)" -> "The Ark")
 	if res.SeriesTitle != "" {
-		res.SeriesTitle = yearRegex.ReplaceAllString(res.SeriesTitle, "")
+		res.SeriesTitle = stripTitleYears(res.SeriesTitle)
 		res.SeriesTitle = strings.TrimSpace(strings.Trim(res.SeriesTitle, ".-_ ()[]"))
 	}
 
@@ -212,6 +233,9 @@ func detectAbsoluteEpisode(title string) (episode int, series string, ok bool) {
 
 	loc := absoluteEpisodeRegex.FindStringSubmatchIndex(rest)
 	if loc == nil {
+		loc = absoluteEpisodePrefixRegex.FindStringSubmatchIndex(rest)
+	}
+	if loc == nil {
 		return 0, "", false
 	}
 	n, err := strconv.Atoi(rest[loc[2]:loc[3]])
@@ -231,6 +255,13 @@ func detectAbsoluteEpisode(title string) (episode int, series string, ok bool) {
 		return 0, "", false
 	}
 	return n, series, true
+}
+
+func stripTitleYears(title string) string {
+	if loc := yearRegex.FindStringIndex(title); loc != nil && loc[0] == 0 {
+		return title[:loc[1]] + yearRegex.ReplaceAllString(title[loc[1]:], " ")
+	}
+	return yearRegex.ReplaceAllString(title, " ")
 }
 
 // CleanSeriesTitle normalizes a title matching Sonarr/Prowlarr's CleanSeriesTitle:
@@ -257,7 +288,7 @@ func CleanSeriesTitle(title string) string {
 	}
 
 	// Strip year
-	normStr = yearRegex.ReplaceAllString(normStr, " ")
+	normStr = stripTitleYears(strings.TrimSpace(normStr))
 
 	// Strip leading articles
 	trimmed := strings.TrimSpace(normStr)
@@ -289,21 +320,15 @@ func MatchesSeries(releaseTitle, expectedTitle string, expectedSeason, expectedE
 
 	// 1. Title verification (Prowlarr/Sonarr 1:1 clean title comparison)
 	cleanExpected := CleanSeriesTitle(expectedTitle)
-	if cleanExpected != "" && parsed.CleanTitle != "" {
-		if parsed.CleanTitle != cleanExpected {
-			// Support author/creator/franchise prefix aliases (e.g. "Harlan Coben's I Will Find You" vs "I Will Find You")
-			isPrefixAlias := (len(cleanExpected) > len(parsed.CleanTitle) && strings.HasSuffix(cleanExpected, parsed.CleanTitle)) ||
-				(len(parsed.CleanTitle) > len(cleanExpected) && strings.HasSuffix(parsed.CleanTitle, cleanExpected))
-			if !isPrefixAlias {
-				return false
-			}
-		}
+	if cleanExpected == "" || parsed.CleanTitle != cleanExpected {
+		return false
 	}
 
 	// 2. Episode verification
 	if expectedSeason > 0 && expectedEpisode > 0 {
 		if parsed.Season > 0 {
-			if parsed.Season != expectedSeason {
+			lastSeason := max(parsed.Season, parsed.SeasonEnd)
+			if expectedSeason < parsed.Season || expectedSeason > lastSeason {
 				return false
 			}
 			if !parsed.IsSeasonPack {
@@ -344,10 +369,8 @@ func MatchesMovie(releaseTitle, expectedTitle string, expectedYear int) bool {
 	parsed := ParseReleaseTitle(releaseTitle)
 	cleanExpected := CleanSeriesTitle(expectedTitle)
 
-	if cleanExpected != "" && parsed.CleanTitle != "" {
-		if parsed.CleanTitle != cleanExpected {
-			return false
-		}
+	if cleanExpected == "" || parsed.CleanTitle != cleanExpected {
+		return false
 	}
 
 	if expectedYear > 0 && parsed.Year > 0 {

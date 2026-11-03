@@ -1,12 +1,15 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -26,12 +29,21 @@ func TestStremioSkipSearchWhenCached(t *testing.T) {
 		age                                 time.Duration
 		library, wantCached                 bool
 		metadataMissing, otherSource, movie bool
+		packFiles                           []string
+		wantFile                            string
+		creatorAlias                        bool
 	}{
 		{name: "disabled by default", release: "Black.Clover.S02E01.1080p"},
 		{name: "explicitly disabled", setting: `{"skip_search_when_cached":false}`, release: "Black.Clover.S02E01.1080p"},
 		{name: "cached import", setting: `{"skip_search_when_cached":true}`, release: "Black.Clover.S02E01.1080p", wantCached: true},
+		{name: "cached season pack", setting: `{"skip_search_when_cached":true}`, release: "Black.Clover.S02.1080p", packFiles: []string{"Black.Clover.S02E01.mkv", "Black.Clover.S02E02.mkv"}, wantFile: "Black.Clover.S02E01.mkv", wantCached: true},
+		{name: "cached season range", setting: `{"skip_search_when_cached":true}`, release: "Black.Clover.S01-S03.1080p", packFiles: []string{"Black.Clover.S01E01.mkv", "Black.Clover.S02E01.mkv"}, wantFile: "Black.Clover.S02E01.mkv", wantCached: true},
+		{name: "cached multi season pack", setting: `{"skip_search_when_cached":true}`, release: "Black.Clover.2009-2019.11.Temporadas", packFiles: []string{"Black.Clover.S01E01.mkv", "Black.Clover.S02E01.mkv"}, wantFile: "Black.Clover.S02E01.mkv", wantCached: true},
+		{name: "title search known creator alias", creatorAlias: true},
+		{name: "library creator alias", setting: `{"skip_search_when_cached":true}`, library: true, wantCached: true, creatorAlias: true},
 		{name: "healthy library", setting: `{"skip_search_when_cached":true}`, library: true, wantCached: true},
 		{name: "empty cache", setting: `{"skip_search_when_cached":true}`},
+		{name: "unrelated pack is not inspected", setting: `{"skip_search_when_cached":true}`, release: "Other.Show.S01", packFiles: []string{"Other.Show.S01E01.mkv"}},
 		{name: "different show", setting: `{"skip_search_when_cached":true}`, release: "Other.Show.S02E01.1080p"},
 		{name: "different episode", setting: `{"skip_search_when_cached":true}`, release: "Black.Clover.S02E02.1080p"},
 		{name: "expired import", setting: `{"skip_search_when_cached":true}`, release: "Black.Clover.S02E01.1080p", age: 48 * time.Hour},
@@ -52,6 +64,10 @@ func TestStremioSkipSearchWhenCached(t *testing.T) {
 				w.Header().Set("Content-Type", "application/json")
 				if tc.movie {
 					_, _ = w.Write([]byte(`{"meta":{"name":"Black Clover","year":"2024"}}`))
+				} else if tc.creatorAlias && r.URL.Path == "/lookup/shows" {
+					_, _ = w.Write([]byte(`{"id":1,"name":"Harlan Coben's I Will Find You","externals":{"thetvdb":331753}}`))
+				} else if tc.creatorAlias && r.URL.Path == "/shows/1/akas" {
+					_, _ = w.Write([]byte(`[{"name":"I Will Find You"}]`))
 				} else if r.URL.Path == "/lookup/shows" {
 					_, _ = w.Write([]byte(`{"id":1,"name":"Black Clover","externals":{"thetvdb":331753}}`))
 				} else {
@@ -86,14 +102,25 @@ func TestStremioSkipSearchWhenCached(t *testing.T) {
 			}
 			if tc.library {
 				filePath = "complete/TV/Black.Clover.S02E01.1080p.mkv"
-				_, err = db.Connection().ExecContext(ctx, `INSERT INTO file_health (file_path, library_path, status) VALUES (?, ?, 'healthy')`, filePath, "/media/TV/Black Clover/Season 02/Black Clover - S02E01.mkv")
+				libraryPath := "/media/TV/Black Clover/Season 02/Black Clover - S02E01.mkv"
+				if tc.creatorAlias {
+					filePath = "complete/TV/I.Will.Find.You.S02E01.1080p.mkv"
+					libraryPath = "/media/TV/Harlan Coben's I Will Find You/Season 02/I Will Find You - S02E01.mkv"
+				}
+				_, err = db.Connection().ExecContext(ctx, `INSERT INTO file_health (file_path, library_path, status) VALUES (?, ?, 'healthy')`, filePath, libraryPath)
 				require.NoError(t, err)
 			}
 			var searches atomic.Int32
 			indexer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				searches.Add(1)
 				w.Header().Set("Content-Type", "application/json")
-				if tc.movie {
+				if tc.creatorAlias {
+					if strings.Contains(r.URL.Query().Get("query"), "ImdbId:") || strings.Contains(r.URL.Query().Get("query"), "TvdbId:") {
+						_, _ = w.Write([]byte(`[]`))
+					} else {
+						_, _ = w.Write([]byte(`[{"title":"I.Will.Find.You.S02E01.720p","downloadUrl":"https://indexer.example/release.nzb","protocol":"usenet"}]`))
+					}
+				} else if tc.movie {
 					_, _ = w.Write([]byte(`[{"title":"Black.Clover.2024.720p","downloadUrl":"https://indexer.example/release.nzb","protocol":"usenet"}]`))
 				} else {
 					_, _ = w.Write([]byte(`[{"title":"Black.Clover.S02E01.720p","downloadUrl":"https://indexer.example/release.nzb","protocol":"usenet"}]`))
@@ -110,6 +137,17 @@ func TestStremioSkipSearchWhenCached(t *testing.T) {
 			cfg.Stremio.Prowlarr.Host = indexer.URL
 			cfg.Stremio.Prowlarr.APIKey = "indexer-key"
 			server := &Server{configManager: &mockConfigManager{cfg: cfg}, userRepo: users, queueRepo: database.NewRepository(db.Connection(), database.DialectSQLite), healthRepo: database.NewHealthRepository(db.Connection(), database.DialectSQLite), stremioFailures: newStremioFailureCache()}
+			var logs bytes.Buffer
+			if len(tc.packFiles) > 0 {
+				pack, item := newStremioStreamsTestServer(t, tc.packFiles)
+				server.metadataService = pack.metadataService
+				filePath = filepath.ToSlash(filepath.Join(*item.StoragePath, tc.wantFile))
+				_, err = db.Connection().ExecContext(ctx, `UPDATE import_queue SET storage_path = ?`, *item.StoragePath)
+				require.NoError(t, err)
+				previousLogger := slog.Default()
+				slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+				t.Cleanup(func() { slog.SetDefault(previousLogger) })
+			}
 			app := fiber.New()
 			app.Get("/stremio/:key/stream/:type/:id.json", server.handleStremioAddonStream)
 			key := auth.HashAPIKey(apiKey)
@@ -126,6 +164,7 @@ func TestStremioSkipSearchWhenCached(t *testing.T) {
 			}
 			require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
 			require.NotEmpty(t, body.Streams)
+			require.NotContains(t, logs.String(), "No media file in Stremio release matched")
 			if tc.wantCached {
 				require.Zero(t, searches.Load(), "cache hit must skip indexer requests")
 				require.Len(t, body.Streams, 1)
