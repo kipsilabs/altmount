@@ -68,6 +68,9 @@ type Caps struct {
 	// release was not STATed). BuildPlan provisions extra margin rows for
 	// them so the payload sweep absorbs the discoveries without a replan.
 	ExpectedHiddenArticles int
+	// RecoveryAttempt doubles the recovery rows the PAR2 parse looks for, once
+	// per attempt, so a repair that came up short reads further each time.
+	RecoveryAttempt int
 	// VerifySweep builds a plan even when no article is known dead: the
 	// trigger knows the release is damaged (corrupt-but-present articles
 	// broke import analysis) but not which articles. The plan then carries
@@ -86,6 +89,9 @@ type Plan struct {
 	SpareRecovery []par2.RecoverySliceRef
 	Files         []SetFile // recovery-set order (FileID ascending)
 	DeadArticles  []DeadArticle
+	// PartialRecovery is set when the PAR2 parse stopped early, so running out
+	// of rows doesn't yet mean the set can't repair this file.
+	PartialRecovery bool
 	// SpillToDisk marks a plan whose solver buffers exceed the memory budget:
 	// the job backs accumulators, recovery payloads and recovered slices with
 	// a memory-mapped scratch file instead of the heap.
@@ -106,7 +112,7 @@ func BuildPlan(idx *par2.Index, files []SetFile, caps Caps) (*Plan, error) {
 		byID[f.FileID] = f
 	}
 
-	plan := &Plan{SliceSize: int(sliceSize)}
+	plan := &Plan{SliceSize: int(sliceSize), PartialRecovery: idx.Partial}
 	var startSlice []int64
 	var total int64
 	for _, id := range idx.RecoveryIDs {
@@ -174,8 +180,7 @@ func BuildPlan(idx *par2.Index, files []SetFile, caps Caps) (*Plan, error) {
 		}
 	}
 	if len(idx.Recovery) < k {
-		return nil, fmt.Errorf("%w: needs %d recovery slices, set has %d",
-			ErrUnrepairable, k, len(idx.Recovery))
+		return nil, plan.outOfRecovery(nil, fmt.Sprintf("needs %d recovery slices, set has %d", k, len(idx.Recovery)))
 	}
 
 	// Choose the k lowest-exponent recovery slices plus up to planMargin
@@ -242,4 +247,26 @@ func articleSizeSum(arts []Article) int64 {
 		sum += a.Size
 	}
 	return sum
+}
+
+// RecoveryShortError reports that a repair ran out of recovery rows while the
+// PAR2 set still has volumes it never read. The retry reads further, so this is
+// transient at the job level. Dead lists recovery articles found unusable, which
+// the next plan must not count on.
+type RecoveryShortError struct {
+	Dead   []string
+	Reason string
+}
+
+func (e *RecoveryShortError) Error() string {
+	return "par2repair: recovery rows ran out with PAR2 volumes unread: " + e.Reason
+}
+
+// outOfRecovery is the error for a repair with too few recovery rows: worth
+// another attempt while the parse has more of the set to read, else final.
+func (p *Plan) outOfRecovery(dead []string, reason string) error {
+	if p.PartialRecovery {
+		return &RecoveryShortError{Dead: dead, Reason: reason}
+	}
+	return fmt.Errorf("%w: %s", ErrUnrepairable, reason)
 }

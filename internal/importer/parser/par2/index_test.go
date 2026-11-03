@@ -284,3 +284,54 @@ func TestParseIndexRecordsPacketIntegrity(t *testing.T) {
 		}
 	}
 }
+
+func parseUntilFixture(t *testing.T) ([]io.Reader, int) {
+	t.Helper()
+	data := bytes.Repeat([]byte("abcdefgh"), 1000)
+	set := par2gen.BuildFull(1024, []par2gen.FileEntry{{Name: "a.rar", Content: data}}, 6)
+	streams := []io.Reader{bytes.NewReader(set.Index)}
+	for _, v := range set.Volumes {
+		streams = append(streams, bytes.NewReader(v))
+	}
+	return streams, len(set.Volumes)
+}
+
+func TestParseIndexUntilStopsOnceEnough(t *testing.T) {
+	streams, _ := parseUntilFixture(t)
+	idx, err := par2.ParseIndexUntil(streams, func(i *par2.Index) bool { return len(i.Recovery) >= 2 })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(idx.Recovery) != 2 {
+		t.Fatalf("recovery slices = %d, want the parse to stop at 2", len(idx.Recovery))
+	}
+	if len(idx.RecoveryIDs) != 1 || len(idx.Files) != 1 {
+		t.Fatalf("metadata incomplete: ids=%d files=%d", len(idx.RecoveryIDs), len(idx.Files))
+	}
+}
+
+func TestParseIndexUntilReadsEverythingWhenNeverEnough(t *testing.T) {
+	streams, volumes := parseUntilFixture(t)
+	idx, err := par2.ParseIndexUntil(streams, func(*par2.Index) bool { return false })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(idx.Recovery) != volumes {
+		t.Fatalf("recovery slices = %d, want %d", len(idx.Recovery), volumes)
+	}
+}
+
+// Stopping must not skip the only copy of the metadata: until it is complete the
+// parse keeps going, however many recovery slices it has already seen.
+func TestParseIndexUntilWaitsForCompleteMetadata(t *testing.T) {
+	streams, volumes := parseUntilFixture(t)
+	// Recovery volumes first: they carry no metadata here, the index comes last.
+	reordered := append(append([]io.Reader{}, streams[1:]...), streams[0])
+	idx, err := par2.ParseIndexUntil(reordered, func(*par2.Index) bool { return true })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(idx.Recovery) != volumes || len(idx.Files) != 1 {
+		t.Fatalf("recovery=%d files=%d, want every stream read", len(idx.Recovery), len(idx.Files))
+	}
+}

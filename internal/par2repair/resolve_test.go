@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"slices"
 	"strings"
 	"testing"
 
@@ -845,5 +846,197 @@ func TestResolveRejectsReleaseOutsideSizeRange(t *testing.T) {
 		Caps{MaxRepairRatio: 0.5, MaxMemoryBytes: 64 << 20, MaxReleaseSizeBytes: 1}, testLogger(), nil)
 	if !errors.Is(err, ErrUnrepairable) {
 		t.Fatalf("err = %v, want ErrUnrepairable for a release above the maximum size", err)
+	}
+}
+
+// mkManyRecoveryFixture is a release with one PAR2 article per recovery slice and
+// article 1 of a.rar dead. It returns each PAR2 article id, index first.
+func mkManyRecoveryFixture(t *testing.T, recovery int) (*metapb.FileMetadata, *metapb.NzbStore, *fakeFetcher, []byte, string, []string) {
+	t.Helper()
+	rng := rand.New(rand.NewSource(17))
+	content := make([]byte, 8192)
+	rng.Read(content)
+	set := par2gen.BuildFull(1024, []par2gen.FileEntry{{Name: "a.rar", Content: content}}, recovery)
+
+	fetch := &fakeFetcher{articles: map[string][]byte{}}
+	deadID := "a.rar-1@test"
+	entry := &metapb.NzbFileEntry{Subject: `"a.rar" yEnc (1/4)`}
+	for i := range 4 {
+		id := fmt.Sprintf("a.rar-%d@test", i)
+		entry.Segments = append(entry.Segments, &metapb.NzbSeg{Id: id, Number: int32(i + 1), Bytes: 2100})
+		if id != deadID {
+			fetch.articles[id] = content[i*2048 : (i+1)*2048]
+		}
+	}
+	store := &metapb.NzbStore{Files: []*metapb.NzbFileEntry{entry}}
+	fm := &metapb.FileMetadata{}
+	var par2IDs []string
+	for i, p := range append([][]byte{set.Index}, set.Volumes...) {
+		id := fmt.Sprintf("par2-%d@test", i)
+		par2IDs = append(par2IDs, id)
+		fetch.articles[id] = p
+		store.Files = append(store.Files, &metapb.NzbFileEntry{
+			Subject:  fmt.Sprintf(`"rel.vol%03d.par2" yEnc (1/1)`, i),
+			Segments: []*metapb.NzbSeg{{Id: id, Number: 1, Bytes: int64(len(p))}},
+		})
+		fm.Par2Files = append(fm.Par2Files, &metapb.Par2FileReference{
+			Filename:    fmt.Sprintf("rel.vol%03d.par2", i),
+			FileSize:    int64(len(p)),
+			SegmentData: []*metapb.SegmentData{{Id: "<" + id + ">", SegmentSize: int64(len(p))}},
+		})
+	}
+	return fm, store, fetch, content[2048:4096], deadID, par2IDs
+}
+
+func fetchedPar2(fetch *fakeFetcher, par2IDs []string) int {
+	fetch.mu.Lock()
+	defer fetch.mu.Unlock()
+	n := 0
+	for _, id := range par2IDs {
+		if slices.Contains(fetch.fetched, id) {
+			n++
+		}
+	}
+	return n
+}
+
+// Planning must not read every recovery volume to plan a small repair, and the
+// repair must still come out byte-exact.
+func TestResolveStopsParsingOnceEnoughRecoveryFound(t *testing.T) {
+	fm, store, fetch, want, deadID, par2IDs := mkManyRecoveryFixture(t, 60)
+	res, err := Resolve(context.Background(), fm, store, []string{deadID}, fetch,
+		Caps{MaxRepairRatio: 0.5, MaxMemoryBytes: 64 << 20}, testLogger(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fetchedPar2(fetch, par2IDs); got >= len(par2IDs) {
+		t.Fatalf("fetched %d of %d PAR2 articles, want the parse to stop early", got, len(par2IDs))
+	}
+	ps := NewPatchStore(t.TempDir())
+	if err := RunJob(context.Background(), res.Plan, res.Index, res.Par2Files, fetch, ps, testLogger()); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := ps.Get(deadID); !ok || !bytes.Equal(got, want) {
+		t.Fatal("repair did not reproduce the dead article")
+	}
+}
+
+// Recovery slices on known-dead articles are no use, so they must not count
+// towards stopping: the parse keeps going until it has enough live ones.
+func TestResolveKeepsParsingPastDeadRecovery(t *testing.T) {
+	fm, store, fetch, _, deadID, par2IDs := mkManyRecoveryFixture(t, 60)
+	dead := []string{deadID}
+	for _, id := range par2IDs[1:21] {
+		delete(fetch.articles, id)
+		dead = append(dead, id)
+	}
+	res, err := Resolve(context.Background(), fm, store, dead, fetch,
+		Caps{MaxRepairRatio: 0.5, MaxMemoryBytes: 64 << 20}, testLogger(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := len(res.Plan.Recovery) + len(res.Plan.SpareRecovery); n == 0 {
+		t.Fatal("no live recovery slices planned")
+	}
+}
+
+// With nothing known dead there is no damage to size against, so the whole set
+// is read, as a verify sweep needs.
+func TestResolveReadsWholeSetForVerifySweep(t *testing.T) {
+	fm, store, fetch, want, deadID, par2IDs := mkManyRecoveryFixture(t, 40)
+	fetch.articles[deadID] = want
+	res, err := Resolve(context.Background(), fm, store, nil, fetch,
+		Caps{MaxRepairRatio: 0.5, MaxMemoryBytes: 64 << 20, VerifySweep: true}, testLogger(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res == nil {
+		t.Fatal("no plan")
+	}
+	if got := fetchedPar2(fetch, par2IDs); got != len(par2IDs) {
+		t.Fatalf("fetched %d of %d PAR2 articles, want all", got, len(par2IDs))
+	}
+}
+
+// serveOnceFetcher serves its ids once, as a recovery article that dies after the
+// parse has read it does.
+type serveOnceFetcher struct {
+	*fakeFetcher
+	once map[string]bool
+	seen map[string]bool
+}
+
+func (f *serveOnceFetcher) Fetch(ctx context.Context, id string) ([]byte, error) {
+	f.mu.Lock()
+	again := f.once[id] && f.seen[id]
+	f.seen[id] = true
+	f.mu.Unlock()
+	if again {
+		return nil, nntppool.ErrArticleNotFound
+	}
+	return f.fakeFetcher.Fetch(ctx, id)
+}
+
+// A repair whose recovery rows die after planning must read further into the set
+// rather than give up while volumes are unread, and must end up byte-exact.
+func TestRepairReadsFurtherWhenChosenRecoveryDies(t *testing.T) {
+	fm, store, inner, want, deadID, par2IDs := mkManyRecoveryFixture(t, 90)
+	once := map[string]bool{}
+	for _, id := range par2IDs[1:45] {
+		once[id] = true
+	}
+	fetch := &serveOnceFetcher{fakeFetcher: inner, once: once, seen: map[string]bool{}}
+	caps := Caps{MaxRepairRatio: 0.5, MaxMemoryBytes: 64 << 20}
+	ps := NewPatchStore(t.TempDir())
+	dead := []string{deadID}
+
+	res, err := Resolve(context.Background(), fm, store, dead, fetch, caps, testLogger(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = RunJob(context.Background(), res.Plan, res.Index, res.Par2Files, fetch, ps, testLogger())
+	var short *RecoveryShortError
+	if !errors.As(err, &short) {
+		t.Fatalf("err = %v, want RecoveryShortError", err)
+	}
+	if errors.Is(err, ErrUnrepairable) {
+		t.Fatal("must not be final while volumes are unread")
+	}
+	if len(short.Dead) == 0 {
+		t.Fatal("unusable recovery articles were not reported")
+	}
+
+	caps.RecoveryAttempt = 1
+	res, err = Resolve(context.Background(), fm, store, append(dead, short.Dead...), fetch, caps, testLogger(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := RunJob(context.Background(), res.Plan, res.Index, res.Par2Files, fetch, ps, testLogger()); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := ps.Get(deadID); !ok || !bytes.Equal(got, want) {
+		t.Fatal("repair did not reproduce the dead article")
+	}
+}
+
+// Once the whole set has been read there is nothing further to try.
+func TestRepairIsFinalOnceWholeSetRead(t *testing.T) {
+	fm, store, inner, _, deadID, par2IDs := mkManyRecoveryFixture(t, 20)
+	once := map[string]bool{}
+	for _, id := range par2IDs[1:] {
+		once[id] = true
+	}
+	fetch := &serveOnceFetcher{fakeFetcher: inner, once: once, seen: map[string]bool{}}
+	res, err := Resolve(context.Background(), fm, store, []string{deadID}, fetch,
+		Caps{MaxRepairRatio: 0.5, MaxMemoryBytes: 64 << 20}, testLogger(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Plan.PartialRecovery {
+		t.Fatal("a 20-slice set is smaller than the parse target, so all of it should be read")
+	}
+	err = RunJob(context.Background(), res.Plan, res.Index, res.Par2Files, fetch, NewPatchStore(t.TempDir()), testLogger())
+	if !errors.Is(err, ErrUnrepairable) {
+		t.Fatalf("err = %v, want ErrUnrepairable", err)
 	}
 }
