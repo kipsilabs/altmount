@@ -244,6 +244,10 @@ func (s *Server) collectLibraryEpisodes(
 		return
 	}
 
+	matchCtx := releaseMatchContext{}
+	if req.IMDbID != "" && s.configManager != nil {
+		matchCtx.aliases = resolveSeriesTitleAliases(ctx, req.IMDbID, s.configManager.GetConfig().GetUserAgent())
+	}
 	selector := &stremioEpisodeSelector{Season: req.Season, Episode: req.Episode}
 	for _, h := range healthyFiles {
 		if !isPlayableLibraryFile(h) {
@@ -254,8 +258,8 @@ func (s *Server) collectLibraryEpisodes(
 			continue
 		}
 		if title != "" &&
-			!stremio.MatchesSeries(filepath.Base(matchPath), title, req.Season, req.Episode, 0) &&
-			!stremio.MatchesSeries(matchPath, title, req.Season, req.Episode, 0) {
+			!releaseMatchesContent("series", filepath.Base(matchPath), title, "", req.Season, req.Episode, matchCtx) &&
+			!releaseMatchesContent("series", matchPath, title, "", req.Season, req.Episode, matchCtx) {
 			continue
 		}
 		sink.add(stremio.EvaluateRelease(filepath.Base(matchPath), scoring), h.FilePath)
@@ -361,14 +365,19 @@ func (s *Server) handleInspectStremioSearch(c *fiber.Ctx) error {
 
 	coordinator := stremio.NewSearchCoordinator(coordCfg, httpclient.NewForExternal(cfg.Network, 30*time.Second))
 
+	var titleAliases []string
+	if req.Type == "series" && req.IMDbID != "" {
+		titleAliases = resolveSeriesTitleAliases(ctx, req.IMDbID, cfg.GetUserAgent())
+	}
 	res, err := coordinator.SearchInspect(ctx, stremio.SearchParams{
-		Type:      req.Type,
-		IMDBID:    req.IMDbID,
-		Title:     meta.Search,
-		TVDBID:    req.TVDBID,
-		Season:    req.Season,
-		Episode:   req.Episode,
-		TimeoutMS: clampInspectTimeoutMS(req.TimeoutMS),
+		Type:         req.Type,
+		IMDBID:       req.IMDbID,
+		Title:        meta.Search,
+		TitleAliases: titleAliases,
+		TVDBID:       req.TVDBID,
+		Season:       req.Season,
+		Episode:      req.Episode,
+		TimeoutMS:    clampInspectTimeoutMS(req.TimeoutMS),
 	})
 	if err != nil {
 		return RespondInternalError(c, "Failed to execute indexer search inspection", err.Error())

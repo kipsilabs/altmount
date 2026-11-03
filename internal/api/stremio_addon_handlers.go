@@ -314,6 +314,7 @@ func (s *Server) findHealthyLibraryStreams(ctx context.Context, cfg *config.Conf
 	} else if streamType == "series" {
 		tvdbIDStr, seriesTitle, _ := resolveSeriesMetadataFromIMDb(ctx, imdbID, cfg.GetUserAgent())
 		tvdbID, _ := strconv.Atoi(tvdbIDStr)
+		matchCtx := releaseMatchContext{aliases: resolveSeriesTitleAliases(ctx, imdbID, cfg.GetUserAgent())}
 		if healthyFiles, err := s.healthRepo.FindHealthyFilesForSeries(ctx, seriesTitle, tvdbID); err == nil {
 			for _, h := range healthyFiles {
 				if h != nil && h.FilePath != "" && isMediaExtension(filepath.Ext(h.FilePath)) && !isSampleFile(h.FilePath) {
@@ -323,7 +324,7 @@ func (s *Server) findHealthyLibraryStreams(ctx context.Context, cfg *config.Conf
 					}
 					if selector == nil || selector.matches(matchPath) || selector.matches(h.FilePath) {
 						// Verify series title matches if seriesTitle is known (prevents cross-show false positives)
-						if seriesTitle != "" && !stremio.MatchesSeries(filepath.Base(matchPath), seriesTitle, season, episode, 0) && !stremio.MatchesSeries(matchPath, seriesTitle, season, episode, 0) {
+						if seriesTitle != "" && !releaseMatchesContent("series", filepath.Base(matchPath), seriesTitle, "", season, episode, matchCtx) && !releaseMatchesContent("series", matchPath, seriesTitle, "", season, episode, matchCtx) {
 							continue
 						}
 						streamURL := baseURL + "/api/files/stream?path=" +
@@ -924,13 +925,14 @@ func (s *Server) searchStremioReleases(
 	}
 
 	scoredReleases, err := coordinator.Search(ctx, stremio.SearchParams{
-		Type:      streamType,
-		IMDBID:    imdbID,
-		Title:     title,
-		Season:    season,
-		Episode:   episode,
-		TVDBID:    tvdbID,
-		TimeoutMS: timeoutMs,
+		Type:         streamType,
+		IMDBID:       imdbID,
+		Title:        title,
+		TitleAliases: seriesMatchCtx.aliases,
+		Season:       season,
+		Episode:      episode,
+		TVDBID:       tvdbID,
+		TimeoutMS:    timeoutMs,
 	})
 	if err != nil {
 		slog.WarnContext(ctx, "Stremio search coordinator error", "error", err, "imdb_id", imdbID)
@@ -966,23 +968,21 @@ func (s *Server) searchStremioReleases(
 		})
 	}
 
-	// Reorder with cached items first, then preserving scored order. Cached
-	// releases were already content-matched at import time, so they bypass the
-	// relevance gate; fresh search results must plausibly belong to the
-	// requested content before they can reach any downstream consumer.
+	// Cache availability does not establish relevance to this request.
+	// Validate every release before promoting cached results.
 	ordered := make([]prowlarr.NZBResult, 0, len(filtered))
 	var uncached []prowlarr.NZBResult
 	var droppedNames []string
 	for _, r := range filtered {
-		if isCached(sanitizeFilename(r.Title)) {
-			ordered = append(ordered, r)
-			continue
-		}
 		if !releaseMatchesContent(streamType, r.Title, expectedTitle, expectedYear, season, episode, seriesMatchCtx) {
 			droppedNames = append(droppedNames, fmt.Sprintf("%q (%s)", r.Title, r.Indexer))
 			continue
 		}
-		uncached = append(uncached, r)
+		if isCached(sanitizeFilename(r.Title)) {
+			ordered = append(ordered, r)
+		} else {
+			uncached = append(uncached, r)
+		}
 	}
 	ordered = append(ordered, uncached...)
 
@@ -991,7 +991,7 @@ func (s *Server) searchStremioReleases(
 			"imdb_id", imdbID,
 			"dropped_count", len(droppedNames),
 			"dropped_sample", droppedNames,
-			"kept", len(ordered)+len(uncached)-len(droppedNames))
+			"kept", len(ordered))
 	}
 
 	return ordered, cachedItems, nil

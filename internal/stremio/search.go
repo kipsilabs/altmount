@@ -16,14 +16,15 @@ import (
 
 // SearchParams contains the query parameters for a Stremio stream search.
 type SearchParams struct {
-	Type      string // "movie" or "series"
-	IMDBID    string // "tt1234567"
-	Title     string // "Arcane"
-	Season    int    // 1
-	Episode   int    // 1
-	TVDBID    string // optional
-	TimeoutMS int    // e.g. 3500
-	CustomUA  string // optional
+	Type         string   // "movie" or "series"
+	IMDBID       string   // "tt1234567"
+	Title        string   // "Arcane"
+	TitleAliases []string // Known alternative titles from metadata.
+	Season       int      // 1
+	Episode      int      // 1
+	TVDBID       string   // optional
+	TimeoutMS    int      // e.g. 3500
+	CustomUA     string   // optional
 }
 
 // CoordinatorConfig defines the search provider configuration.
@@ -302,9 +303,12 @@ func mediaMismatchReason(res SearchResult, params SearchParams) string {
 	}
 	switch {
 	case strings.EqualFold(params.Type, "series"):
-		if !MatchesSeries(res.Title, params.Title, params.Season, params.Episode, 0) {
-			return "Does not match requested series or episode"
+		for _, title := range append([]string{params.Title}, params.TitleAliases...) {
+			if strings.TrimSpace(title) != "" && MatchesSeries(res.Title, title, params.Season, params.Episode, 0) {
+				return ""
+			}
 		}
+		return "Does not match requested series or episode"
 	case strings.EqualFold(params.Type, "movie"):
 		if !MatchesMovie(res.Title, params.Title, 0) {
 			return "Does not match requested movie title"

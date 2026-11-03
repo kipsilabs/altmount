@@ -52,6 +52,22 @@ func (s *Server) findCachedStremioStreams(ctx context.Context, cfg *config.Confi
 		if ttl := cfg.Stremio.NzbTTLHours; ttl > 0 && (item.CompletedAt == nil || time.Since(*item.CompletedAt) >= time.Duration(ttl)*time.Hour) {
 			continue
 		}
+		names := []string{filepath.Base(item.NzbPath), filepath.Base(*item.StoragePath)}
+		if item.RelativePath != nil {
+			names = append(names, filepath.Base(*item.RelativePath))
+		}
+		// Identify the show/movie before traversing its media files. Episode
+		// selection belongs to buildStremioStreams, including season packs.
+		matchesContent := false
+		for _, name := range names {
+			if releaseMatchesContent(streamType, name, title, year, 0, 0, matchCtx) {
+				matchesContent = true
+				break
+			}
+		}
+		if !matchesContent {
+			continue
+		}
 		streams, err := s.buildStremioStreams(ctx, item, baseURL, key, filepath.Base(item.NzbPath), selector)
 		if err != nil {
 			continue
@@ -61,12 +77,9 @@ func (s *Server) findCachedStremioStreams(ctx context.Context, cfg *config.Confi
 			if err != nil || seen[stream.URL] || isSampleFile(u.Query().Get("path")) {
 				continue
 			}
-			names := []string{stream.Title, filepath.Base(item.NzbPath), filepath.Base(*item.StoragePath)}
-			if item.RelativePath != nil {
-				names = append(names, filepath.Base(*item.RelativePath))
-			}
+			streamNames := append([]string{stream.Title}, names...)
 			matched := false
-			for _, name := range names {
+			for _, name := range streamNames {
 				if releaseMatchesContent(streamType, name, title, year, season, episode, matchCtx) {
 					matched = true
 					break
