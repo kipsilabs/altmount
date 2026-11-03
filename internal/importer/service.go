@@ -939,6 +939,13 @@ func (s *Service) processNzbItem(ctx context.Context, item *database.ImportQueue
 	}
 
 	resultPath, writtenPaths, err := s.processor.ProcessNzbFile(ctx, item.NzbPath, basePath, int(item.ID), allowedExtensionsOverride, &virtualDir, extractedFiles, item.Category, item.Metadata, item.DownloadID)
+	var expansion *nestedNzbJobsError
+	if errors.As(err, &expansion) {
+		if err := s.enqueueNestedNzbs(ctx, item, expansion); err != nil {
+			return "", nil, err
+		}
+		return s.processNzbItem(ctx, item)
+	}
 	if err != nil {
 		return resultPath, writtenPaths, err
 	}

@@ -5,7 +5,9 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/crc32"
@@ -217,7 +219,8 @@ func TestNestedNzbProbeSkipsOtherDetectors(t *testing.T) {
 		{"7z", []parser.ParsedFile{{Filename: "release.7z", Is7zArchive: true}}},
 		{"7z-with-zip-name", []parser.ParsedFile{{Filename: "release.zip", Is7zArchive: true}}},
 		{"multipart-mkv", []parser.ParsedFile{{Filename: "Movie.mkv.001"}, {Filename: "Movie.mkv.002"}}},
-		{"direct-nzb", []parser.ParsedFile{{Filename: "release.nzb"}}},
+
+		{"mixed-direct-post", []parser.ParsedFile{{Filename: "release.nzb"}, {Filename: "Movie.mkv"}}},
 		{"mixed-post", []parser.ParsedFile{{Filename: "wrapper.zip"}, {Filename: "Movie.mkv"}}},
 		{"large-rar", []parser.ParsedFile{{Filename: "Movie.rar", IsRarArchive: true, Size: maxNestedArchiveSize + 1}}},
 	} {
@@ -407,7 +410,7 @@ func TestNestedNzbProbeToleratesMissingMediaRarTail(t *testing.T) {
 }
 
 func TestImportNestedNzb(t *testing.T) {
-	for _, format := range []string{"zip", "zip-gzip", "rar", "encrypted-rar", "solid-rar", "multipart-rar"} {
+	for _, format := range []string{"direct", "gzip", "zip", "zip-gzip", "rar", "encrypted-rar", "solid-rar", "multipart-rar"} {
 		t.Run(format, func(t *testing.T) {
 			e := newBatteryEnv(t)
 			media := bytes.Repeat([]byte("M"), 1000)
@@ -418,6 +421,21 @@ func TestImportNestedNzb(t *testing.T) {
 			}
 			name := "wrapper.zip"
 			payload := nestedZip(t, map[string][]byte{"folder/release.NZB": inner, "release.nfo": []byte("info")})
+			if format == "direct" {
+				name, payload = "release.NZB", inner
+			}
+			if format == "gzip" {
+				name = "release.NZB.GZ"
+				var compressed bytes.Buffer
+				gz := gzip.NewWriter(&compressed)
+				if _, err := gz.Write(inner); err != nil {
+					t.Fatal(err)
+				}
+				if err := gz.Close(); err != nil {
+					t.Fatal(err)
+				}
+				payload = compressed.Bytes()
+			}
 			if strings.Contains(format, "rar") {
 				name = "wrapper.rar"
 				fixture := "compressed.rar"
@@ -484,7 +502,7 @@ func TestImportNestedNzb(t *testing.T) {
 	}
 }
 
-func TestImportNestedNzbRejectsAmbiguousZip(t *testing.T) {
+func TestImportNestedNzbExpandsMultipleZip(t *testing.T) {
 	e := newBatteryEnv(t)
 	inner, err := nzbparser.Write(nzbbuild.Build(nzbbuild.File{Subject: "Movie.mkv", Segments: []nzbbuild.Segment{{ID: "media", Bytes: 1000}}}))
 	if err != nil {
@@ -493,10 +511,172 @@ func TestImportNestedNzbRejectsAmbiguousZip(t *testing.T) {
 	payload := nestedZip(t, map[string][]byte{"one.nzb": inner, "two.nzb": inner})
 	outer := nzbbuild.Build(nzbbuild.File{Subject: "wrapper.zip", Segments: e.registerContent("ambiguous", payload, 100, 1, &nntppool.YEncMeta{FileName: "wrapper.zip", FileSize: int64(len(payload))})})
 	_, written, err := e.runImport(outer, "Ambiguous")
-	if err == nil || !strings.Contains(err.Error(), "multiple NZB") {
-		t.Fatalf("error = %v, want multiple NZBs", err)
+	if err == nil || !strings.Contains(err.Error(), "queue 2 nested NZBs") {
+		t.Fatalf("error = %v, want child jobs", err)
 	}
 	if len(written) != 0 {
 		t.Fatalf("unexpected writes: %v", written)
+	}
+}
+
+func nestedStoredRar(entries map[string][]byte) []byte {
+	var archive bytes.Buffer
+	archive.Write([]byte{'R', 'a', 'r', '!', 0x1a, 0x07, 0x00})
+	header := func(kind byte, flags uint16, body []byte) {
+		data := make([]byte, 7+len(body))
+		data[2] = kind
+		binary.LittleEndian.PutUint16(data[3:5], flags)
+		binary.LittleEndian.PutUint16(data[5:7], uint16(len(data)))
+		copy(data[7:], body)
+		binary.LittleEndian.PutUint16(data[:2], uint16(crc32.ChecksumIEEE(data[2:])))
+		archive.Write(data)
+	}
+	header(0x73, 0, make([]byte, 6))
+	var names []string
+	for name := range entries {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		data := entries[name]
+		body := make([]byte, 25)
+		binary.LittleEndian.PutUint32(body[:4], uint32(len(data)))
+		binary.LittleEndian.PutUint32(body[4:8], uint32(len(data)))
+		body[8] = 3
+		binary.LittleEndian.PutUint32(body[9:13], crc32.ChecksumIEEE(data))
+		body[17], body[18] = 20, 0x30
+		binary.LittleEndian.PutUint16(body[19:21], uint16(len(name)))
+		binary.LittleEndian.PutUint32(body[21:25], 0o100644)
+		header(0x74, 0x8000, append(body, name...))
+		archive.Write(data)
+	}
+	header(0x7b, 0, nil)
+	return archive.Bytes()
+}
+
+func TestReadMultipleNestedNzbs(t *testing.T) {
+	inner, err := nzbparser.Write(nzbbuild.Build(nzbbuild.File{Subject: "Movie.mkv", Segments: []nzbbuild.Segment{{ID: "media", Bytes: 1000}}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, format := range []string{"direct", "zip", "rar"} {
+		t.Run(format, func(t *testing.T) {
+			dir := t.TempDir()
+			entries := map[string][]byte{"one.nzb": inner, "two.nzb": inner}
+			var files []parser.ParsedFile
+			if format == "direct" {
+				for name, data := range entries {
+					if err := os.WriteFile(filepath.Join(dir, name), data, 0600); err != nil {
+						t.Fatal(err)
+					}
+					files = append(files, parser.ParsedFile{Filename: name, Size: int64(len(data))})
+				}
+			} else {
+				payload := nestedZip(t, entries)
+				if format == "rar" {
+					payload = nestedStoredRar(entries)
+				}
+				name := "wrapper." + format
+				if err := os.WriteFile(filepath.Join(dir, name), payload, 0600); err != nil {
+					t.Fatal(err)
+				}
+				files = []parser.ParsedFile{{Filename: name, Size: int64(len(payload)), IsRarArchive: format == "rar"}}
+			}
+			_, err := readNestedNzb(context.Background(), os.DirFS(dir), files, "")
+			var expansion *nestedNzbJobsError
+			if !errors.As(err, &expansion) || len(expansion.Jobs) != 2 {
+				t.Fatalf("expected two child jobs, got %v", err)
+			}
+			for _, job := range expansion.Jobs {
+				if !bytes.Equal(job.Data, inner) {
+					t.Fatal("incorrect child payload")
+				}
+			}
+		})
+	}
+}
+
+func TestNestedNzbBranchLimits(t *testing.T) {
+	for _, kind := range []string{"depth", "cycle"} {
+		t.Run(kind, func(t *testing.T) {
+			e := newBatteryEnv(t)
+			inner, err := nzbparser.Write(nzbbuild.Build(nzbbuild.File{Subject: "Movie.mkv", Segments: []nzbbuild.Segment{{ID: "media", Bytes: 1000}}}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			payload := nestedZip(t, map[string][]byte{"one.nzb": inner, "two.nzb": inner})
+			outer := nzbbuild.Build(nzbbuild.File{Subject: "wrapper.zip", Segments: e.registerContent("branch", payload, 100, 1.1, &nntppool.YEncMeta{FileName: "wrapper.zip", FileSize: int64(len(payload))})})
+			chain := nestedNzbChain{Depth: maxNestedNzbDepth}
+			if kind == "cycle" {
+				chain = nestedNzbChain{Depth: 1, Seen: [][32]byte{sha256.Sum256(inner)}}
+			}
+			raw, err := json.Marshal(map[string]any{nestedNzbChainKey: chain})
+			if err != nil {
+				t.Fatal(err)
+			}
+			metadata := string(raw)
+			path := nzbbuild.WriteTemp(t, outer, "Branch")
+			before, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, written, err := e.proc.ProcessNzbFile(context.Background(), path, "", 7, nil, nil, nil, nil, &metadata, nil)
+			want := "nesting limit"
+			if kind == "cycle" {
+				want = "cycle detected"
+			}
+			if err == nil || !strings.Contains(err.Error(), want) || !IsNonRetryable(err) {
+				t.Fatalf("expected %s, got %v", want, err)
+			}
+			if len(written) != 0 {
+				t.Fatalf("unexpected writes: %v", written)
+			}
+			after, err := os.ReadFile(path)
+			if err != nil || !bytes.Equal(before, after) {
+				t.Fatalf("wrapper changed on failure: %v", err)
+			}
+		})
+	}
+}
+
+func TestNestedNzbPayloadLimits(t *testing.T) {
+	inner, err := nzbparser.Write(nzbbuild.Build(nzbbuild.File{Subject: "Movie.mkv", Segments: []nzbbuild.Segment{{ID: "media", Bytes: 1000}}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, kind := range []string{"jobs", "invalid-child", "gzip-limit"} {
+		t.Run(kind, func(t *testing.T) {
+			entries := map[string][]byte{"one.nzb": inner}
+			want := "job limit"
+			switch kind {
+			case "jobs":
+				for i := 0; i < maxNestedNzbJobs; i++ {
+					entries[fmt.Sprintf("%d.nzb", i)] = inner
+				}
+			case "invalid-child":
+				entries["two.nzb"] = []byte("invalid")
+				want = "invalid embedded NZB"
+			case "gzip-limit":
+				var buf bytes.Buffer
+				gz := gzip.NewWriter(&buf)
+				if _, err := gz.Write(bytes.Repeat([]byte("x"), maxNestedNzbSize+1)); err != nil {
+					t.Fatal(err)
+				}
+				if err := gz.Close(); err != nil {
+					t.Fatal(err)
+				}
+				entries["two.nzb.gz"] = buf.Bytes()
+				want = "size limit"
+			}
+			payload := nestedZip(t, entries)
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "wrapper.zip"), payload, 0600); err != nil {
+				t.Fatal(err)
+			}
+			data, err := readNestedNzb(context.Background(), os.DirFS(dir), []parser.ParsedFile{{Filename: "wrapper.zip", Size: int64(len(payload))}}, "")
+			if data != nil || err == nil || !strings.Contains(err.Error(), want) || !IsNonRetryable(err) {
+				t.Fatalf("expected %s, got %v", want, err)
+			}
+		})
 	}
 }

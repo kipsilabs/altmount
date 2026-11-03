@@ -31,13 +31,15 @@ See the [Import Strategy Comparison](../3.%20Configuration/integration.md#import
 
 ## Troubleshooting
 
-### Can an NZB point to a compressed archive containing another NZB?
+### Can an NZB point to another NZB or an archive containing NZBs?
 
-Yes. AltMount automatically resolves RAR or ZIP wrapper posts containing one `.nzb` or `.nzb.gz`, then imports the release described by that NZB. The wrapper is read and decompressed during import; the final release uses normal streaming. The original queue item, category, and download ID are retained for Sonarr/Radarr.
+Yes. AltMount automatically follows directly posted `.nzb` and `.nzb.gz` payloads and NZBs inside RAR or ZIP wrapper posts. Wrappers are read and decompressed during import; the final releases use normal streaming. A wrapper containing one NZB retains its original queue item, category, and download ID for Sonarr/Radarr.
+
+When a wrapper contains several NZBs, each release imports as an independent job. The first NZB continues in the original job, retaining its download ID for Sonarr/Radarr and Stremio. The remaining NZBs receive separate queue jobs and new download IDs. Child jobs inherit the wrapper's category, priority, indexer, relative path, target path, and notification settings. No wrapper completion is reported: each release completes after its own import. Retrying the original job does not queue its siblings again.
 
 Wrapper posts may include `.nfo`, `.txt`, `.sfv`, `.srr`, or `.par2` sidecars. Archives containing media or other payloads use the normal import path. RAR passwords are read from the NZB's existing password metadata or filename conventions; encrypted ZIPs are unsupported.
 
-Automatic resolution is limited to 32 MiB of archive volumes per level, an 8 MiB extracted NZB, and four wrapper levels. Multiple embedded NZBs, invalid NZBs, and cycles fail the import. This feature does not enable streaming compressed media files.
+Automatic resolution is limited to 32 MiB of posted wrapper data and 32 MiB of extracted NZB data per level, 8 MiB per NZB, 64 child jobs per wrapper, and four wrapper levels. Nesting depth and cycle checks continue across child jobs. Invalid NZBs, cycles, and exceeded limits fail the import before any children are queued. This feature does not enable streaming compressed media files.
 
 ### Why are my imports stuck in purple?
 
