@@ -81,6 +81,17 @@ func getFileInfo(
 	}
 	fromPar2 := par2Filename != "" && filename == par2Filename
 
+	// PAR2 names can omit the media extension while retaining dotted release tags.
+	// Keep the full name and recover only a known media suffix from another source.
+	if fromPar2 && !fromSidecar && !IsImportantFileType(filename) && !IsKnownMediaExtension(filename) && !IsPar2File(filename) {
+		for _, source := range []string{subjectFilename, headerFilename} {
+			if IsKnownMediaExtension(source) {
+				filename += filepath.Ext(source)
+				break
+			}
+		}
+	}
+
 	// Gap 4: Correct extension based on magic bytes when filename appears obfuscated.
 	// This handles files that were uploaded with a wrong or missing extension.
 	if !fromSidecar {

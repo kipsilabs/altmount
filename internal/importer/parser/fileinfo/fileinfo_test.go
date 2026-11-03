@@ -4,9 +4,9 @@ import (
 	"crypto/md5"
 	"testing"
 
-	"github.com/kipsilabs/altmount/internal/importer/parser/par2"
 	"github.com/javi11/nntppool/v5"
 	"github.com/javi11/nzbparser"
+	"github.com/kipsilabs/altmount/internal/importer/parser/par2"
 )
 
 func TestIsProbablyObfuscated(t *testing.T) {
@@ -293,6 +293,52 @@ func par2DescFor(first16KB []byte, name string) map[[16]byte]*par2.FileDescripto
 	copy(padded, first16KB)
 	key := md5.Sum(padded)
 	return map[[16]byte]*par2.FileDescriptor{key: {Name: name, Hash16k: key, Length: 100}}
+}
+
+func TestGetFileInfo_Par2MediaExtension(t *testing.T) {
+	const release = "Red.Dwarf.S07E02.Stoke.Me.a.Clipper.1080p.FLAC.2.0.AVC.REMUX-FraMeSToR-AsRequested"
+	tests := []struct {
+		name    string
+		par2    string
+		subject string
+		header  string
+		want    string
+	}{
+		{"subject extension", release, "6WMC.mkv", "", release + ".mkv"},
+		{"header extension", release, "6WMC", "6WMC.mkv", release + ".mkv"},
+		{"subject takes precedence", release, "6WMC.mkv", "6WMC.mp4", release + ".mkv"},
+		{"uppercase extension", release, "6WMC.MKV", "", release + ".MKV"},
+		{"no dot in PAR2 name", "Movie", "6WMC.mp4", "", "Movie.mp4"},
+		{"audio extension", release, "6WMC.flac", "", release + ".flac"},
+		{"existing media extension", release + ".mp4", "6WMC.mkv", "", release + ".mp4"},
+		{"existing audio extension", release + ".flac", "6WMC.mkv", "", release + ".flac"},
+		{"RAR volume", release + ".r00", "6WMC.mkv", "", release + ".r00"},
+		{"7z volume", release + ".7z.001", "6WMC.mkv", "", release + ".7z.001"},
+		{"multipart media", release + ".mkv.001", "6WMC.mkv", "", release + ".mkv.001"},
+		{"PAR2 sidecar", release + ".nfo", "6WMC.mkv", "", release + ".nfo"},
+		{"PAR2 archive", release + ".par2", "6WMC.mkv", "", release + ".par2"},
+		{"no known media extension", release, "6WMC.bin", "6WMC.dat", release},
+		{"no extension source", release, "6WMC", "", release},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			content := mkvFixture()
+			file := &NzbFileWithFirstSegment{
+				NzbFile:   &nzbparser.NzbFile{Filename: tt.subject},
+				First16KB: content,
+			}
+			if tt.header != "" {
+				file.Headers = &nntppool.YEncMeta{FileName: tt.header, FileSize: 200}
+			}
+			info := getFileInfo(file, par2DescFor(content, tt.par2), "Different.NZB.Name")
+			if info.Filename != tt.want {
+				t.Errorf("Filename = %q, want %q", info.Filename, tt.want)
+			}
+			if info.FileSize == nil || *info.FileSize != 100 {
+				t.Errorf("FileSize = %v, want PAR2 size 100", info.FileSize)
+			}
+		})
+	}
 }
 
 // TestGetFileInfo_Par2NameSurvivesGap5 guards the RAR-set fragmentation bug: PAR2
