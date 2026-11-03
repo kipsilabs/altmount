@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/kipsilabs/altmount/internal/database"
+	metapb "github.com/kipsilabs/altmount/internal/metadata/proto"
 	"github.com/stretchr/testify/require"
 )
 
@@ -21,7 +22,6 @@ func TestServiceFailedRepairPreservesDegradedFile(t *testing.T) {
 		attempts int
 	}{
 		{"unrepairable", fmt.Errorf("%w: no PAR2 files", ErrUnrepairable), 0},
-		{"nothing to repair", ErrNothingToRepair, 0},
 		{"attempts exhausted", errors.New("provider timeout"), maxJobAttempts - 1},
 	} {
 		t.Run(failure.name, func(t *testing.T) {
@@ -74,6 +74,66 @@ func TestServiceFailedRepairPreservesDegradedFile(t *testing.T) {
 			jobs, err := repo.List(ctx, 10)
 			require.NoError(t, err)
 			require.Empty(t, jobs)
+		})
+	}
+}
+
+func TestServiceNothingToRepairRestoresFileHealth(t *testing.T) {
+	for _, outcome := range []struct {
+		name string
+		err  error
+	}{
+		{"sentinel", ErrNothingToRepair},
+		{"wrapped", fmt.Errorf("verify release: %w", ErrNothingToRepair)},
+	} {
+		t.Run(outcome.name, func(t *testing.T) {
+			ctx := context.Background()
+			db, err := database.NewDB(database.Config{DatabasePath: filepath.Join(t.TempDir(), "repair.db")})
+			require.NoError(t, err)
+			t.Cleanup(func() { db.Close() })
+			health := database.NewHealthRepository(db.Connection(), database.DialectSQLite)
+			repo := database.NewPar2RepairRepository(db.Connection(), database.DialectSQLite)
+			s := testService(t, repo, true)
+			meta := &recordingMeta{storeRef: "release-1"}
+			s.meta = meta
+			s.SetHealthStore(health)
+			resumer := &recordingResumer{}
+			s.SetImportResumer(resumer)
+			paths := []string{"corrupted.mkv", "degraded.mkv", "repair_triggered.mkv"}
+			for i, status := range []database.HealthStatus{database.HealthStatusCorrupted, database.HealthStatusDegraded, database.HealthStatusRepairTriggered} {
+				reason := "confirmed missing segments"
+				require.NoError(t, health.UpdateFileHealth(ctx, paths[i], status, &reason, nil, nil, false))
+				_, err := db.Connection().Exec(`UPDATE file_health SET scheduled_check_at=NULL WHERE file_path=?`, paths[i])
+				require.NoError(t, err)
+			}
+			s.Enqueue(ctx, paths[0], "")
+			s.execute = func(ctx context.Context, _ *database.Par2RepairJob) error {
+				// Files joining during execution must receive the clean verdict too.
+				for _, path := range paths[1:] {
+					s.Enqueue(ctx, path, "")
+				}
+				return outcome.err
+			}
+			require.True(t, s.runNext(ctx))
+			for _, path := range paths {
+				got, err := health.GetFileHealth(ctx, path)
+				require.NoError(t, err)
+				require.Equal(t, database.HealthStatusHealthy, got.Status, path)
+				require.Nil(t, got.LastError, path)
+				var scheduled time.Time
+				require.NoError(t, db.Connection().QueryRow(`SELECT scheduled_check_at FROM file_health WHERE file_path=?`, path).Scan(&scheduled))
+				require.False(t, scheduled.IsZero(), path)
+			}
+			require.Len(t, meta.statusCalls, 3)
+			for _, call := range meta.statusCalls {
+				require.Contains(t, paths, call.path)
+				require.Equal(t, metapb.FileStatus_FILE_STATUS_HEALTHY, call.status)
+			}
+			jobs, err := repo.List(ctx, 10)
+			require.NoError(t, err)
+			require.Empty(t, jobs)
+			require.Empty(t, resumer.resumed)
+			require.Empty(t, resumer.failed)
 		})
 	}
 }

@@ -374,7 +374,16 @@ func (s *Service) handleOutcome(ctx context.Context, job *database.Par2RepairJob
 		s.resumeImport(ctx, job)
 		s.deleteJob(ctx, job.ID)
 		s.pruneStore(ctx)
-	case errors.Is(err, ErrUnrepairable), errors.Is(err, ErrNothingToRepair):
+	case errors.Is(err, ErrNothingToRepair):
+		s.log.InfoContext(ctx, "PAR2 verification found nothing to repair", "file", job.FilePath)
+		for _, member := range s.jobMembers(ctx, job) {
+			s.markFileHealthy(ctx, member)
+		}
+		// An intact release cannot fix a deferred import's analysis failure;
+		// resuming it would loop through the same failure indefinitely.
+		s.failImport(ctx, job, err.Error())
+		s.deleteJob(ctx, job.ID)
+	case errors.Is(err, ErrUnrepairable):
 		s.log.WarnContext(ctx, "PAR2 repair not possible", "file", job.FilePath, "reason", err)
 		for _, member := range s.jobMembers(ctx, job) {
 			s.markFileUnrepairable(ctx, member, err.Error())
@@ -527,7 +536,7 @@ func (s *Service) markFileHealthy(ctx context.Context, filePath string) {
 		}
 	}
 	if s.health != nil {
-		note := "restored by PAR2 repair"
+		note := "verified healthy by PAR2 repair"
 		if err := s.health.UpdateFileHealth(ctx, filePath, database.HealthStatusHealthy, nil, nil, &note, false); err != nil {
 			s.log.ErrorContext(ctx, "Failed to flip health record to healthy after repair",
 				"error", err, "file", filePath)
