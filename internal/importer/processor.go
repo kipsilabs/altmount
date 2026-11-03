@@ -3,7 +3,6 @@ package importer
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -1017,8 +1016,12 @@ func (proc *Processor) ProcessNzbFile(ctx context.Context, filePath, relativePat
 			return "", nil, fmt.Errorf("failed to close NZB file: %w", err)
 		}
 
-		seen := make(map[[32]byte]struct{})
-		for depth := 0; ; depth++ {
+		chain, chainErr := readNestedNzbChain(metadata)
+		if chainErr != nil {
+			return "", nil, chainErr
+		}
+		var resolved []byte
+		for {
 			parser.SanitizeNzbFilenames(n)
 
 			// Articles the NZB never listed become sized placeholders, so later
@@ -1086,27 +1089,37 @@ func (proc *Processor) ProcessNzbFile(ctx context.Context, filePath, relativePat
 			degradedFiles = mergeDegradedFiles(degradedFiles, parsed.DegradedFiles)
 
 			inner, resolveErr := proc.resolveNestedNzb(ctx, parsed)
+			var jobs *nestedNzbJobsError
+			if errors.As(resolveErr, &jobs) {
+				for _, job := range jobs.Jobs {
+					if _, err := chain.follow(job.Data); err != nil {
+						return "", nil, err
+					}
+				}
+				jobs.Chain = chain
+				return "", nil, jobs
+			}
 			if resolveErr != nil {
 				return "", nil, fmt.Errorf("failed to resolve embedded NZB: %w", resolveErr)
 			}
 			if inner == nil {
+				if resolved != nil {
+					if err := persistNestedNzb(filePath, resolved); err != nil {
+						return "", nil, fmt.Errorf("failed to persist embedded NZB: %w", err)
+					}
+				}
 				break
 			}
-			if depth >= maxNestedNzbDepth {
-				return "", nil, NewNonRetryableError("embedded NZB nesting limit exceeded", nil)
+			chain, err = chain.follow(inner)
+			if err != nil {
+				return "", nil, err
 			}
-			hash := sha256.Sum256(inner)
-			if _, exists := seen[hash]; exists {
-				return "", nil, NewNonRetryableError("embedded NZB cycle detected", nil)
-			}
-			seen[hash] = struct{}{}
+			resolved = inner
 			n, err = nzbparser.Parse(bytes.NewReader(inner))
 			if err != nil {
 				return "", nil, NewNonRetryableError("failed to parse embedded NZB", err)
 			}
-			if err := persistNestedNzb(filePath, inner); err != nil {
-				return "", nil, fmt.Errorf("failed to persist embedded NZB: %w", err)
-			}
+
 			// Wrapper extraction metadata describes the wrapper, not the release.
 			extractedFiles = nil
 			proc.updateProgressWithStage(queueID, 0, "Resolving embedded NZB")

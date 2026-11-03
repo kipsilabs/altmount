@@ -31,7 +31,7 @@ const (
 	maxNestedNzbSize     = 8 << 20
 )
 
-// resolveNestedNzb only probes small, archive-only posts. Media imports keep
+// resolveNestedNzb only probes small NZB-only or archive-only posts. Media imports keep
 // their existing streaming path, including the prohibition on compressed media.
 func (proc *Processor) resolveNestedNzb(ctx context.Context, parsed *parser.ParsedNzb) ([]byte, error) {
 	var archives []parser.ParsedFile
@@ -42,7 +42,7 @@ func (proc *Processor) resolveNestedNzb(ctx context.Context, parsed *parser.Pars
 		if file.Is7zArchive {
 			return nil, nil
 		}
-		if file.IsRarArchive || strings.EqualFold(filepath.Ext(file.Filename), ".zip") {
+		if file.IsRarArchive || strings.EqualFold(filepath.Ext(file.Filename), ".zip") || nzbtrim.HasNzbExtension(file.Filename) {
 			archives = append(archives, file)
 			total += file.Size
 		} else if !file.IsPar2Archive && !nestedNzbSidecar(file.Filename) {
@@ -83,7 +83,7 @@ func nestedNzbSidecar(name string) bool {
 }
 
 // readNestedNzb inspects headers before decompressing. It never extracts
-// archive paths onto disk and refuses to choose between multiple NZBs.
+// archive paths onto disk. Multiple NZBs become separate queue jobs.
 func readNestedNzb(ctx context.Context, source fs.FS, archives []parser.ParsedFile, password string) ([]byte, error) {
 	type candidate struct {
 		name     string
@@ -98,6 +98,25 @@ func readNestedNzb(ctx context.Context, source fs.FS, archives []parser.ParsedFi
 		}
 		if file.IsRarArchive {
 			rarFiles = append(rarFiles, file)
+			continue
+		}
+		if nzbtrim.HasNzbExtension(file.Filename) {
+			name, size := file.Filename, file.Size
+			candidates = append(candidates, candidate{name: name, oversize: file.Size > maxNestedNzbSize, open: func() (io.ReadCloser, error) {
+				f, err := source.Open(name)
+				if err != nil {
+					return nil, err
+				}
+				if ra, ok := f.(io.ReaderAt); ok {
+					// Each range read owns its timeout; sequential UsenetFile reads
+					// retain a reader whose creation context has already expired.
+					return struct {
+						io.Reader
+						io.Closer
+					}{io.NewSectionReader(ra, 0, size), f}, nil
+				}
+				return f, nil
+			}})
 			continue
 		}
 		f, err := source.Open(file.Filename)
@@ -192,25 +211,45 @@ func readNestedNzb(ctx context.Context, source fs.FS, archives []parser.ParsedFi
 	if len(candidates) == 0 {
 		return nil, nil
 	}
-	if len(candidates) != 1 {
-		return nil, NewNonRetryableError("archive contains multiple NZBs; cannot select a release", nil)
+	if len(candidates) > maxNestedNzbJobs {
+		return nil, NewNonRetryableError("embedded NZB job limit exceeded", nil)
 	}
-	c := candidates[0]
-	// Validate payload limits only after all entries have confirmed this is
-	// an NZB wrapper, rather than an ordinary archive with an NZB sidecar.
-	if c.oversize {
-		return nil, NewNonRetryableError("embedded NZB exceeds size limit", nil)
+	var jobs []nestedNzbJob
+	var total int
+	for _, c := range candidates {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if c.oversize {
+			return nil, NewNonRetryableError("embedded NZB exceeds size limit", nil)
+		}
+		r, err := c.open()
+		if err != nil {
+			return nil, err
+		}
+		data, readErr := readNestedNzbPayload(c.name, r)
+		r.Close()
+		if readErr != nil {
+			return nil, readErr
+		}
+		total += len(data)
+		if total > maxNestedArchiveSize {
+			return nil, NewNonRetryableError("embedded NZBs exceed total size limit", nil)
+		}
+		jobs = append(jobs, nestedNzbJob{Name: c.name, Data: data})
 	}
-	r, err := c.open()
-	if err != nil {
-		return nil, err
+	if len(jobs) > 1 {
+		return nil, &nestedNzbJobsError{Jobs: jobs}
 	}
-	defer r.Close()
+	return jobs[0].Data, nil
+}
+
+func readNestedNzbPayload(name string, r io.Reader) ([]byte, error) {
 	data, err := readNestedNzbBytes(r)
 	if err != nil {
 		return nil, err
 	}
-	if nzbfile.IsGzipped(c.name) {
+	if nzbfile.IsGzipped(name) {
 		gr, err := gzip.NewReader(bytes.NewReader(data))
 		if err != nil {
 			return nil, NewNonRetryableError("invalid embedded gzip NZB", err)
