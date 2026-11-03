@@ -739,17 +739,22 @@ func sizeArticles(
 		} else {
 			derived = partSize
 		}
-		// The probe may have hit the (smaller) final article; a uniform part
-		// size must satisfy (n-1)*partSize < length <= n*partSize. This is also
-		// what validates a borrowed hint.
-		if int64(n-1)*partSize >= length || int64(n)*partSize < length {
+		// The probe may have hit the (smaller) final article, so a uniform part
+		// size must cover the file: length <= n*partSize. This also rejects a
+		// borrowed hint that is too small; one that is too large fails the
+		// slice checksums instead.
+		if int64(n)*partSize < length {
 			return sf, 0, fmt.Errorf("%w: part size %d inconsistent with %d articles of %d bytes in %q",
 				ErrUnrepairable, partSize, n, length, fd.Name)
 		}
+		// Some posts list articles past the end of the file, often dead ones.
+		// PAR2's length is authoritative, so they carry none of this file's
+		// bytes and must not count as damage.
+		n = int((length + partSize - 1) / partSize)
 	}
 
 	var off int64
-	for i, seg := range entry.Segments {
+	for i, seg := range entry.Segments[:n] {
 		msgID := normalizeMsgID(seg.Id)
 		size := partSize
 		if i == n-1 {

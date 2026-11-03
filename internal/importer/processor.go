@@ -71,6 +71,17 @@ type Processor struct {
 // still retrievable.
 var ErrDeferredForRepair = errors.New("import deferred pending PAR2 repair")
 
+// articlesPastEndError reports that a release's missing articles include dead
+// ones listed past the end of a file. keep is how many articles to keep, by
+// file index.
+type articlesPastEndError struct {
+	keep map[int]int
+}
+
+func (e *articlesPastEndError) Error() string {
+	return "dead articles listed past the end of a file"
+}
+
 // shouldDeferForRepair decides whether a damaged release waits for a PAR2
 // repair instead of being dropped. Deferring needs the feature enabled, PAR2
 // files in the NZB to repair from, and actual damage to repair.
@@ -535,6 +546,15 @@ func (proc *Processor) preParseFastFail(ctx context.Context, n *nzbparser.Nzb, c
 				"duration", time.Since(probeStart))
 		}
 	default:
+		// Some posts list dead articles past the end of a file. Those are not
+		// damage, so the miss may mean nothing at all: have the caller trim
+		// them and check again before judging the release.
+		if proc.parser != nil {
+			if keep := proc.parser.FindDeadArticlesPastEnd(ctx, n.Files); len(keep) > 0 {
+				return nil, nil, nil, &articlesPastEndError{keep: keep}
+			}
+		}
+
 		isStremioImport := (category != nil && *category == "stremio") || (downloadID != nil && strings.HasPrefix(*downloadID, "stremio:"))
 		// A miss confined to sidecars (a separately posted .nfo often expires
 		// on its own) says nothing about the media: escalate so the sweep
@@ -1028,6 +1048,13 @@ func (proc *Processor) ProcessNzbFile(ctx context.Context, filePath, relativePat
 			}
 			<-warmDone
 			cancelWarm()
+			// Trimmed here, not in the check: the warm-up reads n.Files until
+			// warmDone closes.
+			var pastEnd *articlesPastEndError
+			if errors.As(fastFailErr, &pastEnd) {
+				proc.parser.TrimArticles(ctx, n.Files, pastEnd.keep)
+				brokenIdx, missingIDs, degradedFiles, fastFailErr = proc.preParseFastFail(ctx, n, cfg, queueID, category, downloadID)
+			}
 			if fastFailErr != nil {
 				// A deferral is not a failure: propagate it so the service parks
 				// the queue item pending the repair. Checked before the

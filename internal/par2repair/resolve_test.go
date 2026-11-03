@@ -137,6 +137,52 @@ func TestResolveEndToEndWithRunJob(t *testing.T) {
 	}
 }
 
+// listPastEnd appends articles to a.rar that the provider never serves, as some
+// posts do past the end of a file.
+func listPastEnd(store *metapb.NzbStore, count int) {
+	for i := range count {
+		seg := &metapb.NzbSeg{Id: fmt.Sprintf("a.rar-extra-%d@test", i), Number: int32(5 + i), Bytes: 2248}
+		store.Files[0].Segments = append(store.Files[0].Segments, seg)
+	}
+}
+
+// Dead articles listed past the end of a file are not damage: real damage in
+// the same file still repairs, without patching the extras.
+func TestResolveIgnoresArticlesListedPastFileEnd(t *testing.T) {
+	fm, store, fetch, contents, deadID := mkResolveFixture(t, false)
+	listPastEnd(store, 3)
+
+	res, err := Resolve(context.Background(), fm, store, []string{deadID}, fetch,
+		Caps{MaxRepairRatio: 0.5, MaxMemoryBytes: 64 << 20}, testLogger(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Plan.DeadArticles) != 1 || res.Plan.DeadArticles[0].MessageID != deadID {
+		t.Fatalf("dead articles = %+v, want only %s", res.Plan.DeadArticles, deadID)
+	}
+	ps := NewPatchStore(t.TempDir())
+	if err := RunJob(context.Background(), res.Plan, res.Index, res.Par2Files, fetch, ps, testLogger()); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := ps.Get(deadID)
+	if !ok || !bytes.Equal(got, contents["a.rar"][2048:4096]) {
+		t.Fatal("repair did not reproduce the dead article payload")
+	}
+}
+
+// A file whose only dead articles lie past its end is intact.
+func TestResolveNothingToRepairWhenOnlyArticlesPastFileEndAreDead(t *testing.T) {
+	fm, store, fetch, contents, deadID := mkResolveFixture(t, false)
+	fetch.articles[deadID] = contents["a.rar"][2048:4096]
+	listPastEnd(store, 3)
+
+	_, err := Resolve(context.Background(), fm, store, nil, fetch,
+		Caps{MaxRepairRatio: 0.5, MaxMemoryBytes: 64 << 20}, testLogger(), nil)
+	if !errors.Is(err, ErrNothingToRepair) {
+		t.Fatalf("err = %v, want ErrNothingToRepair", err)
+	}
+}
+
 // mkVolumeFixture builds a release of two volumes with a full PAR2 set and no
 // dead articles; the caller decides which message IDs to remove from the
 // fetcher. Volume sizes differ so a part size borrowed from one file is
