@@ -2,6 +2,8 @@ package health
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 
 	"github.com/kipsilabs/altmount/internal/holes"
@@ -37,23 +39,7 @@ func (hc *HealthChecker) classifyHoles(
 		return nil
 	}
 
-	var acc holes.Accumulator
-	known := metadata.KnownHolesFromProto(input.knownHoles)
-	if hc.patchIndex == nil {
-		acc.Load(known)
-	} else {
-		// Keep the persisted provider-missing evidence, but repaired bytes
-		// are no longer holes while their local patches remain available.
-		for _, run := range known {
-			start := min(run.Start, len(input.segments))
-			end := start + min(run.Count, len(input.segments)-start)
-			for i := start; i < end; i++ {
-				if !hc.hasPatch(input.segments[i].Id) {
-					acc.Add(i)
-				}
-			}
-		}
-	}
+	acc := hc.unpatchedKnownHoles(input)
 	priorTotal := acc.Total()
 	observed := missingRuns(input.segments, result.MissingIDs)
 	acc.Load(observed)
@@ -109,6 +95,68 @@ func (hc *HealthChecker) classifyHoles(
 	}
 }
 
+// classifyKnownHoles is the verdict for a sweep that found nothing missing,
+// judged against the file's persisted holes. A clean STAT sample cannot clear
+// them: providers can answer STAT for an article whose body is gone, so the
+// hole map is the only body-level evidence there is. Holes count regardless
+// of age or provider fingerprint (those only decide whether playback asks
+// for the article again before padding), and only a local patch covers one.
+//
+// The verdict is degraded, never failed: the sweep found no new damage, and
+// the pad recorder only persists holes within the padding caps.
+//
+// Returns nil, nil when the file is ineligible or has no unpatched hole, and
+// an error when its metadata cannot be read or is gone: without the hole map
+// a clean sweep is not evidence of a healthy file.
+func (hc *HealthChecker) classifyKnownHoles(filePath string, result usenet.ValidationResult) (*holes.Impact, error) {
+	fileMeta, err := hc.metadataService.ReadFileMetadata(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("could not re-read metadata for known holes: %w", err)
+	}
+	if fileMeta == nil {
+		return nil, errors.New("metadata disappeared during the check")
+	}
+	input, ok := classificationInput(filePath, fileMeta)
+	if !ok {
+		return nil, nil
+	}
+	acc := hc.unpatchedKnownHoles(input)
+	if acc.Total() == 0 {
+		return nil, nil
+	}
+	totalSegments := len(input.segments)
+	segBytes := avgSegmentBytes(input.fileSize, totalSegments)
+	var ratio float64
+	if input.fileSize > 0 {
+		ratio = float64(int64(acc.Total())*segBytes) / float64(input.fileSize)
+	}
+	return &holes.Impact{
+		Verdict:       holes.VerdictDegraded,
+		TotalMissing:  acc.Total(),
+		LongestRun:    acc.LongestRun(),
+		Sampled:       result.TotalChecked,
+		TotalSegments: totalSegments,
+		PaddedRatio:   ratio,
+	}, nil
+}
+
+// unpatchedKnownHoles loads the file's persisted hole map, minus segments a
+// local patch has repaired: the provider-missing evidence stays, but repaired
+// bytes are no longer holes while their patches remain available.
+func (hc *HealthChecker) unpatchedKnownHoles(input healthCheckInput) holes.Accumulator {
+	var acc holes.Accumulator
+	for _, run := range metadata.KnownHolesFromProto(input.knownHoles) {
+		start := min(run.Start, len(input.segments))
+		end := start + min(run.Count, len(input.segments)-start)
+		for i := start; i < end; i++ {
+			if !hc.hasPatch(input.segments[i].Id) {
+				acc.Add(i)
+			}
+		}
+	}
+	return acc
+}
+
 // loadClassificationInput re-reads metadata for hole classification and
 // reports whether the file is eligible (plain unencrypted video).
 func (hc *HealthChecker) loadClassificationInput(filePath string) (healthCheckInput, bool) {
@@ -116,6 +164,12 @@ func (hc *HealthChecker) loadClassificationInput(filePath string) (healthCheckIn
 	if err != nil || fileMeta == nil {
 		return healthCheckInput{}, false
 	}
+	return classificationInput(filePath, fileMeta)
+}
+
+// classificationInput extracts the hole-classification fields and reports
+// whether the file is eligible (plain unencrypted video).
+func classificationInput(filePath string, fileMeta *metapb.FileMetadata) (healthCheckInput, bool) {
 	input := healthCheckInput{
 		fileSize:      fileMeta.FileSize,
 		sourceNzbPath: fileMeta.SourceNzbPath,

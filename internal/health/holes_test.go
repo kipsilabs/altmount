@@ -4,15 +4,20 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/kipsilabs/altmount/internal/config"
 	"github.com/kipsilabs/altmount/internal/database"
 	"github.com/kipsilabs/altmount/internal/holes"
 	"github.com/kipsilabs/altmount/internal/metadata"
 	metapb "github.com/kipsilabs/altmount/internal/metadata/proto"
+	"github.com/kipsilabs/altmount/internal/par2repair"
 	"github.com/kipsilabs/altmount/internal/pool"
 	"github.com/kipsilabs/altmount/internal/testsupport/fakepool"
+	"github.com/kipsilabs/altmount/internal/usenet"
 	"github.com/javi11/nntppool/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -37,6 +42,7 @@ type holeTestEnv struct {
 	filePath string
 	segIDs   []string
 	cfg      *config.Config
+	metaRoot string
 }
 
 func newHoleTestEnv(t *testing.T, fileName string, fileSize, segSize int64) *holeTestEnv {
@@ -91,6 +97,7 @@ func newHoleTestEnv(t *testing.T, fileName string, fileSize, segSize int64) *hol
 		filePath: filePath,
 		segIDs:   ids,
 		cfg:      cfg,
+		metaRoot: tempDir,
 	}
 }
 
@@ -217,4 +224,163 @@ func TestHealthCheckMergesPersistedHoles(t *testing.T) {
 	assert.Equal(t, holes.VerdictDegraded, event.Classification.Verdict)
 	// Persisted hole (5) + newly observed (20) both counted.
 	assert.Equal(t, 2, event.Classification.TotalMissing)
+}
+
+// A STAT sweep cannot clear a known hole: providers can answer STAT for an
+// article whose body is gone. Persisted holes therefore keep the file
+// degraded through a clean sweep, sampled or full, single or batched, and
+// whatever their age or provider fingerprint.
+func TestHealthCheckKnownHolesSurviveCleanSweep(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		sampled bool
+		batch   bool
+		stale   bool
+	}{
+		{name: "sampled single", sampled: true},
+		{name: "sampled batch", sampled: true, batch: true},
+		{name: "full single"},
+		{name: "full batch", batch: true},
+		{name: "stale foreign hole", sampled: true, stale: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newHoleTestEnv(t, "movie.mp4", 4*1024*1024, 1024)
+			if tc.sampled {
+				checkAll := false
+				env.cfg.Health.CheckAllSegments = &checkAll
+				env.cfg.Health.SegmentSamplePercentage = 5
+			}
+			require.NoError(t, env.ms.AddKnownHoles(env.filePath, []holes.Run{{Start: 5, Count: 2}}, env.cfg.ProviderFingerprint()))
+			if tc.stale {
+				require.NoError(t, env.ms.UpdateFileMetadata(env.filePath, func(m *metapb.FileMetadata) {
+					m.HoleProviderFingerprint = "another-provider-set"
+					for _, r := range m.KnownHoles {
+						r.RecordedAt = time.Now().Add(-2 * holes.TTL).Unix()
+					}
+				}))
+			}
+
+			var event HealthEvent
+			if tc.batch {
+				event = env.checker.CheckFilesBatch(context.Background(), []string{env.filePath}, nil)[0]
+			} else {
+				event = env.checker.CheckFile(context.Background(), env.filePath)
+			}
+
+			require.Equal(t, EventTypeFileCorrupted, event.Type, "err: %v", event.Error)
+			require.NotNil(t, event.Classification)
+			assert.Equal(t, holes.VerdictDegraded, event.Classification.Verdict)
+			assert.Equal(t, 2, event.Classification.TotalMissing)
+			require.NotNil(t, event.Details)
+			var details database.HealthErrorDetails
+			require.NoError(t, json.Unmarshal([]byte(*event.Details), &details))
+			assert.Equal(t, "known_holes", details.ErrorType)
+		})
+	}
+}
+
+// Known holes never escalate a clean sweep to failed, even when they exceed
+// the acceptable-missing threshold: the sweep found no new damage.
+func TestHealthCheckKnownHolesCleanSweepNeverFails(t *testing.T) {
+	env := newHoleTestEnv(t, "movie.mp4", 4*1024*1024, 1024)
+	env.cfg.Health.AcceptableMissingSegmentsPercentage = 0
+	require.NoError(t, env.ms.AddKnownHoles(env.filePath, []holes.Run{{Start: 5, Count: 1}}, env.cfg.ProviderFingerprint()))
+
+	event := env.checker.CheckFile(context.Background(), env.filePath)
+	require.NotNil(t, event.Classification)
+	assert.Equal(t, holes.VerdictDegraded, event.Classification.Verdict)
+}
+
+// Once every known hole is covered by a local patch, a clean sweep is healthy.
+func TestHealthCheckPatchedKnownHolesCleanSweepIsHealthy(t *testing.T) {
+	env := newHoleTestEnv(t, "movie.mp4", 4*1024*1024, 1024)
+	require.NoError(t, env.ms.AddKnownHoles(env.filePath, []holes.Run{{Start: 5, Count: 2}}, env.cfg.ProviderFingerprint()))
+	store := par2repair.NewPatchStore(t.TempDir())
+	require.NoError(t, store.Put(env.segIDs[5], make([]byte, 1024)))
+	require.NoError(t, store.Put(env.segIDs[6], make([]byte, 1024)))
+	env.checker.SetPatchIndex(store)
+
+	event := env.checker.CheckFile(context.Background(), env.filePath)
+	require.Equal(t, EventTypeFileHealthy, event.Type, "err: %v", event.Error)
+	assert.Nil(t, event.Classification)
+}
+
+// Hole classification only applies to plain video: other files keep the
+// old clean-sweep verdict even when they carry a hole map.
+func TestHealthCheckKnownHolesIgnoredForIneligibleFile(t *testing.T) {
+	env := newHoleTestEnv(t, "archive.rar", 4*1024*1024, 1024)
+	require.NoError(t, env.ms.AddKnownHoles(env.filePath, []holes.Run{{Start: 5, Count: 1}}, env.cfg.ProviderFingerprint()))
+
+	event := env.checker.CheckFile(context.Background(), env.filePath)
+	require.Equal(t, EventTypeFileHealthy, event.Type, "err: %v", event.Error)
+}
+
+// cleanSweep runs the clean-sweep verdict on a check prepared earlier, so a
+// test can change the metadata in between, as playback or a delete would.
+func (e *holeTestEnv) cleanSweep(t *testing.T, prep preparedCheck) HealthEvent {
+	t.Helper()
+	require.Nil(t, prep.earlyEvent)
+	return e.checker.judgeValidation(context.Background(), prep, usenet.ValidationResult{TotalChecked: len(prep.sampledIDs)}, nil)
+}
+
+// metaFile is the on-disk metadata file of the env's video.
+func (e *holeTestEnv) metaFile(t *testing.T) string {
+	t.Helper()
+	matches, err := filepath.Glob(filepath.Join(e.metaRoot, "movies", "*.meta"))
+	require.NoError(t, err)
+	require.Len(t, matches, 1)
+	return matches[0]
+}
+
+// A hole that playback records while the sweep runs must still count: the
+// verdict reads the hole map after the sweep, not the one seen at prepare.
+func TestHealthCheckHoleRecordedDuringSweepIsNotHealthy(t *testing.T) {
+	env := newHoleTestEnv(t, "movie.mp4", 4*1024*1024, 1024)
+	prep := env.checker.prepareCheck(context.Background(), env.filePath)
+	require.NoError(t, env.ms.AddKnownHoles(env.filePath, []holes.Run{{Start: 5, Count: 1}}, env.cfg.ProviderFingerprint()))
+
+	event := env.cleanSweep(t, prep)
+	require.Equal(t, EventTypeFileCorrupted, event.Type, "err: %v", event.Error)
+	require.NotNil(t, event.Classification)
+	assert.Equal(t, holes.VerdictDegraded, event.Classification.Verdict)
+}
+
+// When the hole map cannot be read after a clean sweep, the sweep proves
+// nothing about the file: the check is inconclusive, never healthy.
+func TestHealthCheckUnreadableMetadataAfterCleanSweepIsInconclusive(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		breakMeta func(t *testing.T, path string)
+	}{
+		{name: "read error", breakMeta: func(t *testing.T, path string) {
+			require.NoError(t, os.Remove(path))
+			require.NoError(t, os.Mkdir(path, 0o755))
+		}},
+		{name: "metadata gone", breakMeta: func(t *testing.T, path string) {
+			require.NoError(t, os.Remove(path))
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newHoleTestEnv(t, "movie.mp4", 4*1024*1024, 1024)
+			require.NoError(t, env.ms.AddKnownHoles(env.filePath, []holes.Run{{Start: 5, Count: 1}}, env.cfg.ProviderFingerprint()))
+			prep := env.checker.prepareCheck(context.Background(), env.filePath)
+			tc.breakMeta(t, env.metaFile(t))
+
+			event := env.cleanSweep(t, prep)
+			assert.Equal(t, EventTypeCheckInconclusive, event.Type)
+			assert.Equal(t, database.HealthStatusPending, event.Status)
+			assert.Error(t, event.Error)
+		})
+	}
+}
+
+// An ineligible file whose metadata reads fine keeps the old clean-sweep
+// verdict, with or without a hole map.
+func TestHealthCheckIneligibleFileCleanSweepIsHealthy(t *testing.T) {
+	env := newHoleTestEnv(t, "archive.rar", 4*1024*1024, 1024)
+	prep := env.checker.prepareCheck(context.Background(), env.filePath)
+	require.NoError(t, env.ms.AddKnownHoles(env.filePath, []holes.Run{{Start: 5, Count: 1}}, env.cfg.ProviderFingerprint()))
+
+	event := env.cleanSweep(t, prep)
+	require.Equal(t, EventTypeFileHealthy, event.Type, "err: %v", event.Error)
 }
