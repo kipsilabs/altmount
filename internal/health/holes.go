@@ -37,23 +37,7 @@ func (hc *HealthChecker) classifyHoles(
 		return nil
 	}
 
-	var acc holes.Accumulator
-	known := metadata.KnownHolesFromProto(input.knownHoles)
-	if hc.patchIndex == nil {
-		acc.Load(known)
-	} else {
-		// Keep the persisted provider-missing evidence, but repaired bytes
-		// are no longer holes while their local patches remain available.
-		for _, run := range known {
-			start := min(run.Start, len(input.segments))
-			end := start + min(run.Count, len(input.segments)-start)
-			for i := start; i < end; i++ {
-				if !hc.hasPatch(input.segments[i].Id) {
-					acc.Add(i)
-				}
-			}
-		}
-	}
+	acc := hc.unpatchedKnownHoles(input)
 	priorTotal := acc.Total()
 	observed := missingRuns(input.segments, result.MissingIDs)
 	acc.Load(observed)
@@ -107,6 +91,59 @@ func (hc *HealthChecker) classifyHoles(
 		TotalSegments: totalSegments,
 		PaddedRatio:   ratio,
 	}
+}
+
+// classifyKnownHoles is the verdict for a sweep that found nothing missing
+// in a file that already has persisted holes. A clean STAT sample cannot clear
+// them: providers can answer STAT for an article whose body is gone, so the
+// hole map is the only body-level evidence there is. Holes count regardless
+// of age or provider fingerprint (those only decide whether playback asks
+// for the article again before padding), and only a local patch covers one.
+//
+// The verdict is degraded, never failed: the sweep found no new damage, and
+// the pad recorder only persists holes within the padding caps.
+//
+// Returns nil when the file is ineligible or every known hole is patched.
+func (hc *HealthChecker) classifyKnownHoles(filePath string, result usenet.ValidationResult) *holes.Impact {
+	input, ok := hc.loadClassificationInput(filePath)
+	if !ok {
+		return nil
+	}
+	acc := hc.unpatchedKnownHoles(input)
+	if acc.Total() == 0 {
+		return nil
+	}
+	totalSegments := len(input.segments)
+	segBytes := avgSegmentBytes(input.fileSize, totalSegments)
+	var ratio float64
+	if input.fileSize > 0 {
+		ratio = float64(int64(acc.Total())*segBytes) / float64(input.fileSize)
+	}
+	return &holes.Impact{
+		Verdict:       holes.VerdictDegraded,
+		TotalMissing:  acc.Total(),
+		LongestRun:    acc.LongestRun(),
+		Sampled:       result.TotalChecked,
+		TotalSegments: totalSegments,
+		PaddedRatio:   ratio,
+	}
+}
+
+// unpatchedKnownHoles loads the file's persisted hole map, minus segments a
+// local patch has repaired: the provider-missing evidence stays, but repaired
+// bytes are no longer holes while their patches remain available.
+func (hc *HealthChecker) unpatchedKnownHoles(input healthCheckInput) holes.Accumulator {
+	var acc holes.Accumulator
+	for _, run := range metadata.KnownHolesFromProto(input.knownHoles) {
+		start := min(run.Start, len(input.segments))
+		end := start + min(run.Count, len(input.segments)-start)
+		for i := start; i < end; i++ {
+			if !hc.hasPatch(input.segments[i].Id) {
+				acc.Add(i)
+			}
+		}
+	}
+	return acc
 }
 
 // loadClassificationInput re-reads metadata for hole classification and
