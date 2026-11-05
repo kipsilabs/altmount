@@ -22,7 +22,7 @@ func matroskaHeader() []byte {
 // A healthy file that was actually probed must say so, otherwise the UI
 // cannot distinguish "verified clean" from "never verified".
 func TestJudgeValidation_HealthyRecordsContentVerificationPassed(t *testing.T) {
-	hc := newTestHealthCheckerWithVerifyContentEnabled(&fakeContentOpener{data: matroskaHeader()})
+	hc := newTestHealthCheckerWithVerifyContentEnabled(t, &fakeContentOpener{data: matroskaHeader()})
 	prep := preparedCheck{filePath: "/movie.mkv", currentStatus: database.HealthStatusPending}
 
 	event := hc.judgeValidation(context.Background(), prep, allPresentResult(), nil)
@@ -38,7 +38,7 @@ func TestJudgeValidation_HealthyRecordsContentVerificationPassed(t *testing.T) {
 // A probe that could not complete leaves the file healthy, but the result
 // must record that verification did not actually run.
 func TestJudgeValidation_HealthyRecordsContentVerificationUnavailable(t *testing.T) {
-	hc := newTestHealthCheckerWithVerifyContentEnabled(&fakeContentOpener{err: errors.New("connection reset")})
+	hc := newTestHealthCheckerWithVerifyContentEnabled(t, &fakeContentOpener{err: errors.New("connection reset")})
 	prep := preparedCheck{filePath: "/movie.mkv", currentStatus: database.HealthStatusPending}
 
 	event := hc.judgeValidation(context.Background(), prep, allPresentResult(), nil)
@@ -58,7 +58,7 @@ func TestJudgeValidation_HealthyRecordsContentVerificationUnavailable(t *testing
 // A file that was never eligible for probing must carry no verification
 // claim at all.
 func TestJudgeValidation_NonMediaFileRecordsNoContentVerification(t *testing.T) {
-	hc := newTestHealthCheckerWithVerifyContentEnabled(&fakeContentOpener{data: make([]byte, 512)})
+	hc := newTestHealthCheckerWithVerifyContentEnabled(t, &fakeContentOpener{data: make([]byte, 512)})
 	prep := preparedCheck{filePath: "/release.nfo", currentStatus: database.HealthStatusPending}
 
 	event := hc.judgeValidation(context.Background(), prep, allPresentResult(), nil)
@@ -69,7 +69,7 @@ func TestJudgeValidation_NonMediaFileRecordsNoContentVerification(t *testing.T) 
 }
 
 func TestJudgeValidation_CorruptedRecordsContentVerificationFailed(t *testing.T) {
-	hc := newTestHealthCheckerWithVerifyContentEnabled(&fakeContentOpener{data: make([]byte, 512)})
+	hc := newTestHealthCheckerWithVerifyContentEnabled(t, &fakeContentOpener{data: make([]byte, 512)})
 	prep := preparedCheck{filePath: "/movie.mkv", currentStatus: database.HealthStatusPending}
 
 	event := hc.judgeValidation(context.Background(), prep, allPresentResult(), nil)
@@ -88,7 +88,7 @@ func TestShouldVerifyContent_OverrideWithoutFilesystemDoesNotProbe(t *testing.T)
 	force := true
 	enabled := true
 	cfg := &config.Config{Health: config.HealthConfig{VerifyContent: &enabled}}
-	hc := &HealthChecker{configGetter: func() *config.Config { return cfg }}
+	hc := &HealthChecker{configGetter: func() *config.Config { return cfg }, metadataService: newContentTestMetadata(t)}
 	prep := preparedCheck{filePath: "/movie.mkv", currentStatus: database.HealthStatusPending, verifyContentOverride: &force}
 
 	if hc.shouldVerifyContent(prep) {

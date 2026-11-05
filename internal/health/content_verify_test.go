@@ -13,6 +13,7 @@ import (
 
 	"github.com/kipsilabs/altmount/internal/config"
 	"github.com/kipsilabs/altmount/internal/database"
+	"github.com/kipsilabs/altmount/internal/metadata"
 	"github.com/kipsilabs/altmount/internal/testsupport/fakepool"
 	"github.com/kipsilabs/altmount/internal/usenet"
 	"github.com/spf13/afero"
@@ -53,13 +54,27 @@ func (o *fakeContentOpener) OpenFile(ctx context.Context, name string, flag int,
 	return &fakeContentFile{data: o.data}, nil
 }
 
-func newTestHealthCheckerWithVerifyContentEnabled(opener *fakeContentOpener) *HealthChecker {
+func newTestHealthCheckerWithVerifyContentEnabled(t *testing.T, opener *fakeContentOpener) *HealthChecker {
 	enabled := true
 	cfg := &config.Config{Health: config.HealthConfig{VerifyContent: &enabled}}
 	return &HealthChecker{
 		configGetter:    func() *config.Config { return cfg },
 		contentVerifyFS: opener,
+		metadataService: newContentTestMetadata(t),
 	}
+}
+
+// newContentTestMetadata holds metadata for the files these tests judge: a
+// clean verdict re-reads it to look for known holes.
+func newContentTestMetadata(t *testing.T) *metadata.MetadataService {
+	t.Helper()
+	ms := metadata.NewMetadataService(t.TempDir())
+	for _, p := range []string{"/movie.mkv", "/release.nfo"} {
+		if err := ms.WriteFileMetadata(p, validSegmentMeta(ms, 1024)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return ms
 }
 
 func allPresentResult() usenet.ValidationResult {
@@ -67,7 +82,7 @@ func allPresentResult() usenet.ValidationResult {
 }
 
 func TestJudgeValidation_ContentInvalid(t *testing.T) {
-	hc := newTestHealthCheckerWithVerifyContentEnabled(&fakeContentOpener{data: make([]byte, 512)}) // no recognized signature
+	hc := newTestHealthCheckerWithVerifyContentEnabled(t, &fakeContentOpener{data: make([]byte, 512)}) // no recognized signature
 	prep := preparedCheck{filePath: "/movie.mkv", currentStatus: database.HealthStatusPending}
 
 	event := hc.judgeValidation(context.Background(), prep, allPresentResult(), nil)
@@ -81,7 +96,7 @@ func TestJudgeValidation_ContentInvalid(t *testing.T) {
 }
 
 func TestJudgeValidation_ContentProbeErrorLeavesStatusUnchanged(t *testing.T) {
-	hc := newTestHealthCheckerWithVerifyContentEnabled(&fakeContentOpener{err: errors.New("connection reset")})
+	hc := newTestHealthCheckerWithVerifyContentEnabled(t, &fakeContentOpener{err: errors.New("connection reset")})
 	prep := preparedCheck{filePath: "/movie.mkv", currentStatus: database.HealthStatusPending}
 
 	event := hc.judgeValidation(context.Background(), prep, allPresentResult(), nil)
@@ -92,7 +107,7 @@ func TestJudgeValidation_ContentProbeErrorLeavesStatusUnchanged(t *testing.T) {
 }
 
 func TestJudgeContentVerification_ProbeErrorReturnsNoEvent(t *testing.T) {
-	hc := newTestHealthCheckerWithVerifyContentEnabled(&fakeContentOpener{err: errors.New("connection reset")})
+	hc := newTestHealthCheckerWithVerifyContentEnabled(t, &fakeContentOpener{err: errors.New("connection reset")})
 	prep := preparedCheck{filePath: "/movie.mkv", currentStatus: database.HealthStatusPending}
 
 	event, healthyDetails := hc.judgeContentVerification(context.Background(), prep)
@@ -105,7 +120,7 @@ func TestJudgeContentVerification_ProbeErrorReturnsNoEvent(t *testing.T) {
 }
 
 func TestJudgeValidation_SkipsProbeWhenNotPending(t *testing.T) {
-	hc := newTestHealthCheckerWithVerifyContentEnabled(&fakeContentOpener{data: make([]byte, 512)}) // would fail if probed
+	hc := newTestHealthCheckerWithVerifyContentEnabled(t, &fakeContentOpener{data: make([]byte, 512)}) // would fail if probed
 	prep := preparedCheck{filePath: "/movie.mkv", currentStatus: database.HealthStatusDegraded}
 
 	event := hc.judgeValidation(context.Background(), prep, allPresentResult(), nil)
@@ -118,7 +133,7 @@ func TestJudgeValidation_SkipsProbeWhenNotPending(t *testing.T) {
 func TestJudgeValidation_ValidSignaturePasses(t *testing.T) {
 	data := append([]byte{0x1A, 0x45, 0xDF, 0xA3, 0x42, 0x82, 0x88}, []byte("matroska")...)
 	data = append(data, make([]byte, 512-len(data))...)
-	hc := newTestHealthCheckerWithVerifyContentEnabled(&fakeContentOpener{data: data})
+	hc := newTestHealthCheckerWithVerifyContentEnabled(t, &fakeContentOpener{data: data})
 	prep := preparedCheck{filePath: "/movie.mkv", currentStatus: database.HealthStatusPending}
 
 	event := hc.judgeValidation(context.Background(), prep, allPresentResult(), nil)
@@ -130,7 +145,7 @@ func TestJudgeValidation_ValidSignaturePasses(t *testing.T) {
 
 func TestJudgeValidation_OverrideForcesProbeOnNonPending(t *testing.T) {
 	force := true
-	hc := newTestHealthCheckerWithVerifyContentEnabled(&fakeContentOpener{data: make([]byte, 512)})
+	hc := newTestHealthCheckerWithVerifyContentEnabled(t, &fakeContentOpener{data: make([]byte, 512)})
 	prep := preparedCheck{filePath: "/movie.mkv", currentStatus: database.HealthStatusDegraded, verifyContentOverride: &force}
 
 	event := hc.judgeValidation(context.Background(), prep, allPresentResult(), nil)
@@ -141,7 +156,7 @@ func TestJudgeValidation_OverrideForcesProbeOnNonPending(t *testing.T) {
 }
 
 func TestJudgeValidation_SkipsNonMediaFiles(t *testing.T) {
-	hc := newTestHealthCheckerWithVerifyContentEnabled(&fakeContentOpener{data: make([]byte, 512)}) // would fail if probed
+	hc := newTestHealthCheckerWithVerifyContentEnabled(t, &fakeContentOpener{data: make([]byte, 512)}) // would fail if probed
 	prep := preparedCheck{filePath: "/release.nfo", currentStatus: database.HealthStatusPending}
 
 	event := hc.judgeValidation(context.Background(), prep, allPresentResult(), nil)

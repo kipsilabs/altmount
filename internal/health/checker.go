@@ -165,9 +165,6 @@ type preparedCheck struct {
 	// ids it cannot hold. Zero (metadata written before the field existed)
 	// means unknown, which applies no policy.
 	releaseDate time.Time
-	// hasKnownHoles marks a file with a persisted hole map, so a clean sweep
-	// re-reads metadata only for those files.
-	hasKnownHoles bool
 }
 
 // baseResultEvent builds the shared HealthEvent skeleton. SourceNzbPath is
@@ -243,7 +240,6 @@ func (hc *HealthChecker) prepareCheck(ctx context.Context, filePath string, opts
 	fileMeta = nil //nolint:ineffassign // explicit drop so the proto can be collected
 
 	prep.sourceNzbPath = input.sourceNzbPath
-	prep.hasKnownHoles = len(input.knownHoles) > 0
 
 	if len(input.segments) == 0 {
 		event := baseResultEvent(filePath, input.sourceNzbPath)
@@ -378,24 +374,38 @@ func (hc *HealthChecker) judgeValidation(ctx context.Context, prep preparedCheck
 
 	// A clean STAT sample never overrides observed misses: persisted known
 	// holes (from playback padding) that no patch covers keep the file
-	// degraded instead of letting this sweep mark it healthy.
-	if prep.hasKnownHoles {
-		if impact := hc.classifyKnownHoles(prep.filePath, result); impact != nil {
-			event.Type = EventTypeFileCorrupted
-			event.Status = database.HealthStatusCorrupted
-			event.Classification = impact
-			event.Error = fmt.Errorf("%d segments are known missing from earlier reads and have not been repaired",
-				impact.TotalMissing)
-			details := database.HealthErrorDetails{
-				ErrorType:       "known_holes",
-				MissingArticles: impact.TotalMissing,
-				TotalArticles:   prep.totalSegments,
-				Sampled:         result.TotalChecked,
-				PlaybackImpact:  impact,
-			}
-			event.Details = details.Marshal()
-			return event
+	// degraded instead of letting this sweep mark it healthy. The hole map is
+	// read now, not at prepare time, since playback may record a hole while
+	// the sweep runs. If it cannot be read, the check proves nothing.
+	impact, err := hc.classifyKnownHoles(prep.filePath, result)
+	if err != nil {
+		event.Type = EventTypeCheckInconclusive
+		event.Status = database.HealthStatusPending
+		event.Error = fmt.Errorf("segment check inconclusive: %w", err)
+		details := database.HealthErrorDetails{
+			ErrorType:     "check_inconclusive",
+			Message:       event.Error.Error(),
+			TotalArticles: prep.totalSegments,
+			Sampled:       result.TotalChecked,
 		}
+		event.Details = details.Marshal()
+		return event
+	}
+	if impact != nil {
+		event.Type = EventTypeFileCorrupted
+		event.Status = database.HealthStatusCorrupted
+		event.Classification = impact
+		event.Error = fmt.Errorf("%d segments are known missing from earlier reads and have not been repaired",
+			impact.TotalMissing)
+		details := database.HealthErrorDetails{
+			ErrorType:       "known_holes",
+			MissingArticles: impact.TotalMissing,
+			TotalArticles:   prep.totalSegments,
+			Sampled:         result.TotalChecked,
+			PlaybackImpact:  impact,
+		}
+		event.Details = details.Marshal()
+		return event
 	}
 
 	// All checked segments are available - record will be deleted.
