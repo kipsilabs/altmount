@@ -124,22 +124,18 @@ func (m *Manager) recoverMount(ctx context.Context, provider string, expected *M
 
 	m.logger.WarnContext(ctx, "Attempting to recover mount", "provider", provider)
 
-	// Pre-recovery rcd liveness probe. If the rcd subprocess has wedged,
-	// every subsequent RPC (mount/unmount, config/create, mount/mount) will
-	// hang on context deadline exceeded. Kill+respawn rcd before issuing
-	// recovery RPCs to break out of that wedge.
+	// Pre-recovery rcd liveness probe. If the rcd is unresponsive, every
+	// recovery RPC (mount/unmount, config/create, mount/mount) would hang on
+	// its deadline, so there is nothing useful to do here.
+	//
+	// Deciding that the rcd is wedged and restarting it is left to the health
+	// check alone. A restart tears the FUSE mount out from under every reader,
+	// and only the health check measures unresponsiveness over the configured
+	// rclone.rcd_restart_after duration and honours the startup grace window. A
+	// failed probe here is one more observation: the next tick counts its own,
+	// restarts the rcd once the streak reaches the threshold, and remounts.
 	if !m.probe(ctx, probeTimeout) {
-		m.logger.WarnContext(ctx, "rcd unresponsive during recovery, restarting subprocess", "provider", provider)
-		if err := m.restart(ctx); err != nil {
-			return fmt.Errorf("failed to restart wedged rcd: %w", err)
-		}
-		// After restart there is nothing to RC-unmount; skip straight to Mount,
-		// which will recreate the rclone config and FUSE mount on the fresh rcd.
-		if err := m.mountWithRetry(ctx, provider, mountInfo.LocalPath, mountInfo.WebDAVURL, 3); err != nil {
-			return fmt.Errorf("failed to recover mount for %s after rcd restart: %w", provider, err)
-		}
-		m.logger.InfoContext(ctx, "Successfully recovered mount after rcd restart", "provider", provider)
-		return nil
+		return fmt.Errorf("rcd unresponsive during recovery of %s; leaving any restart to the health check", provider)
 	}
 
 	// First try to unmount cleanly. The health checker leaves Mounted=true until
