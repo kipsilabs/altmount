@@ -91,3 +91,49 @@ func TestIsCategoryRootDownloadPath(t *testing.T) {
 		}
 	}
 }
+
+// A category dir with a slash ("tv/uhd") is nested under complete_dir. It is a
+// root whether the arr sees the mount at mount_path or somewhere else, and so
+// is the folder above it, which holds that category too.
+func TestIsCategoryRoot_NestedCategoryDir(t *testing.T) {
+	cfg := &Config{
+		MountPath: "/mnt/altmount",
+		SABnzbd: SABnzbdConfig{
+			CompleteDir: "/complete",
+			Categories:  []SABnzbdCategory{{Name: "tv-uhd", Dir: "tv/uhd"}},
+		},
+	}
+	for _, tt := range []struct {
+		path string
+		want bool
+	}{
+		// Arr sees the mount at mount_path.
+		{"/mnt/altmount/complete/tv/uhd", true},
+		{"/mnt/altmount/complete/tv/uhd/", true},
+		{"/mnt/altmount/complete/tv", true},
+		{"/mnt/altmount/complete/tv/uhd/Some.Show.S01", false},
+		// Arr sees the mount somewhere else.
+		{"/data/complete/tv/uhd", true},
+		{"/data/complete/TV/UHD/", true},
+		{"/data/complete/tv", true},
+		{`D:\usenet\complete\tv\uhd`, true},
+		{"/data/complete/tv/uhd/Some.Show.S01", false},
+		{"/data/elsewhere/tv/uhd", false},
+	} {
+		if got := cfg.IsCategoryRootDownloadPath(tt.path); got != tt.want {
+			t.Errorf("IsCategoryRootDownloadPath(%q) = %v, want %v", tt.path, got, tt.want)
+		}
+	}
+	for _, tt := range []struct {
+		path string
+		want bool
+	}{
+		{"complete/tv/uhd", true},
+		{"complete/tv", true},
+		{"complete/tv/uhd/Some.Show.S01", false},
+	} {
+		if got := cfg.IsCategoryRootVirtualPath(tt.path); got != tt.want {
+			t.Errorf("IsCategoryRootVirtualPath(%q) = %v, want %v", tt.path, got, tt.want)
+		}
+	}
+}

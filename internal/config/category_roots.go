@@ -44,7 +44,7 @@ func (c *Config) IsCategoryRootVirtualPath(virtualPath string) bool {
 		}
 		rest = p[len(cd)+1:]
 	}
-	return c.isKnownCategory(rest) || c.isKnownCategory(p)
+	return c.isKnownCategory(rest) || c.isKnownCategory(p) || c.isCategoryAncestor(rest)
 }
 
 // IsCategoryRootDownloadPath is IsCategoryRootVirtualPath for an absolute path
@@ -76,33 +76,79 @@ func (c *Config) IsCategoryRootDownloadPath(p string) bool {
 		return true
 	}
 	cd := trimVirtual(c.SABnzbd.CompleteDir)
+	parts := strings.Split(strings.Trim(clean, "/"), "/")
 	if cd == "" {
-		return c.isKnownCategoryBase(base)
+		return c.matchesCategorySuffix(parts, "")
 	}
 	// complete_dir is always prepended to a job's storage path, so a category
-	// folder sits directly under it; a folder elsewhere that merely shares a
-	// category's name is a release.
+	// folder sits under a folder named like complete_dir; a folder elsewhere
+	// that merely shares a category's name is a release.
 	cdBase := path.Base(cd)
 	if strings.EqualFold(base, cdBase) {
 		return true
 	}
-	return strings.EqualFold(path.Base(path.Dir(clean)), cdBase) && c.isKnownCategoryBase(base)
+	return c.matchesCategorySuffix(parts, cdBase)
 }
 
-// isKnownCategoryBase is isKnownCategory on the last path element only, for a
-// path seen from outside mount_path: a category dir configured as
-// "complete/anime" is known there by "anime".
-func (c *Config) isKnownCategoryBase(base string) bool {
-	base = trimVirtual(base)
-	if base == "" {
+// matchesCategorySuffix reports whether the path made of parts ends in a
+// known category folder, or in a folder above one, relative to complete_dir
+// ("tv", "tv/uhd", or "tv" for a category dir "tv/uhd"). When cdBase is set,
+// the folder just before that suffix must be named cdBase. This is how a path
+// seen from outside mount_path is judged.
+func (c *Config) matchesCategorySuffix(parts []string, cdBase string) bool {
+	for _, rel := range c.categoryDirsUnderComplete() {
+		relParts := strings.Split(rel, "/")
+		for j := 1; j <= len(relParts); j++ {
+			start := len(parts) - j
+			if start < 0 || (cdBase != "" && start < 1) {
+				continue
+			}
+			match := true
+			for k := 0; k < j; k++ {
+				if !strings.EqualFold(parts[start+k], relParts[k]) {
+					match = false
+					break
+				}
+			}
+			if match && (cdBase == "" || strings.EqualFold(parts[start-1], cdBase)) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// isCategoryAncestor reports whether rest, a path relative to complete_dir, is
+// a folder above a known category folder, such as "tv" for a category dir
+// "tv/uhd". Such a folder holds that category's jobs too.
+func (c *Config) isCategoryAncestor(rest string) bool {
+	rest = trimVirtual(rest)
+	if rest == "" {
 		return false
 	}
-	for _, n := range c.knownCategoryNames() {
-		if strings.EqualFold(base, path.Base(n)) {
+	prefix := strings.ToLower(rest) + "/"
+	for _, rel := range c.categoryDirsUnderComplete() {
+		if strings.HasPrefix(strings.ToLower(rel), prefix) {
 			return true
 		}
 	}
 	return false
+}
+
+// categoryDirsUnderComplete returns the known category names and dirs
+// relative to complete_dir: a dir configured with complete_dir in it
+// ("complete/anime") loses that prefix.
+func (c *Config) categoryDirsUnderComplete() []string {
+	cd := trimVirtual(c.SABnzbd.CompleteDir)
+	names := c.knownCategoryNames()
+	out := make([]string, 0, len(names))
+	for _, n := range names {
+		if cd != "" && len(n) > len(cd) && strings.EqualFold(n[:len(cd)], cd) && n[len(cd)] == '/' {
+			n = n[len(cd)+1:]
+		}
+		out = append(out, n)
+	}
+	return out
 }
 
 // isKnownCategory reports whether p equals, ignoring case, a configured
