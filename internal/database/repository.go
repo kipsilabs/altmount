@@ -346,7 +346,8 @@ func (r *Repository) IncrementDailyStat(ctx context.Context, statType string) er
 func (r *Repository) GetQueueItem(ctx context.Context, id int64) (*ImportQueueItem, error) {
 	query := `
 		SELECT id, download_id, nzb_path, relative_path, category, priority, status, created_at, updated_at,
-		       started_at, completed_at, retry_count, max_retries, error_message, batch_id, metadata, file_size, storage_path, target_path, indexer
+		       started_at, completed_at, retry_count, max_retries, error_message, batch_id, metadata, file_size, storage_path, target_path, indexer,
+		       skip_arr_notification, skip_post_import_links
 		FROM import_queue WHERE id = ?
 	`
 
@@ -355,6 +356,7 @@ func (r *Repository) GetQueueItem(ctx context.Context, id int64) (*ImportQueueIt
 		&item.ID, &item.DownloadID, &item.NzbPath, &item.RelativePath, &item.Category, &item.Priority, &item.Status,
 		&item.CreatedAt, &item.UpdatedAt, &item.StartedAt, &item.CompletedAt,
 		&item.RetryCount, &item.MaxRetries, &item.ErrorMessage, &item.BatchID, &item.Metadata, &item.FileSize, &item.StoragePath, &item.TargetPath, &item.Indexer,
+		&item.SkipArrNotification, &item.SkipPostImportLinks,
 	)
 
 	if err != nil {
@@ -371,7 +373,8 @@ func (r *Repository) GetQueueItem(ctx context.Context, id int64) (*ImportQueueIt
 func (r *Repository) GetQueueItemByDownloadID(ctx context.Context, downloadID string) (*ImportQueueItem, error) {
 	query := `
 		SELECT id, download_id, nzb_path, relative_path, category, priority, status, created_at, updated_at,
-		       started_at, completed_at, retry_count, max_retries, error_message, batch_id, metadata, file_size, storage_path, target_path, indexer
+		       started_at, completed_at, retry_count, max_retries, error_message, batch_id, metadata, file_size, storage_path, target_path, indexer,
+		       skip_arr_notification, skip_post_import_links
 		FROM import_queue WHERE download_id = ?
 	`
 
@@ -380,6 +383,7 @@ func (r *Repository) GetQueueItemByDownloadID(ctx context.Context, downloadID st
 		&item.ID, &item.DownloadID, &item.NzbPath, &item.RelativePath, &item.Category, &item.Priority, &item.Status,
 		&item.CreatedAt, &item.UpdatedAt, &item.StartedAt, &item.CompletedAt,
 		&item.RetryCount, &item.MaxRetries, &item.ErrorMessage, &item.BatchID, &item.Metadata, &item.FileSize, &item.StoragePath, &item.TargetPath, &item.Indexer,
+		&item.SkipArrNotification, &item.SkipPostImportLinks,
 	)
 
 	if err != nil {
@@ -799,7 +803,8 @@ func (r *Repository) ListQueueItems(ctx context.Context, status *QueueStatus, se
 	var args []any
 
 	baseSelect := `SELECT id, download_id, nzb_path, relative_path, category, priority, status, created_at, updated_at,
-	               started_at, completed_at, retry_count, max_retries, error_message, batch_id, metadata, file_size, storage_path, target_path, indexer
+	               started_at, completed_at, retry_count, max_retries, error_message, batch_id, metadata, file_size, storage_path, target_path, indexer,
+	               skip_arr_notification, skip_post_import_links
 	               FROM import_queue`
 
 	var conditions []string
@@ -863,6 +868,7 @@ func (r *Repository) ListQueueItems(ctx context.Context, status *QueueStatus, se
 			&item.ID, &item.DownloadID, &item.NzbPath, &item.RelativePath, &item.Category, &item.Priority, &item.Status,
 			&item.CreatedAt, &item.UpdatedAt, &item.StartedAt, &item.CompletedAt,
 			&item.RetryCount, &item.MaxRetries, &item.ErrorMessage, &item.BatchID, &item.Metadata, &item.FileSize, &item.StoragePath, &item.TargetPath, &item.Indexer,
+			&item.SkipArrNotification, &item.SkipPostImportLinks,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan queue item: %w", err)
@@ -879,7 +885,8 @@ func (r *Repository) ListActiveQueueItems(ctx context.Context, search string, ca
 	var args []any
 
 	baseSelect := `SELECT id, download_id, nzb_path, relative_path, category, priority, status, created_at, updated_at,
-	               started_at, completed_at, retry_count, max_retries, error_message, batch_id, metadata, file_size, storage_path, target_path, indexer
+	               started_at, completed_at, retry_count, max_retries, error_message, batch_id, metadata, file_size, storage_path, target_path, indexer,
+	               skip_arr_notification, skip_post_import_links
 	               FROM import_queue`
 
 	conditions := []string{"(status = 'pending' OR status = 'processing' OR status = 'paused')"}
@@ -934,6 +941,7 @@ func (r *Repository) ListActiveQueueItems(ctx context.Context, search string, ca
 			&item.ID, &item.DownloadID, &item.NzbPath, &item.RelativePath, &item.Category, &item.Priority, &item.Status,
 			&item.CreatedAt, &item.UpdatedAt, &item.StartedAt, &item.CompletedAt,
 			&item.RetryCount, &item.MaxRetries, &item.ErrorMessage, &item.BatchID, &item.Metadata, &item.FileSize, &item.StoragePath, &item.TargetPath, &item.Indexer,
+			&item.SkipArrNotification, &item.SkipPostImportLinks,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan queue item: %w", err)
