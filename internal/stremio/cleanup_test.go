@@ -129,3 +129,21 @@ func TestStremioCleanupHandlesMultiFileDownloads(t *testing.T) {
 	assert.True(t, env.meta.FileExists(kept[0]), "adopted pack kept")
 	assert.False(t, env.queueItemExists(t, keptID))
 }
+
+// A storage path recorded as a category folder (#1013) must not make the
+// cleanup delete that folder's metadata tree; only the queue entry goes.
+func TestStremioCleanupRefusesCategoryFolderStoragePath(t *testing.T) {
+	env := newCleanupEnv(t)
+	other := "complete/Movies/Other.Release.2024/Other.Release.2024.mkv"
+	fm := env.meta.CreateFileMetadata(100, "x.nzb", metapb.FileStatus_FILE_STATUS_HEALTHY, nil, metapb.Encryption_NONE, "", "", nil, nil, 0, nil, "")
+	require.NoError(t, env.meta.WriteFileMetadata(other, fm))
+
+	f := "complete/Movies/Stream.Only.2024/Stream.Only.2024.mkv"
+	id := env.addExpiredStremioImport(t, "complete/Movies", []string{f}, "")
+
+	env.svc.cleanupExpired(context.Background())
+
+	assert.True(t, env.meta.FileExists(other), "other release in the category kept")
+	assert.True(t, env.meta.FileExists(f), "nothing under the category folder deleted")
+	assert.False(t, env.queueItemExists(t, id), "queue entry dropped so the refusal does not repeat")
+}

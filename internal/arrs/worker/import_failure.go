@@ -150,7 +150,7 @@ func (w *Worker) importFailureRadarr(ctx context.Context, instance *model.Config
 				slog.WarnContext(ctx, "Failed to unmonitor movie after failure threshold",
 					"instance", instance.Name, "movie_id", q.MovieID, "error", err)
 			}
-			w.deleteStarrQueue(ctx, instance, []stuckAction{{ID: q.ID, Action: config.StuckActionBlocklist}}, client.DeleteQueueContext)
+			w.deleteStarrQueue(ctx, instance, []stuckAction{{ID: q.ID, Action: config.StuckActionBlocklist, OutputPath: q.OutputPath}}, client.DeleteQueueContext)
 		} else {
 			slog.InfoContext(ctx, "Import failure counted toward failure limit",
 				"instance", instance.Name, "download_id", downloadID, "max_failures", maxFailures)
@@ -180,7 +180,7 @@ func (w *Worker) importFailureLidarr(ctx context.Context, instance *model.Config
 		if q.AlbumID > 0 && w.bumpBreaker(failures.AlbumKey(instance.Name, q.AlbumID)) >= maxFailures {
 			slog.WarnContext(ctx, "Failure threshold reached on import failure, giving up (blocklist without re-search)",
 				"instance", instance.Name, "title", q.Title, "album_id", q.AlbumID, "max_failures", maxFailures)
-			w.deleteStarrQueue(ctx, instance, []stuckAction{{ID: q.ID, Action: config.StuckActionBlocklist}}, client.DeleteQueueContext)
+			w.deleteStarrQueue(ctx, instance, []stuckAction{{ID: q.ID, Action: config.StuckActionBlocklist, OutputPath: q.OutputPath}}, client.DeleteQueueContext)
 		} else {
 			slog.InfoContext(ctx, "Import failure counted toward failure limit",
 				"instance", instance.Name, "download_id", downloadID, "max_failures", maxFailures)
@@ -209,7 +209,7 @@ func (w *Worker) importFailureReadarr(ctx context.Context, instance *model.Confi
 		if q.BookID > 0 && w.bumpBreaker(failures.BookKey(instance.Name, q.BookID)) >= maxFailures {
 			slog.WarnContext(ctx, "Failure threshold reached on import failure, giving up (blocklist without re-search)",
 				"instance", instance.Name, "title", q.Title, "book_id", q.BookID, "max_failures", maxFailures)
-			w.deleteStarrQueue(ctx, instance, []stuckAction{{ID: q.ID, Action: config.StuckActionBlocklist}}, client.DeleteQueueContext)
+			w.deleteStarrQueue(ctx, instance, []stuckAction{{ID: q.ID, Action: config.StuckActionBlocklist, OutputPath: q.OutputPath}}, client.DeleteQueueContext)
 		} else {
 			slog.InfoContext(ctx, "Import failure counted toward failure limit",
 				"instance", instance.Name, "download_id", downloadID, "max_failures", maxFailures)

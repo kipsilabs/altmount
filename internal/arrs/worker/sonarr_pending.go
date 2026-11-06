@@ -135,7 +135,10 @@ func (w *Worker) resumeSonarrPendingLocked(ctx context.Context, event string, p 
 			p.Removed = true
 		} else {
 			p.RemovalAttempted = true
-			if err = p.Client.RemoveDownload(ctx, p.Group, model.SonarrRemovalOptions{RemoveFromClient: true, Blocklist: p.Blocklist}); err != nil {
+			// Removing a download whose output is a category folder from the
+			// client would make Sonarr delete that whole folder.
+			removeFromClient := !w.outputIsCategoryRoot(ctx, &p.Instance, stuckAction{ID: p.Group.Record.ID, Action: sonarrRemovalAction(p.Blocklist), OutputPath: p.Group.Record.OutputPath})
+			if err = p.Client.RemoveDownload(ctx, p.Group, model.SonarrRemovalOptions{RemoveFromClient: removeFromClient, Blocklist: p.Blocklist}); err != nil {
 				return false, err
 			}
 			p.Removed = true
@@ -239,4 +242,11 @@ func (w *Worker) RepairSonarrDownload(ctx context.Context, instanceName string, 
 		}
 	}
 	return fmt.Errorf("enabled Sonarr instance %q not found", instanceName)
+}
+
+func sonarrRemovalAction(blocklist bool) string {
+	if blocklist {
+		return config.StuckActionBlocklist
+	}
+	return config.StuckActionRemove
 }
