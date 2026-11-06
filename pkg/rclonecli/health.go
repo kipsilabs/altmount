@@ -207,13 +207,16 @@ func (m *Manager) performMountHealthCheck() {
 		// guard against. Also require sustained failure before restarting so a
 		// single transient miss can't nuke a healthy rcd.
 		//
-		// Failures inside the grace window do not count toward the threshold.
-		// If they did, a slow-starting rcd would leave the window with its
-		// streak already at or near the threshold, and the first failed probe
-		// after it would kill the rcd: the window would delay the restart by
-		// one tick instead of preventing it.
+		// Failures inside the grace window do not count toward the threshold,
+		// and the window clears any streak left from before the rcd was
+		// (re)started. Otherwise a slow-starting rcd would leave the window
+		// with its streak already at or near the threshold, and the first
+		// failed probe after it would kill the rcd: the window would delay the
+		// restart by one tick instead of preventing it.
 		withinGrace := m.withinStartupGrace()
-		if !withinGrace {
+		if withinGrace {
+			m.consecutiveProbeFailures = 0
+		} else {
 			m.consecutiveProbeFailures++
 		}
 
