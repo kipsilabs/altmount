@@ -54,7 +54,9 @@ func TestCalculateHistoryStoragePath_FileBehavior(t *testing.T) {
 		want     string
 	}{
 		{"existing file returns directory", config.ImportStrategyNone, "episode.mkv", true, "tv/Show"},
-		{"missing file keeps extension fallback", config.ImportStrategyNone, "episode.mkv", false, "tv/Show"},
+		// A missing path is reported as itself, never as its parent,
+		// so an arr cannot be sent to scan (or delete) the folder above it.
+		{"missing file is reported unchanged", config.ImportStrategyNone, "episode.mkv", false, "tv/Show/episode.mkv"},
 		{"symlink strategy returns file", config.ImportStrategySYMLINK, "episode.mkv", true, "tv/Show/episode.mkv"},
 		{"strm strategy returns file", config.ImportStrategySTRM, "episode.strm", true, "tv/Show/episode.strm"},
 	} {
@@ -130,6 +132,48 @@ func TestSABnzbdHistory_PreservesReleaseDirectories(t *testing.T) {
 				assert.Equal(t, want, slot.Storage)
 				assert.Equal(t, want, slot.Path)
 			}
+		})
+	}
+}
+
+func TestCalculateHistoryStoragePathExtensionNames(t *testing.T) {
+	mount := t.TempDir()
+	cfg := &config.Config{
+		MountPath: mount,
+		SABnzbd:   config.SABnzbdConfig{CompleteDir: "complete"},
+		Import:    config.ImportConfig{ImportStrategy: config.ImportStrategyNone},
+	}
+	server := &Server{configManager: &mockConfigManager{cfg: cfg}}
+	catDir := filepath.ToSlash(filepath.Join(mount, "complete", "tv"))
+
+	require.NoError(t, os.MkdirAll(filepath.Join(catDir, "Show.S01.1080p.h264"), 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Join(catDir, "X.r20"), 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Join(catDir, "Y.nzb"), 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Join(catDir, "Normal"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(catDir, "Normal", "ep.mkv"), []byte("x"), 0o644))
+
+	tests := []struct {
+		name        string
+		storagePath string
+		want        string
+	}{
+		{"directory ending .h264", "/complete/tv/Show.S01.1080p.h264", catDir + "/Show.S01.1080p.h264"},
+		{"directory ending .rNN", "/complete/tv/X.r20", catDir + "/X.r20"},
+		{"directory ending .nzb", "/complete/tv/Y.nzb", catDir + "/Y.nzb"},
+		{"existing file returns its parent", "/complete/tv/Normal/ep.mkv", catDir + "/Normal"},
+		{"missing .h264 path is reported unchanged", "/complete/tv/Gone.h264", catDir + "/Gone.h264"},
+		{"missing .nzb path is reported unchanged", "/complete/tv/Gone.nzb", catDir + "/Gone.nzb"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			item := &database.ImportQueueItem{
+				ID:          1,
+				Category:    strPtr("tv"),
+				StoragePath: strPtr(tt.storagePath),
+				Status:      database.QueueStatusCompleted,
+			}
+			got, _ := server.calculateHistoryStoragePath(item, mount)
+			assert.Equal(t, tt.want, got)
 		})
 	}
 }
