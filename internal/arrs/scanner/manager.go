@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -1225,6 +1226,33 @@ func (m *Manager) triggerSonarrRescanByPath(ctx context.Context, client clients.
 	return nil
 }
 
+// queueOutputMatches reports whether a queue item whose download output is
+// outputPath belongs to the file at filePath: the same path, filePath inside
+// outputPath (on a path-component boundary), or the same final name.
+//
+// An item whose outputPath is a category root never matches. Deleting a queue
+// item with RemoveFromClient makes the arr delete its output path, so a queue
+// item that reports a category folder as its output would take the whole
+// category with it (#1029), and a prefix match on that folder would select it
+// for any file in the category.
+func queueOutputMatches(ctx context.Context, cfg *config.Config, arrType string, queueID int64, outputPath, filePath string) bool {
+	if outputPath == "" {
+		return false
+	}
+	if cfg != nil && cfg.IsCategoryRootDownloadPath(outputPath) {
+		slog.WarnContext(ctx, "Skipping queue item whose output path is a category folder; not removing it from the client",
+			"arr_type", arrType, "queue_id", queueID, "output_path", outputPath, "path", filePath)
+		return false
+	}
+	// Backslashes are separators too: a Windows arr reports them.
+	out := strings.TrimSuffix(path.Clean(strings.ReplaceAll(outputPath, "\\", "/")), "/")
+	p := path.Clean(strings.ReplaceAll(filePath, "\\", "/"))
+	if p == out || strings.HasPrefix(p, out+"/") {
+		return true
+	}
+	return path.Base(out) == path.Base(p)
+}
+
 // failRadarrQueueItemByPath searches for an item in the active Radarr queue by path and marks it as failed
 func (m *Manager) failRadarrQueueItemByPath(ctx context.Context, client *radarr.Radarr, path string) error {
 	queue, err := client.GetQueueContext(ctx, 0, 500)
@@ -1232,11 +1260,12 @@ func (m *Manager) failRadarrQueueItemByPath(ctx context.Context, client *radarr.
 		return fmt.Errorf("failed to get Radarr queue: %w", err)
 	}
 
+	var cfg *config.Config
+	if m.configGetter != nil {
+		cfg = m.configGetter()
+	}
 	for _, q := range queue.Records {
-		// Try exact match, prefix match (if queue item is parent dir), or filename match
-		if q.OutputPath == path ||
-			(q.OutputPath != "" && strings.HasPrefix(filepath.ToSlash(path), filepath.ToSlash(q.OutputPath))) ||
-			(q.OutputPath != "" && filepath.Base(q.OutputPath) == filepath.Base(path)) {
+		if queueOutputMatches(ctx, cfg, "radarr", q.ID, q.OutputPath, path) {
 			slog.InfoContext(ctx, "Found matching item in Radarr download queue, marking as failed",
 				"queue_id", q.ID, "path", path, "output_path", q.OutputPath)
 
@@ -1259,14 +1288,16 @@ func (m *Manager) failSonarrQueueItemByPath(ctx context.Context, client clients.
 	if err != nil {
 		return fmt.Errorf("read Sonarr queue: %w", err)
 	}
+	var cfg *config.Config
+	if m.configGetter != nil {
+		cfg = m.configGetter()
+	}
 	for _, group := range groups {
 		q := group.Record
-		if q == nil || !registrar.IsAltmountDownloadClient(q.DownloadClient) || q.OutputPath == "" {
+		if q == nil || !registrar.IsAltmountDownloadClient(q.DownloadClient) {
 			continue
 		}
-		source := strings.TrimRight(filepath.ToSlash(q.OutputPath), "/")
-		target := filepath.ToSlash(path)
-		if target != source && !strings.HasPrefix(target, source+"/") && filepath.Base(q.OutputPath) != filepath.Base(path) {
+		if !queueOutputMatches(ctx, cfg, "sonarr", q.ID, q.OutputPath, path) {
 			continue
 		}
 		if m.sonarrQueueRepair == nil {

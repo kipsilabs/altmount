@@ -103,6 +103,20 @@ func (s *StremioCleanupService) deleteItem(ctx context.Context, item *database.I
 
 	if item.StoragePath != nil && *item.StoragePath != "" {
 		storagePath := *item.StoragePath
+		// A storage path recorded as a category folder (#1013) would make the
+		// directory delete below remove every release in it (#1029).
+		var cfg *config.Config
+		if s.configGetter != nil {
+			cfg = s.configGetter()
+		}
+		if cfg != nil && cfg.IsCategoryRootVirtualPath(storagePath) {
+			slog.WarnContext(ctx, "StremioCleanup: refusing to delete a category folder; dropping the queue item only",
+				"path", storagePath, "queue_id", item.ID)
+			if err := s.queueRepo.RemoveFromQueue(ctx, item.ID); err != nil {
+				slog.ErrorContext(ctx, "StremioCleanup: failed to remove queue item", "id", item.ID, "error", err)
+			}
+			return
+		}
 		if s.metadataService.DirectoryExists(storagePath) {
 			// Multi-file: remove the entire metadata subtree (including nested .meta files)
 			if err := s.metadataService.DeleteDirectory(storagePath); err != nil {

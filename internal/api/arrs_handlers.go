@@ -449,6 +449,10 @@ func (s *Server) handleArrsWebhook(c *fiber.Ctx) error {
 			"normalized_path", normalizedPath,
 			"event_type", req.EventType)
 
+		if s.isCategoryRootForWebhook(c, path, normalizedPath, req.EventType) {
+			continue
+		}
+
 		// Delete health record — try by library_path first (more reliable), fall back to file_path
 		metadataPath := normalizedPath
 		if s.healthRepo != nil {
@@ -466,6 +470,10 @@ func (s *Server) handleArrsWebhook(c *fiber.Ctx) error {
 					}
 				}
 			}
+		}
+
+		if s.isCategoryRootForWebhook(c, path, metadataPath, req.EventType) {
+			continue
 		}
 
 		// Delete metadata (and optionally source NZB)
@@ -1184,4 +1192,24 @@ func (s *Server) handleTestArrsDownloadClients(c *fiber.Ctx) error {
 		"success": true,
 		"data":    results,
 	})
+}
+
+// isCategoryRootForWebhook reports whether a webhook file deletion would act on
+// a category root (config.IsCategoryRootVirtualPath), and logs the refusal.
+// A webhook deletes one file of an upgrade; a path that normalizes to a
+// category folder, or to nothing, is never that file, and the removal through
+// the mount would act on the whole folder (#1029).
+func (s *Server) isCategoryRootForWebhook(c *fiber.Ctx, originalPath, virtualPath, eventType string) bool {
+	if s.configManager == nil {
+		return false
+	}
+	cfg := s.configManager.GetConfig()
+	if cfg == nil || !cfg.IsCategoryRootVirtualPath(virtualPath) {
+		return false
+	}
+	slog.WarnContext(c.Context(), "Refusing webhook file deletion of a category folder",
+		"original_path", originalPath,
+		"metadata_path", virtualPath,
+		"event_type", eventType)
+	return true
 }
