@@ -1349,6 +1349,7 @@ func (hw *HealthWorker) cleanupZombieRecord(ctx context.Context, item *database.
 	if delMetaErr := hw.metadataService.DeleteFileMetadata(ctx, relativePath); delMetaErr != nil {
 		slog.ErrorContext(ctx, "Failed to delete metadata during cleanup", "file_path", item.FilePath, "error", delMetaErr)
 	} else {
+		slog.InfoContext(ctx, "Deleted metadata of a file no arr tracks (zombie cleanup)", "file_path", item.FilePath)
 		hw.NotifyRcloneVFSForget(item.FilePath)
 	}
 }

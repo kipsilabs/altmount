@@ -242,6 +242,8 @@ func (s *Server) handleDeleteHealth(c *fiber.Ctx) error {
 			if delErr := s.metadataService.DeleteFileMetadata(c.Context(), item.FilePath); delErr != nil {
 				slog.ErrorContext(c.Context(), "Failed to delete metadata during health record deletion", "file_path", item.FilePath, "error", delErr)
 			} else {
+				slog.InfoContext(c.Context(), "Deleted metadata on health record deletion (API)",
+					"file_path", item.FilePath, "remote", c.IP())
 				metaDeleted = true
 				if s.healthWorker != nil {
 					s.healthWorker.NotifyRcloneVFSForget(item.FilePath)
@@ -327,6 +329,8 @@ func (s *Server) handleDeleteHealthBulk(c *fiber.Ctx) error {
 				if delErr := s.metadataService.DeleteFileMetadata(c.Context(), item.FilePath); delErr != nil {
 					slog.ErrorContext(c.Context(), "Failed to delete metadata during bulk deletion", "file_path", item.FilePath, "error", delErr)
 				} else {
+					slog.InfoContext(c.Context(), "Deleted metadata in bulk health deletion (API)",
+						"file_path", item.FilePath, "remote", c.IP())
 					metaDeletedCount++
 					deletedMetaDirs[path.Dir(filepath.ToSlash(item.FilePath))] = true
 				}
