@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -209,4 +210,39 @@ func TestFindHealthyLibraryStreams_Disabled(t *testing.T) {
 
 	streams := s.findHealthyLibraryStreams(context.Background(), cfg, "series", "tt123", "http://host", "key", 1, 1)
 	assert.Nil(t, streams)
+}
+
+// AIOStreams consumes these hints instead of guessing from display badges.
+func TestBuildStremioStreamEntries_BehaviorHints(t *testing.T) {
+	now := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
+	title := "Ted.Lasso.S03.1080p.WEB-DL.x265.SPANiSH"
+	for _, cached := range []bool{false, true} {
+		t.Run(map[bool]string{false: "uncached", true: "cached"}[cached], func(t *testing.T) {
+			var items []*database.ImportQueueItem
+			if cached {
+				items = []*database.ImportQueueItem{cachedItem("/nzbs/"+sanitizeFilename(title)+".nzb", "/storage/ted", timePtr(now.Add(-time.Hour)))}
+			}
+			entries := buildStremioStreamEntries([]prowlarr.NZBResult{{Title: title, Indexer: "UsenetHD", DownloadURL: "https://indexer/dl"}}, items, 24, now,
+				"https://host", "key", "series", 3, 7, "tt10986410", resolveStreamDisplay(config.StremioConfig{}))
+			if len(entries) != 1 {
+				t.Fatalf("expected one stream, got %d", len(entries))
+			}
+			data, err := json.Marshal(entries[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			var stream map[string]any
+			if err := json.Unmarshal(data, &stream); err != nil {
+				t.Fatal(err)
+			}
+			hints, ok := stream["behaviorHints"].(map[string]any)
+			if !ok {
+				t.Fatalf("missing behaviorHints in stream: %s", data)
+			}
+			assert.Equal(t, "altmount", hints["service"])
+			assert.Equal(t, cached, hints["cached"])
+			assert.Equal(t, title, hints["filename"])
+			assert.Equal(t, "UsenetHD", hints["indexer"])
+		})
+	}
 }
