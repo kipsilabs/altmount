@@ -266,9 +266,10 @@ func (s *Server) handleStremioAddonStream(c *fiber.Ctx) error {
 
 	for _, e := range entries {
 		streams = append(streams, fiber.Map{
-			"name":  e.Name,
-			"title": e.Title,
-			"url":   e.URL,
+			"name":          e.Name,
+			"title":         e.Title,
+			"url":           e.URL,
+			"behaviorHints": e.BehaviorHints,
 		})
 	}
 
@@ -1030,10 +1031,20 @@ func (s *Server) loadStremioQueueState(ctx context.Context, reuseLibrary bool, t
 // result, together with whether the underlying release is already cached/imported
 // in AltMount.
 type stremioStreamEntry struct {
-	Name   string
-	Title  string
-	URL    string
-	Cached bool
+	Name          string
+	Title         string
+	URL           string
+	Cached        bool
+	BehaviorHints stremioStreamBehaviorHints `json:"behaviorHints"`
+}
+
+// Explicit hints let addon aggregators identify the service and parse the full
+// release title without depending on AltMount's human-readable display badges.
+type stremioStreamBehaviorHints struct {
+	Service  string `json:"service"`
+	Cached   bool   `json:"cached"`
+	Filename string `json:"filename"`
+	Indexer  string `json:"indexer,omitempty"`
 }
 
 // buildStremioStreamEntries converts filtered Prowlarr results into ordered
@@ -1112,6 +1123,12 @@ func buildStremioStreamEntries(
 			Title:  description,
 			URL:    playURL,
 			Cached: cachedHit,
+			BehaviorHints: stremioStreamBehaviorHints{
+				Service:  "altmount",
+				Cached:   cachedHit,
+				Filename: r.Title,
+				Indexer:  r.Indexer,
+			},
 		})
 	}
 
