@@ -100,6 +100,10 @@ type stuckAction struct {
 	Ghost  bool
 	ID     int64
 	Action string
+	// OutputPath is the queue item's download output as the arr reports it
+	// (may be empty). It decides whether the arr may be told to remove the
+	// download from the client (see outputIsCategoryRoot).
+	OutputPath string
 	// Unmonitor is set only when the failure breaker has tripped for this item: it
 	// is invoked after the queue delete succeeds to stop the *arr re-grabbing the
 	// target. Nil otherwise.
@@ -167,7 +171,7 @@ func (w *Worker) selectStuckActions(ctx context.Context, instance *model.ConfigI
 		// breaker, and clears its grace tracking.
 		emitAction := func(baseAction string) {
 			action, unmonitor := w.applyBreaker(ctx, item, baseAction, maxFailures, instance.Name)
-			actions = append(actions, stuckAction{ID: item.ID, Action: action, Unmonitor: unmonitor})
+			actions = append(actions, stuckAction{ID: item.ID, Action: action, Unmonitor: unmonitor, OutputPath: item.OutputPath})
 			clearFirstSeen()
 		}
 
@@ -188,12 +192,12 @@ func (w *Worker) selectStuckActions(ctx context.Context, instance *model.ConfigI
 		}
 		if healthyGhost {
 			w.resetBreaker(item.BreakerKey)
-			actions = append(actions, stuckAction{ID: item.ID, Action: config.StuckActionRemove, Ghost: true})
+			actions = append(actions, stuckAction{ID: item.ID, Action: config.StuckActionRemove, Ghost: true, OutputPath: item.OutputPath})
 			clearFirstSeen()
 			continue
 		}
 		if w.isGhostByPathGone(ctx, item.OutputPath, item.ID, cfg, instance.Name, item.Title) {
-			actions = append(actions, stuckAction{ID: item.ID, Action: config.StuckActionRemove, Ghost: true})
+			actions = append(actions, stuckAction{ID: item.ID, Action: config.StuckActionRemove, Ghost: true, OutputPath: item.OutputPath})
 			clearFirstSeen()
 			continue
 		}
@@ -303,12 +307,35 @@ func unmonitorRadarrMovie(client *radarr.Radarr, movieID int64) func(ctx context
 	}
 }
 
+// outputIsCategoryRoot reports whether a queue item's output path is a
+// category root (config.IsCategoryRootDownloadPath), and logs it when it is.
+// Removing such an item from the client makes the arr delete the whole folder
+// with every other job in it (#1029), so the caller must not ask for that. An empty output path is not one: with no path the arr has
+// nothing to delete.
+func (w *Worker) outputIsCategoryRoot(ctx context.Context, instance *model.ConfigInstance, a stuckAction) bool {
+	if a.OutputPath == "" || w.configGetter == nil {
+		return false
+	}
+	cfg := w.configGetter()
+	if cfg == nil || !cfg.IsCategoryRootDownloadPath(a.OutputPath) {
+		return false
+	}
+	slog.WarnContext(ctx, "Queue item reports a category folder as its output; not removing it from the client",
+		"instance", instance.Name, "id", a.ID, "action", a.Action, "output_path", a.OutputPath)
+	return true
+}
+
 // deleteStarrQueue runs the per-item starr delete (per its action) and counts
 // successes, tolerating already-removed (404) items.
 func (w *Worker) deleteStarrQueue(ctx context.Context, instance *model.ConfigInstance, actions []stuckAction, del func(ctx context.Context, id int64, opts *starr.QueueDeleteOpts) error) int {
 	cleaned := 0
 	for _, a := range actions {
-		if err := del(ctx, a.ID, starrDeleteOpts(a.Action)); err != nil {
+		opts := starrDeleteOpts(a.Action)
+		if w.outputIsCategoryRoot(ctx, instance, a) {
+			keep := false
+			opts.RemoveFromClient = &keep
+		}
+		if err := del(ctx, a.ID, opts); err != nil {
 			if strings.Contains(err.Error(), "404") {
 				slog.DebugContext(ctx, "Stuck queue item already removed", "instance", instance.Name, "id", a.ID)
 				continue
@@ -532,6 +559,11 @@ func (w *Worker) cleanupStuckSportarr(ctx context.Context, instance *model.Confi
 	actions := w.selectStuckActions(ctx, instance, cfg, items)
 	cleaned := 0
 	for _, a := range actions {
+		// Sportarr's native delete always removes from the client, so an item
+		// whose output is a category folder is left alone instead.
+		if w.outputIsCategoryRoot(ctx, instance, a) {
+			continue
+		}
 		var err error
 		// Sportarr's native API has no skipRedownload flag, so blocklist and
 		// blocklist_search both map to a blocklisting delete.
