@@ -1580,9 +1580,11 @@ func (s *Server) calculateHistoryStoragePath(item *database.ImportQueueItem, bas
 		return fullStoragePath, exists
 	}
 
-	// Release directories can end in known extensions such as .h264 or .nzb.
-	// Only infer a file from its extension when it is not an existing directory.
-	if (err != nil || !fileInfo.IsDir()) && utils.HasPopularExtension(fullStoragePath) {
+	// A release folder can end in .h264/.nzb/.rNN, so strip the last component
+	// only when the path is an existing regular file. For a missing path,
+	// reporting the parent gives the arr the whole category to scan; reporting
+	// the missing path itself makes it fail with "path does not exist".
+	if utils.HasPopularExtension(fullStoragePath) && err == nil && fileInfo.Mode().IsRegular() {
 		return filepath.Dir(fullStoragePath), exists
 	}
 
