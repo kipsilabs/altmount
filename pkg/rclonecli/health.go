@@ -68,6 +68,15 @@ func (m *Manager) restartAfterProbeFailures() int {
 	return threshold
 }
 
+// withinStartupGrace reports whether the rcd became ready less than
+// startupGracePeriod ago.
+func (m *Manager) withinStartupGrace() bool {
+	m.mu.RLock()
+	readyAt := m.readyAt
+	m.mu.RUnlock()
+	return !readyAt.IsZero() && time.Since(readyAt) < startupGracePeriod
+}
+
 // checkMountHealth checks if a specific mount is healthy
 func (m *Manager) checkMountHealth(provider string) error {
 	// Try to list the root directory of the mount
@@ -190,7 +199,6 @@ func (m *Manager) performMountHealthCheck() {
 		// Healthy probe: clear the failure streak and continue to per-mount checks.
 		m.consecutiveProbeFailures = 0
 	} else {
-		m.consecutiveProbeFailures++
 		restartAfter := m.restartAfterProbeFailures()
 
 		// Never kill the rcd during the startup grace period: right after
@@ -198,10 +206,19 @@ func (m *Manager) performMountHealthCheck() {
 		// expected rather than a wedge. Killing it then is the regression we
 		// guard against. Also require sustained failure before restarting so a
 		// single transient miss can't nuke a healthy rcd.
-		m.mu.RLock()
-		readyAt := m.readyAt
-		m.mu.RUnlock()
-		withinGrace := !readyAt.IsZero() && time.Since(readyAt) < startupGracePeriod
+		//
+		// Failures inside the grace window do not count toward the threshold,
+		// and the window clears any streak left from before the rcd was
+		// (re)started. Otherwise a slow-starting rcd would leave the window
+		// with its streak already at or near the threshold, and the first
+		// failed probe after it would kill the rcd: the window would delay the
+		// restart by one tick instead of preventing it.
+		withinGrace := m.withinStartupGrace()
+		if withinGrace {
+			m.consecutiveProbeFailures = 0
+		} else {
+			m.consecutiveProbeFailures++
+		}
 
 		if withinGrace || m.consecutiveProbeFailures < restartAfter {
 			m.logger.WarnContext(m.ctx, "rcd liveness probe failed; not restarting yet",
