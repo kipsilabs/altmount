@@ -185,6 +185,16 @@ func (ss *StoreService) WriteStore(ref string, store *metapb.NzbStore) error {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("write temp store file: %w", writeErr)
 	}
+	// os.CreateTemp always creates 0600. Make the store world-readable so a
+	// backup job running under a different uid can read it. A store holds the
+	// release's NZB file entries and message-ids, the same text as the original
+	// .nzb. The derived archive password and the keys live in the .meta files,
+	// which keep 0600.
+	if chmodErr := tmpFile.Chmod(0o644); chmodErr != nil {
+		tmpFile.Close()
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("chmod temp store file: %w", chmodErr)
+	}
 	if closeErr := tmpFile.Close(); closeErr != nil {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("close temp store file: %w", closeErr)
