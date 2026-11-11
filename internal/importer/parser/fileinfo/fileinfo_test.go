@@ -295,6 +295,47 @@ func par2DescFor(first16KB []byte, name string) map[[16]byte]*par2.FileDescripto
 	return map[[16]byte]*par2.FileDescriptor{key: {Name: name, Hash16k: key, Length: 100}}
 }
 
+// Subject prefixes can win over obfuscated filenames even without a PAR2 match (#1061).
+func TestGetFileInfo_SubjectHeaderMediaExtension(t *testing.T) {
+	const release = "Some.Release.Name.1080p.REMUX-GROUP-AsRequested"
+	tests := []struct {
+		name    string
+		prefix  string
+		subject string
+		header  string
+		want    string
+	}{
+		{"subject extension", release, "6WMC.mkv", "", release + ".mkv"},
+		{"header extension", release, "6WMC", "6WMC.mkv", release + ".mkv"},
+		{"subject takes precedence", release, "6WMC.mkv", "6WMC.mp4", release + ".mkv"},
+		{"uppercase extension", release, "6WMC.MKV", "", release + ".MKV"},
+		{"audio extension", release, "6WMC.flac", "", release + ".flac"},
+		{"existing media extension", release + ".mp4", "6WMC.mkv", "", release + ".mp4"},
+		{"existing audio extension", release + ".flac", "6WMC.mkv", "", release + ".flac"},
+		{"archive volume", release + ".r00", "6WMC.mkv", "", release + ".r00"},
+		{"PAR2 archive", release + ".par2", "6WMC", "6WMC.mkv", release + ".par2"},
+		{"no known media extension", release, "6WMC.bin", "6WMC.dat", release},
+		{"no extension source", release, "6WMC", "", release},
+		{"readable subject wins", release, "Other.Readable.Movie.mkv", "", "Other.Readable.Movie.mkv"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			file := &NzbFileWithFirstSegment{
+				NzbFile:       &nzbparser.NzbFile{Filename: tt.subject},
+				SubjectHeader: tt.prefix,
+				First16KB:     mkvFixture(),
+			}
+			if tt.header != "" {
+				file.Headers = &nntppool.YEncMeta{FileName: tt.header, FileSize: 200}
+			}
+			infos := GetFileInfos([]*NzbFileWithFirstSegment{file}, nil, "Different.NZB.Name.nzb")
+			if got := infos[0].Filename; got != tt.want {
+				t.Errorf("Filename = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestGetFileInfo_Par2MediaExtension(t *testing.T) {
 	const release = "Red.Dwarf.S07E02.Stoke.Me.a.Clipper.1080p.FLAC.2.0.AVC.REMUX-FraMeSToR-AsRequested"
 	tests := []struct {

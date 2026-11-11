@@ -80,10 +80,11 @@ func getFileInfo(
 		filename, fromSidecar = subjectFilename, true
 	}
 	fromPar2 := par2Filename != "" && filename == par2Filename
+	fromSubjectHeader := file.SubjectHeader != "" && filename == file.SubjectHeader
 
-	// PAR2 names can omit the media extension while retaining dotted release tags.
+	// PAR2 names and subject prefixes can omit the media extension while retaining dotted release tags.
 	// Keep the full name and recover only a known media suffix from another source.
-	if fromPar2 && !fromSidecar && !IsImportantFileType(filename) && !IsKnownMediaExtension(filename) && !IsPar2File(filename) {
+	if (fromPar2 || fromSubjectHeader) && !fromSidecar && !IsImportantFileType(filename) && !IsKnownMediaExtension(filename) && !IsPar2File(filename) {
 		for _, source := range []string{subjectFilename, headerFilename} {
 			if IsKnownMediaExtension(source) {
 				filename += filepath.Ext(source)
