@@ -7,10 +7,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/javi11/nntppool/v5"
 	metapb "github.com/kipsilabs/altmount/internal/metadata/proto"
 	"github.com/kipsilabs/altmount/internal/pool"
 	"github.com/kipsilabs/altmount/internal/testsupport/fakepool"
-	"github.com/javi11/nntppool/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -235,3 +235,5 @@ func TestValidateSegmentAvailabilityBatch_UnreportedSegmentsAreInconclusive(t *t
 	assert.True(t, results[0].Inconclusive())
 	assert.ErrorIs(t, results[0].Err, context.DeadlineExceeded)
 }
+
+func (m *validationTestPoolManager) WaitForIdle(ctx context.Context) error { return ctx.Err() }

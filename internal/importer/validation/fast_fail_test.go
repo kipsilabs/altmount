@@ -8,12 +8,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/javi11/nntppool/v5"
 	"github.com/kipsilabs/altmount/internal/holes"
 	metapb "github.com/kipsilabs/altmount/internal/metadata/proto"
 	"github.com/kipsilabs/altmount/internal/pool"
 	"github.com/kipsilabs/altmount/internal/testsupport/fakepool"
 	"github.com/kipsilabs/altmount/internal/usenet"
-	"github.com/javi11/nntppool/v5"
 )
 
 type fastFailPoolManager struct {
@@ -1245,3 +1245,5 @@ func TestPlaceholderResultsMapsDeclaredGapsWithoutStats(t *testing.T) {
 		t.Errorf("segment-less sidecar result = %+v, want zero value", results[2])
 	}
 }
+
+func (m fastFailPoolManager) WaitForIdle(ctx context.Context) error { return ctx.Err() }

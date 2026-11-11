@@ -164,7 +164,7 @@ func statIDsWithBoundedRetries(
 		if sweepCtx.Err() == nil && stopOnMissing && len(missing) == 0 && len(remaining) <= tolerableUnverified(len(ids)) {
 			// The release probe answers "is this post damaged?" from a
 			// sample. With everything else healthy, an article whose STAT
-			// neither the original request nor the priority hedge could get
+			// neither the original request nor the normal-lane hedge could get
 			// answered inside the ceiling is slow at the provider itself;
 			// waiting out further attempts held healthy imports for seconds.
 			// It is handled at stream time like the articles never sampled.

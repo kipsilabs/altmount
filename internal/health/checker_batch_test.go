@@ -5,12 +5,13 @@ import (
 	"fmt"
 	"runtime"
 	"testing"
+	"time"
 
+	"github.com/javi11/nntppool/v5"
 	"github.com/kipsilabs/altmount/internal/config"
 	metapb "github.com/kipsilabs/altmount/internal/metadata/proto"
 	"github.com/kipsilabs/altmount/internal/pool"
 	"github.com/kipsilabs/altmount/internal/testsupport/fakepool"
-	"github.com/javi11/nntppool/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -284,4 +285,71 @@ func TestRunHealthCheckCycle_BatchExceedsMaxJobs(t *testing.T) {
 		`SELECT COUNT(*) FROM file_health WHERE status IN ('checking', 'pending')`,
 	).Scan(&stuck))
 	assert.Equal(t, 0, stuck, "no files should remain due after one cycle")
+}
+
+// Health checks must never queue with playback or interactive imports.
+func TestHealthSweepUsesBackgroundLane(t *testing.T) {
+	env := newBatchTestEnv(t, t.TempDir(), fakepool.New())
+	client := &healthLaneClient{Client: fakepool.New()}
+	env.healthChecker.poolManager = &fakeClientPoolManager{client: client}
+	writeHealthyFile(t, env, "complete/lane.mkv")
+	event := env.healthChecker.CheckFile(context.Background(), "complete/lane.mkv")
+	require.Equal(t, EventTypeFileHealthy, event.Type)
+	require.Equal(t, []nntppool.Lane{nntppool.LaneBackground}, client.lanes)
+}
+
+type healthLaneClient struct {
+	*fakepool.Client
+	lanes []nntppool.Lane
+}
+
+func (c *healthLaneClient) ExistsMany(ctx context.Context, ids []string, opts nntppool.ManyOptions) <-chan nntppool.ExistsResult {
+	c.lanes = append(c.lanes, opts.Lane)
+	return c.Client.ExistsMany(ctx, ids, opts)
+}
+
+// Exercise the real activity gate through both health entry points, including
+// immediate post-import checks, without letting the wait consume a STAT budget.
+func TestHealthSweepsDeferDuringPlayback(t *testing.T) {
+	for _, batch := range []bool{false, true} {
+		t.Run(fmt.Sprintf("batch=%v", batch), func(t *testing.T) {
+			client := &healthLaneClient{Client: fakepool.New()}
+			env := newBatchTestEnv(t, t.TempDir(), client)
+			budget := pool.NewImportBudget()
+			budget.SetStreamSource(healthActiveSource{})
+			env.healthChecker.poolManager = &healthActivityManager{
+				fakeClientPoolManager: fakeClientPoolManager{client: client}, budget: budget,
+			}
+			path := "complete/playing.mkv"
+			writeHealthyFile(t, env, path)
+			check := func(ctx context.Context) HealthEvent {
+				if batch {
+					return env.healthChecker.CheckFilesBatch(ctx, []string{path}, nil)[0]
+				}
+				return env.healthChecker.CheckFile(ctx, path)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+			defer cancel()
+			event := check(ctx)
+			require.Equal(t, EventTypeCheckInconclusive, event.Type)
+			require.Empty(t, client.lanes, "playback must prevent STAT submission")
+			budget.SetStreamSource(nil)
+			event = check(context.Background())
+			require.Equal(t, EventTypeFileHealthy, event.Type)
+			require.Equal(t, []nntppool.Lane{nntppool.LaneBackground}, client.lanes)
+		})
+	}
+}
+
+type healthActiveSource struct{}
+
+func (healthActiveSource) ActiveStreams() int { return 1 }
+
+type healthActivityManager struct {
+	fakeClientPoolManager
+	budget *pool.ImportBudget
+}
+
+func (m *healthActivityManager) WaitForIdle(ctx context.Context) error {
+	return m.budget.WaitForIdle(ctx)
 }

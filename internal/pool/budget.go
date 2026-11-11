@@ -33,7 +33,8 @@ type ImportBudget struct {
 	streamSource StreamActivitySource
 	// headroom is the per-stream connection reserve. Owned by the adaptive
 	// controller when one is running; defaultStreamHeadroom otherwise.
-	headroom int
+	headroom    int
+	idleChanged chan struct{}
 }
 
 // NewImportBudget constructs a budget with capacity 0 (disabled). Use
@@ -104,6 +105,7 @@ func (b *ImportBudget) Headroom() int {
 func (b *ImportBudget) SetStreamSource(src StreamActivitySource) {
 	b.sem.mu.Lock()
 	b.streamSource = src
+	b.signalIdleChangeLocked()
 	b.sem.wakeWaitersLocked()
 	b.sem.mu.Unlock()
 }
@@ -112,6 +114,7 @@ func (b *ImportBudget) SetStreamSource(src StreamActivitySource) {
 // budget can wake or hold waiters according to the new effective cap.
 func (b *ImportBudget) NotifyStreamChange() {
 	b.sem.mu.Lock()
+	b.signalIdleChangeLocked()
 	b.sem.wakeWaitersLocked()
 	b.sem.mu.Unlock()
 }
@@ -129,4 +132,36 @@ func (b *ImportBudget) StreamsActive() bool {
 // done. When the capacity is 0 the call is a fast-path no-op.
 func (b *ImportBudget) Acquire(ctx context.Context) (release func(), err error) {
 	return b.sem.Acquire(ctx)
+}
+
+// WaitForIdle defers background network work while playback is active. Call it
+// between chunks so a newly opened stream stops further pipeline submission.
+func (b *ImportBudget) WaitForIdle(ctx context.Context) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		b.sem.mu.Lock()
+		if b.streamSource == nil || b.streamSource.ActiveStreams() == 0 {
+			b.sem.mu.Unlock()
+			return nil
+		}
+		if b.idleChanged == nil {
+			b.idleChanged = make(chan struct{})
+		}
+		changed := b.idleChanged
+		b.sem.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-changed:
+		}
+	}
+}
+
+func (b *ImportBudget) signalIdleChangeLocked() {
+	if b.idleChanged != nil {
+		close(b.idleChanged)
+		b.idleChanged = nil
+	}
 }

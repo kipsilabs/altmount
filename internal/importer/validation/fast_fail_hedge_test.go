@@ -182,9 +182,9 @@ func (c *optionsRecordingClient) ExistsMany(ctx context.Context, ids []string, o
 }
 
 // Nine of sixty-four STATs queued behind other traffic is the shape seen on a
-// busy pool; that many stragglers must still be hedged, and the hedge must go
-// down the priority lane or it just joins the same queue.
-func TestFastFailReleaseProbeHedgesLargerStragglerTailOnPriorityLane(t *testing.T) {
+// busy pool; that many stragglers must still be hedged without competing in
+// playback's priority lane.
+func TestFastFailReleaseProbeHedgesLargerStragglerTailOnNormalLane(t *testing.T) {
 	delays := make(map[string]time.Duration, 9)
 	for i := 40; i < 49; i++ {
 		delays[fmt.Sprintf("seg-%d", i)] = 5 * time.Second
@@ -207,8 +207,8 @@ func TestFastFailReleaseProbeHedgesLargerStragglerTailOnPriorityLane(t *testing.
 	if client.opts[0].Lane != nntppool.LaneNormal || client.opts[1].Lane != nntppool.LaneNormal {
 		t.Fatal("probe sweeps must stay on the normal lane")
 	}
-	if client.opts[2].Lane != nntppool.LanePriority {
-		t.Fatalf("hedge sweep lane = %v, want priority", client.opts[2].Lane)
+	if client.opts[2].Lane != nntppool.LaneNormal {
+		t.Fatalf("hedge sweep lane = %v, want normal", client.opts[2].Lane)
 	}
 }
 
@@ -236,7 +236,7 @@ func TestFastFailReleaseProbeHedgesWhenArrivalsStall(t *testing.T) {
 	}
 }
 
-// One article of sixty-four that neither the original STAT nor the priority
+// One article of sixty-four that neither the original STAT nor the normal-lane
 // hedge can get an answer for is slow at the provider itself; three 2 s
 // attempts on it held a healthy import for 4.5 s in the bench. The release
 // probe answers "damaged?" from a sample, and the articles it never sampled

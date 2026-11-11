@@ -375,3 +375,36 @@ func TestManagerStatSweepConcurrency(t *testing.T) {
 		t.Fatalf("StatSweepConcurrency(1000) = %d, want 1000 (conservative floor never shrinks the sweep)", got)
 	}
 }
+
+func TestImportBudgetWaitForIdle(t *testing.T) {
+	b := NewImportBudget()
+	src := &stubStreamSource{}
+	b.SetStreamSource(src)
+	if err := b.WaitForIdle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	src.set(1)
+	b.NotifyStreamChange()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := b.WaitForIdle(ctx); err != context.DeadlineExceeded {
+		t.Fatalf("wait = %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- b.WaitForIdle(context.Background()) }()
+	select {
+	case <-done:
+		t.Fatal("background work admitted during playback")
+	case <-time.After(20 * time.Millisecond):
+	}
+	src.set(0)
+	b.NotifyStreamChange()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("waiter did not resume")
+	}
+}

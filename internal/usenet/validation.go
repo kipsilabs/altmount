@@ -94,6 +94,11 @@ const maxTrackedMissingIDs = 50
 
 // BatchOptions tunes a cross-file STAT sweep.
 type BatchOptions struct {
+	// Lane selects the request queue; zero preserves normal priority for callers.
+	Lane nntppool.Lane
+	// BeforeChunk may wait for playback to stop before starting a chunk's timeout.
+	BeforeChunk func(context.Context) error
+
 	// HasPatch reports whether an article is available locally after repair.
 	// Patched articles count as checked without querying the providers.
 	HasPatch func(messageID string) bool
@@ -229,10 +234,16 @@ func ValidateSegmentAvailabilityBatch(
 			continue
 		}
 
+		if opts.BeforeChunk != nil {
+			if err := opts.BeforeChunk(ctx); err != nil {
+				return results, err
+			}
+		}
 		statCtx, cancel := context.WithTimeout(ctx, pool.StatManyTimeout(len(chunk), opts.MaxConnections, opts.Timeout))
 		errByID := make(map[string]error, len(chunk))
 		for r := range usenetPool.ExistsMany(statCtx, chunk, nntppool.ManyOptions{
 			Concurrency: opts.MaxConnections,
+			Lane:        opts.Lane,
 			ArticleDate: opts.ArticleDate,
 		}) {
 			errByID[r.MessageID] = r.Err

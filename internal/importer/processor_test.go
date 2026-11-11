@@ -984,3 +984,5 @@ func TestApplyNzbRenamePreservesOriginalFilename(t *testing.T) {
 		t.Fatal("a second rename replaced original identity")
 	}
 }
+
+func (m processorTestPoolManager) WaitForIdle(ctx context.Context) error { return ctx.Err() }

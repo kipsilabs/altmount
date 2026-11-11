@@ -111,6 +111,9 @@ type Manager interface {
 	// the extra width nearly free. Falls back to conservative when no pool
 	// exists or its capacity is below the conservative bound.
 	StatSweepConcurrency(conservative int) int
+
+	// WaitForIdle defers background STAT chunks until playback has stopped.
+	WaitForIdle(ctx context.Context) error
 }
 
 // StatsRepository defines the interface for persisting pool statistics
@@ -738,4 +741,8 @@ func (m *manager) checkAndResetExpiredQuotas(ctx context.Context) {
 				"provider", ps.Name, "error", err)
 		}
 	}
+}
+
+func (m *manager) WaitForIdle(ctx context.Context) error {
+	return m.budget.WaitForIdle(ctx)
 }

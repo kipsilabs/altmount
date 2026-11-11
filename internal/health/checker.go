@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/javi11/nntppool/v5"
 	"github.com/kipsilabs/altmount/internal/config"
 	"github.com/kipsilabs/altmount/internal/contentverify"
 	"github.com/kipsilabs/altmount/internal/database"
@@ -533,6 +534,8 @@ func (hc *HealthChecker) batchOptions(preps []preparedCheck, opts ...CheckOption
 	}
 
 	return usenet.BatchOptions{
+		Lane:           nntppool.LaneBackground,
+		BeforeChunk:    hc.poolManager.WaitForIdle,
 		HasPatch:       hc.hasPatch,
 		MaxConnections: hc.statSweepConcurrency(cfg),
 		Timeout:        cfg.GetHealthReadTimeout(),

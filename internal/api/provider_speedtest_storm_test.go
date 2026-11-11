@@ -9,9 +9,9 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/javi11/nntppool/v5"
 	"github.com/kipsilabs/altmount/internal/config"
 	"github.com/kipsilabs/altmount/internal/pool"
-	"github.com/javi11/nntppool/v5"
 )
 
 // provider_speedtest_storm_test.go reproduces the speed-test handler
@@ -143,3 +143,5 @@ func TestStorm_SpeedTestBypassesPoolManager(t *testing.T) {
 
 func (m *countingPoolManager) SetStreamHeadroom(int)                      {}
 func (m *countingPoolManager) SpeculativeBudget() *pool.SpeculativeBudget { return nil }
+
+func (m *countingPoolManager) WaitForIdle(ctx context.Context) error { return ctx.Err() }
