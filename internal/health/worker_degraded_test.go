@@ -133,3 +133,39 @@ func TestDegradedRepairEnqueuedAfterHealthUpdate(t *testing.T) {
 type par2EnqueueFunc func(context.Context, string, string)
 
 func (f par2EnqueueFunc) Enqueue(ctx context.Context, path, segment string) { f(ctx, path, segment) }
+
+// The bug behind this test: playback padded a hole, then a clean STAT sweep
+// wrote the file back to healthy. Both check paths must keep it degraded
+// and hand it to PAR2 repair.
+func TestKnownHolesKeepFileDegradedThroughCleanSweep(t *testing.T) {
+	for _, mode := range []string{"batch", "direct"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx := context.Background()
+			holesEnv := newHoleTestEnv(t, "movie.mp4", 128*1024, 1024)
+			require.NoError(t, holesEnv.ms.AddKnownHoles(holesEnv.filePath, []holes.Run{{Start: 10, Count: 1}}, holesEnv.cfg.ProviderFingerprint()))
+			env := newRepairTestEnv(t, t.TempDir(), nil)
+			env.hw.healthChecker = holesEnv.checker
+			env.hw.metadataService = holesEnv.ms
+			env.hw.configGetter = func() *config.Config { return holesEnv.cfg }
+			require.NoError(t, env.healthRepo.UpdateFileHealth(ctx, holesEnv.filePath, database.HealthStatusDegraded, nil, nil, nil, false))
+			queued := &recordingPar2Enqueuer{}
+			env.hw.SetPar2RepairEnqueuer(queued)
+
+			if mode == "direct" {
+				require.NoError(t, env.hw.performDirectCheck(ctx, holesEnv.filePath, database.HealthStatusDegraded, nil))
+			} else {
+				// Make the record due now so the cycle picks it up.
+				require.NoError(t, env.healthRepo.UpdateFileHealth(ctx, holesEnv.filePath, database.HealthStatusPending, nil, nil, nil, false))
+				require.NoError(t, env.hw.runHealthCheckCycle(ctx))
+			}
+
+			got, err := env.healthRepo.GetFileHealth(ctx, holesEnv.filePath)
+			require.NoError(t, err)
+			require.Equal(t, database.HealthStatusDegraded, got.Status)
+			assert.Len(t, queued.calls, 1, "the degraded file is handed to PAR2 repair")
+			meta, err := holesEnv.ms.ReadFileMetadata(holesEnv.filePath)
+			require.NoError(t, err)
+			assert.Equal(t, metapb.FileStatus_FILE_STATUS_DEGRADED, meta.Status)
+		})
+	}
+}

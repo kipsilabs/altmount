@@ -372,9 +372,43 @@ func (hc *HealthChecker) judgeValidation(ctx context.Context, prep preparedCheck
 		event.Details = healthyDetails
 	}
 
+	// A clean STAT sample never overrides observed misses: persisted known
+	// holes (from playback padding) that no patch covers keep the file
+	// degraded instead of letting this sweep mark it healthy. The hole map is
+	// read now, not at prepare time, since playback may record a hole while
+	// the sweep runs. If it cannot be read, the check proves nothing.
+	impact, err := hc.classifyKnownHoles(prep.filePath, result)
+	if err != nil {
+		event.Type = EventTypeCheckInconclusive
+		event.Status = database.HealthStatusPending
+		event.Error = fmt.Errorf("segment check inconclusive: %w", err)
+		details := database.HealthErrorDetails{
+			ErrorType:     "check_inconclusive",
+			Message:       event.Error.Error(),
+			TotalArticles: prep.totalSegments,
+			Sampled:       result.TotalChecked,
+		}
+		event.Details = details.Marshal()
+		return event
+	}
+	if impact != nil {
+		event.Type = EventTypeFileCorrupted
+		event.Status = database.HealthStatusCorrupted
+		event.Classification = impact
+		event.Error = fmt.Errorf("%d segments are known missing from earlier reads and have not been repaired",
+			impact.TotalMissing)
+		details := database.HealthErrorDetails{
+			ErrorType:       "known_holes",
+			MissingArticles: impact.TotalMissing,
+			TotalArticles:   prep.totalSegments,
+			Sampled:         result.TotalChecked,
+			PlaybackImpact:  impact,
+		}
+		event.Details = details.Marshal()
+		return event
+	}
+
 	// All checked segments are available - record will be deleted.
-	// Persisted known holes (from playback padding) survive on purpose: a
-	// clean STAT sample never overrides observed misses.
 	event.Type = EventTypeFileHealthy
 	// Status not needed as the record will be deleted from database
 
