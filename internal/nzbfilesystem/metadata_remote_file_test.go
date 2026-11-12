@@ -6,9 +6,9 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/javi11/nntppool/v5"
 	metapb "github.com/kipsilabs/altmount/internal/metadata/proto"
 	"github.com/kipsilabs/altmount/internal/pool"
-	"github.com/javi11/nntppool/v5"
 )
 
 // createTestVirtualFile creates a MetadataVirtualFile with default configuration for testing
@@ -701,3 +701,5 @@ func TestConcurrentSegmentIndexAccess(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func (m *mockPoolManager) WaitForIdle(ctx context.Context) error { return ctx.Err() }

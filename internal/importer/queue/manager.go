@@ -2,6 +2,7 @@ package queue
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -10,6 +11,10 @@ import (
 	"github.com/kipsilabs/altmount/internal/config"
 	"github.com/kipsilabs/altmount/internal/database"
 )
+
+// ErrProcessingCancelled identifies an explicit user cancellation, as opposed
+// to service shutdown, which leaves interrupted imports resumable on restart.
+var ErrProcessingCancelled = errors.New("processing cancelled by user request")
 
 // QueueEventListener receives notifications about queue item lifecycle events.
 type QueueEventListener interface {
@@ -226,7 +231,9 @@ func (m *Manager) ExecuteItem(ctx context.Context, itemID int64) error {
 
 	go func() {
 		// Use a separate context for the execution to avoid early termination
-		itemCtx, cancel := context.WithCancel(context.Background())
+		itemCtx, cancelItem := context.WithCancelCause(context.Background())
+		defer cancelItem(nil)
+		cancel := func() { cancelItem(ErrProcessingCancelled) }
 		m.cancelMu.Lock()
 		m.cancelFuncs[item.ID] = cancel
 		m.cancelMu.Unlock()
@@ -366,7 +373,9 @@ func (m *Manager) processNextItem(ctx context.Context, workerID int) bool {
 
 	m.log.DebugContext(ctx, "Processing claimed queue item", "worker_id", workerID, "queue_id", item.ID, "file", item.NzbPath)
 
-	itemCtx, cancel := context.WithCancel(ctx)
+	itemCtx, cancelItem := context.WithCancelCause(ctx)
+	defer cancelItem(nil)
+	cancel := func() { cancelItem(ErrProcessingCancelled) }
 	m.cancelMu.Lock()
 	m.cancelFuncs[item.ID] = cancel
 	m.cancelMu.Unlock()
@@ -380,7 +389,7 @@ func (m *Manager) processNextItem(ctx context.Context, workerID int) bool {
 	resultingPath, processingErr := m.processor.ProcessItem(itemCtx, item)
 
 	if processingErr != nil {
-		m.processor.HandleFailure(ctx, item, processingErr)
+		m.processor.HandleFailure(itemCtx, item, processingErr)
 	} else {
 		m.processor.HandleSuccess(ctx, item, resultingPath)
 	}

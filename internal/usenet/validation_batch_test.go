@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/javi11/nntppool/v5"
 	"github.com/kipsilabs/altmount/internal/pool"
 	"github.com/kipsilabs/altmount/internal/testsupport/fakepool"
-	"github.com/javi11/nntppool/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -148,4 +148,23 @@ func TestValidateSegmentAvailabilityBatch_Interleaves(t *testing.T) {
 
 	want := []string{"a-0@test", "b-0@test", "c-0@test", "a-1@test", "b-1@test", "a-2@test"}
 	assert.Equal(t, want, client.gotIDs)
+}
+
+func TestValidationWaitsBeforeEveryChunk(t *testing.T) {
+	client := &statOrderClient{Client: fakepool.New()}
+	mgr := &validationTestPoolManager{client: client}
+	opts := batchOpts(1)
+	waits := 0
+	opts.BeforeChunk = func(ctx context.Context) error {
+		waits++
+		require.Len(t, client.gotIDs, waits-1)
+		if waits == 2 {
+			return context.Canceled
+		}
+		return nil
+	}
+	_, err := ValidateSegmentAvailabilityBatch(context.Background(), [][]string{idList("a", 3)}, mgr, opts)
+	require.ErrorIs(t, err, context.Canceled)
+	require.Equal(t, 2, waits)
+	require.Len(t, client.gotIDs, 1)
 }

@@ -1462,6 +1462,8 @@ func (s *Service) OnItemClaimed(ctx context.Context, item *database.ImportQueueI
 // along with any health records already scheduled for them.
 // Paths prefixed with "DIR:" indicate a directory that should be removed if empty; others are individual files.
 func (s *Service) cleanupWrittenPaths(ctx context.Context, itemID int64, paths []string) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
 	// Files first: a release folder is only ever removed once this job's own
 	// files are gone, so what remains in it belongs to another import.
 	var dirPaths []string
@@ -1552,6 +1554,14 @@ func (s *Service) handleProcessingFailure(ctx context.Context, item *database.Im
 		s.log.ErrorContext(ctx, "Failed to roll back import history", "queue_id", item.ID, "error", err)
 	}
 
+	if ctx.Err() != nil {
+		if errors.Is(context.Cause(ctx), queue.ErrProcessingCancelled) {
+			s.markImportCancelled(cleanupCtx, item)
+		}
+		// Shutdown leaves the row processing for ResetStaleItems on restart.
+		return
+	}
+
 	// A deferral is not a failure: the release is parked while a PAR2 repair
 	// rebuilds its missing articles. The repair service returns it to pending
 	// on success, or fails it when the damage proves unrepairable.
@@ -1573,6 +1583,39 @@ func (s *Service) handleProcessingFailure(ctx context.Context, item *database.Im
 	}
 
 	errorMessage := processingErr.Error()
+	if errors.Is(processingErr, validation.ErrFastFailInconclusive) && item.RetryCount < item.MaxRetries {
+		// Keep the item claimed during backoff so another worker cannot retry
+		// immediately. Cancellation ends automatic retries.
+		delay := time.Second << min(max(item.RetryCount, 0), 5)
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+		case <-timer.C:
+		}
+		timer.Stop()
+		retryCtx, cancelRetry := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancelRetry()
+		if ctx.Err() != nil {
+			if errors.Is(context.Cause(ctx), queue.ErrProcessingCancelled) {
+				s.markImportCancelled(retryCtx, item)
+			}
+			return
+		} else {
+			retried, err := s.database.Repository.IncrementRetryCountAndResetStatus(retryCtx, item.ID, &errorMessage)
+			if err != nil {
+				s.log.ErrorContext(ctx, "Failed to requeue inconclusive import", "queue_id", item.ID, "error", err)
+				return
+			}
+			if retried {
+				s.log.InfoContext(ctx, "Requeued inconclusive import", "queue_id", item.ID, "backoff", delay)
+				if s.broadcaster != nil {
+					s.broadcaster.NotifyComplete(int(item.ID), string(database.QueueStatusPending))
+					s.broadcaster.BroadcastQueueChanged()
+				}
+				return
+			}
+		}
+	}
 	if errors.Is(processingErr, validation.ErrFastFailInconclusive) || errors.Is(processingErr, ErrContentProbeInconclusive) {
 		// The provider never produced a conclusive answer within the bounded
 		// retry budget of segment validation or of the content probe. Keep this
@@ -1702,6 +1745,24 @@ func (s *Service) handleProcessingFailure(ctx context.Context, item *database.Im
 	}
 }
 
+// markImportCancelled persists cancellation without starting fallback or ARR
+// failure handling. ctx must remain live long enough for the status writes.
+func (s *Service) markImportCancelled(ctx context.Context, item *database.ImportQueueItem) {
+	message := "Processing cancelled by user request"
+	if err := s.database.Repository.UpdateQueueItemStatus(ctx, item.ID, database.QueueStatusFailed, &message); err != nil {
+		s.log.ErrorContext(ctx, "Failed to persist import cancellation", "queue_id", item.ID, "error", err)
+	}
+	if s.database.MigrationRepo != nil {
+		if err := s.database.MigrationRepo.MarkFailed(ctx, item.ID, message); err != nil {
+			s.log.WarnContext(ctx, "Failed to persist migration cancellation", "queue_id", item.ID, "error", err)
+		}
+	}
+	if s.broadcaster != nil {
+		s.broadcaster.NotifyComplete(int(item.ID), "failed")
+		s.broadcaster.BroadcastQueueChanged()
+	}
+}
+
 // runFailedItemCleanup periodically removes stale failed queue items and their NZB files.
 func (s *Service) runFailedItemCleanup(ctx context.Context) {
 	// Run once at startup
@@ -1817,7 +1878,9 @@ func (s *Service) ProcessItemInBackground(ctx context.Context, itemID int64) {
 		}
 
 		// Create cancellable context for this item
-		itemCtx, cancel := context.WithCancel(ctx)
+		itemCtx, cancelItem := context.WithCancelCause(ctx)
+		defer cancelItem(nil)
+		cancel := func() { cancelItem(queue.ErrProcessingCancelled) }
 
 		// Register cancel function
 		s.cancelMu.Lock()
@@ -1838,7 +1901,7 @@ func (s *Service) ProcessItemInBackground(ctx context.Context, itemID int64) {
 		if processingErr != nil {
 			// Clean up any metadata files written before the failure
 			s.cleanupWrittenPaths(ctx, item.ID, writtenPaths)
-			s.handleProcessingFailure(ctx, item, processingErr)
+			s.handleProcessingFailure(itemCtx, item, processingErr)
 		} else {
 			// Handle success (storage path, VFS notification, symlinks, status update)
 			s.handleProcessingSuccess(ctx, item, resultingPath, writtenPaths)

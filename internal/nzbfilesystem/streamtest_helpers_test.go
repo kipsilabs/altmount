@@ -4,11 +4,11 @@ import (
 	"context"
 	"testing"
 
+	"github.com/javi11/nntppool/v5"
 	metapb "github.com/kipsilabs/altmount/internal/metadata/proto"
 	"github.com/kipsilabs/altmount/internal/pool"
 	"github.com/kipsilabs/altmount/internal/testsupport/fakepool"
 	"github.com/kipsilabs/altmount/internal/testsupport/segments"
-	"github.com/javi11/nntppool/v5"
 )
 
 // streamtest_helpers_test.go provides the construction kit shared by the
@@ -146,3 +146,5 @@ func newTestMVF(
 	t.Cleanup(func() { _ = mvf.Close() })
 	return mvf
 }
+
+func (m *fakePoolManager) WaitForIdle(ctx context.Context) error { return ctx.Err() }

@@ -26,7 +26,7 @@ const (
 
 // hedgedStatMany runs one StatMany sweep over ids and, once answers have been
 // arriving and then stop for a grace period, re-issues every id still
-// outstanding on a second, priority-lane sweep. The stragglers measured were
+// outstanding on a second, normal-lane sweep. The stragglers measured were
 // STATs pipelined on slow or cold connections while the rest of the sweep
 // answered in ~150 ms — anywhere from one id to a third of the probe — and a
 // re-issue picked up by an idle connection answers in tens of milliseconds.
@@ -113,13 +113,11 @@ func hedgedStatMany(ctx context.Context, client pool.NntpClient, ids []string, c
 					"stragglers", len(stragglers),
 					"reported", len(ids)-len(stragglers),
 					"elapsed", time.Since(start))
-				// The stragglers are queued behind other normal-lane traffic;
-				// a hedge on the same lane would join the queue. The priority
-				// lane lets an idle connection pick these bodyless requests up
-				// ahead of it.
+				// Import probes must not join playback's priority queue. Bound
+				// the duplicate sweep to the same concurrency as its primary.
 				hedge = client.ExistsMany(sweepCtx, stragglers, nntppool.ManyOptions{
-					Concurrency: len(stragglers),
-					Lane:        nntppool.LanePriority,
+					Concurrency: min(concurrency, len(stragglers)),
+					Lane:        nntppool.LaneNormal,
 					ArticleDate: articleDate,
 					Skip: func(id string) bool {
 						mu.Lock()

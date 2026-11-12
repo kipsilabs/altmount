@@ -6,12 +6,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/javi11/nntppool/v5"
+	"github.com/javi11/nzbparser"
 	"github.com/kipsilabs/altmount/internal/config"
 	"github.com/kipsilabs/altmount/internal/pool"
 	"github.com/kipsilabs/altmount/internal/testsupport/fakepool"
 	"github.com/kipsilabs/altmount/internal/testsupport/segments"
-	"github.com/javi11/nntppool/v5"
-	"github.com/javi11/nzbparser"
 )
 
 // parser_storm_test.go pins the connection-budget invariants on the parser
@@ -208,3 +208,5 @@ func TestStorm_ParallelImportsShareGlobalBudget(t *testing.T) {
 			mif, concurrentImports, budgetCapacity)
 	}
 }
+
+func (m *fakeFullPoolManager) WaitForIdle(ctx context.Context) error { return ctx.Err() }

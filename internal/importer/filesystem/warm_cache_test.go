@@ -6,11 +6,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/javi11/nntppool/v5"
 	"github.com/kipsilabs/altmount/internal/importer/parser"
 	metapb "github.com/kipsilabs/altmount/internal/metadata/proto"
 	"github.com/kipsilabs/altmount/internal/pool"
 	"github.com/kipsilabs/altmount/internal/testsupport/fakepool"
-	"github.com/javi11/nntppool/v5"
 )
 
 // fsFakePoolManager satisfies the full pool.Manager surface so UsenetFile can
@@ -191,3 +191,5 @@ func TestWarmPrefixReaderPrefixOnly(t *testing.T) {
 		t.Errorf("makeRest called %d times for prefix-only read, want 0", madeRest)
 	}
 }
+
+func (m *fsFakePoolManager) WaitForIdle(ctx context.Context) error { return ctx.Err() }

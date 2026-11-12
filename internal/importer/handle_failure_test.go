@@ -19,6 +19,7 @@ import (
 
 	"github.com/kipsilabs/altmount/internal/config"
 	"github.com/kipsilabs/altmount/internal/database"
+	"github.com/kipsilabs/altmount/internal/importer/queue"
 	"github.com/kipsilabs/altmount/internal/importer/validation"
 )
 
@@ -161,8 +162,9 @@ func TestHandleFailure_FastFailInconclusiveSkipsDefinitiveFailureHandling(t *tes
 	svc := newMoveToFailedTestService(t)
 	ctx := context.Background()
 	item := &database.ImportQueueItem{
-		NzbPath: filepath.Join(t.TempDir(), "inconclusive.nzb"),
-		Status:  database.QueueStatusPending,
+		NzbPath:    filepath.Join(t.TempDir(), "inconclusive.nzb"),
+		Status:     database.QueueStatusProcessing,
+		MaxRetries: 1,
 	}
 	require.NoError(t, os.WriteFile(item.NzbPath, []byte("<nzb/>"), 0644))
 	require.NoError(t, svc.database.Repository.AddToQueue(ctx, item))
@@ -174,10 +176,16 @@ func TestHandleFailure_FastFailInconclusiveSkipsDefinitiveFailureHandling(t *tes
 	dbItem, err := svc.database.Repository.GetQueueItem(ctx, item.ID)
 	require.NoError(t, err)
 	require.NotNil(t, dbItem)
-	assert.Equal(t, database.QueueStatusFailed, dbItem.Status)
+	assert.Equal(t, database.QueueStatusPending, dbItem.Status)
 	require.NotNil(t, dbItem.ErrorMessage)
 	assert.Contains(t, *dbItem.ErrorMessage, validation.ErrFastFailInconclusive.Error())
-	assert.FileExists(t, item.NzbPath, "inconclusive validation must retain the NZB for manual retry")
+	assert.FileExists(t, item.NzbPath)
+	assert.Equal(t, 1, dbItem.RetryCount)
+	// Exhaustion keeps the inconclusive item for manual retry without fallback.
+	svc.HandleFailure(ctx, dbItem, validation.ErrFastFailInconclusive)
+	exhausted, err := svc.database.Repository.GetQueueItem(ctx, item.ID)
+	require.NoError(t, err)
+	assert.Equal(t, database.QueueStatusFailed, exhausted.Status)
 }
 
 func TestHandleFailure_ContentProbeInconclusiveSkipsDefinitiveFailureHandling(t *testing.T) {
@@ -241,4 +249,50 @@ func TestCleanupFailedItems_RemovesNzbFile(t *testing.T) {
 	}
 
 	assert.NoFileExists(t, nzbPath, "failed NZB should be removed by cleanup")
+}
+
+func TestHandleFailure_CancelledDoesNotRetryOrFallback(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		err   error
+		delay time.Duration
+	}{
+		{"cancelled processing", context.Canceled, 0},
+		{"cancelled validation", validation.ErrFastFailInconclusive, 0},
+		{"cancel during backoff", validation.ErrFastFailInconclusive, 20 * time.Millisecond},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := newMoveToFailedTestService(t)
+			item := &database.ImportQueueItem{NzbPath: filepath.Join(t.TempDir(), "cancelled.nzb"), Status: database.QueueStatusProcessing, MaxRetries: 3}
+			require.NoError(t, svc.database.Repository.AddToQueue(context.Background(), item))
+			ctx, cancelItem := context.WithCancelCause(context.Background())
+			cancel := func() { cancelItem(queue.ErrProcessingCancelled) }
+			defer cancel()
+			if tc.delay == 0 {
+				cancel()
+			} else {
+				timer := time.AfterFunc(tc.delay, cancel)
+				defer timer.Stop()
+			}
+			svc.HandleFailure(ctx, item, tc.err)
+			got, err := svc.database.Repository.GetQueueItem(context.Background(), item.ID)
+			require.NoError(t, err)
+			require.Equal(t, database.QueueStatusFailed, got.Status)
+			require.Zero(t, got.RetryCount)
+			require.Contains(t, *got.ErrorMessage, "cancelled")
+		})
+	}
+}
+
+func TestHandleFailure_ShutdownPreservesInterruptedImport(t *testing.T) {
+	svc := newMoveToFailedTestService(t)
+	item := &database.ImportQueueItem{NzbPath: filepath.Join(t.TempDir(), "interrupted.nzb"), Status: database.QueueStatusProcessing, MaxRetries: 3}
+	require.NoError(t, svc.database.Repository.AddToQueue(context.Background(), item))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	svc.HandleFailure(ctx, item, context.Canceled)
+	got, err := svc.database.Repository.GetQueueItem(context.Background(), item.ID)
+	require.NoError(t, err)
+	require.Equal(t, database.QueueStatusProcessing, got.Status)
+	require.Zero(t, got.RetryCount)
 }
