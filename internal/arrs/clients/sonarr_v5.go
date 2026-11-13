@@ -2,6 +2,7 @@ package clients
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"path"
@@ -174,4 +175,13 @@ func (s *nativeSonarr) DeleteAny(ctx context.Context, r starr.Request) error {
 		return err
 	}
 	return sanitizeSonarrError(s.APIer.DeleteAny(ctx, r))
+}
+
+// ErrParseUnsupported is returned by the native adapter's ParseContext.
+var ErrParseUnsupported = errors.New("sonarr parse is not supported by the native (v5) adapter")
+
+// ParseContext is not mapped for the native adapter yet: callers fall back to
+// their old behaviour.
+func (*nativeSonarr) ParseContext(context.Context, *sonarr.ParseInput) (*sonarr.ParseOutput, error) {
+	return nil, ErrParseUnsupported
 }
