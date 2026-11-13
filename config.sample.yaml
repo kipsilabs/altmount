@@ -311,6 +311,22 @@ log_level: 'info'
 # Profiler configuration
 profiler_enabled: false # Enable performance profiling (default: false)
 
+# Peer network (opt-in; everything below applies live, no restart needed)
+# When disabled nothing listens, nothing connects and no key is generated.
+# Private networks (hosted or joined) are managed in the UI, not here.
+peernet:
+  enabled: false # Master switch (default: false)
+  accept_incoming: false # Run the peer listener so others can connect to you (default: false)
+  listen_port: 8470 # Peer listener port, 1024-65535 (default: 8470)
+  advertise_address: '' # Optional host:port other peers should use to reach you
+  open_network:
+    level: 0 # 0 off, 1 receive only, 2 share metadata, 3 share bundles
+    peers: [] # Peer addresses as host:port (no scheme, userinfo or path), max 64
+  sharing:
+    excluded_categories: [] # Releases in these categories are never published
+    excluded_indexers: [] # Releases from these indexers are never published
+  min_corroboration: 3 # Distinct nodes (one per network prefix) that must attest a release before it shows as healthy (>= 1)
+
 # NNTP Providers Configuration
 # Configure multiple providers for redundancy and load balancing
 providers:

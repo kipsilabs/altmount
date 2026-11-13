@@ -43,12 +43,16 @@ func DefaultConfig() *Config {
 
 // Server represents the API server
 type Server struct {
-	config            *Config
-	queueRepo         *database.Repository
-	healthRepo        *database.HealthRepository
-	authService       *auth.Service
-	userRepo          *database.UserRepository
-	configManager     ConfigManager
+	config        *Config
+	queueRepo     *database.Repository
+	healthRepo    *database.HealthRepository
+	authService   *auth.Service
+	userRepo      *database.UserRepository
+	configManager ConfigManager
+	peernet       PeernetService
+	// networkLabeler labels library streams healthy on the peer network; nil
+	// (the default) leaves Stremio responses untouched.
+	networkLabeler    atomic.Pointer[networkLabelerHolder]
 	metadataReader    *metadata.MetadataReader
 	metadataService   *metadata.MetadataService
 	nzbFilesystem     *nzbfilesystem.NzbFilesystem
@@ -367,6 +371,8 @@ func (s *Server) SetupRoutes(app *fiber.App) {
 	api.Patch("/config/:section", s.handlePatchConfigSection)
 	api.Post("/config/reload", s.handleReloadConfig)
 	api.Post("/config/validate", s.handleValidateConfig)
+
+	s.registerPeernetRoutes(api)
 
 	// Stremio helper endpoints
 	api.Post("/prowlarr/indexers", s.handleListProwlarrIndexers)

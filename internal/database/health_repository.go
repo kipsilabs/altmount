@@ -397,6 +397,28 @@ func (r *HealthRepository) GetFilesForRepairNotification(ctx context.Context, li
 	return files, nil
 }
 
+// BringCheckForward makes a healthy file's next check due at the given time
+// when that is earlier than its current schedule (or it has none). It never
+// moves a check later, never writes a status, and leaves files that are not
+// healthy alone. It reports whether a schedule was moved.
+func (r *HealthRepository) BringCheckForward(ctx context.Context, filePath string, at time.Time) (bool, error) {
+	at = at.UTC()
+	res, err := r.db.ExecContext(ctx, `
+		UPDATE file_health
+		SET scheduled_check_at = ?, updated_at = datetime('now')
+		WHERE file_path = ? AND status = 'healthy'
+		  AND (scheduled_check_at IS NULL OR scheduled_check_at > ?)
+	`, at, normalizeHealthPath(filePath), at)
+	if err != nil {
+		return false, fmt.Errorf("failed to bring check forward: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("failed to read rows affected: %w", err)
+	}
+	return n > 0, nil
+}
+
 // IncrementRetryCount increments the retry count and schedules next check
 func (r *HealthRepository) IncrementRetryCount(ctx context.Context, filePath string, errorMessage *string, errorDetails *string, nextCheck time.Time) error {
 	filePath = normalizeHealthPath(filePath)
@@ -1327,13 +1349,23 @@ func (r *HealthRepository) MarkAsHealthy(ctx context.Context, filePath string, n
 
 // UpdateHealthStatusBulk updates multiple health records in a single transaction
 func (r *HealthRepository) UpdateHealthStatusBulk(ctx context.Context, updates []HealthStatusUpdate) error {
+	_, err := r.UpdateHealthStatusBulkApplied(ctx, updates)
+	return err
+}
+
+// UpdateHealthStatusBulkApplied is UpdateHealthStatusBulk that also reports,
+// index-aligned with updates, which writes changed a row. A guarded write that
+// lost its race (the status moved underneath it) and a skipped update report
+// false. When the error is non-nil nothing was committed and the result is nil.
+func (r *HealthRepository) UpdateHealthStatusBulkApplied(ctx context.Context, updates []HealthStatusUpdate) ([]bool, error) {
 	if len(updates) == 0 {
-		return nil
+		return nil, nil
 	}
+	applied := make([]bool, len(updates))
 
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
+		return nil, fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback()
 
@@ -1349,7 +1381,7 @@ func (r *HealthRepository) UpdateHealthStatusBulk(ctx context.Context, updates [
 		WHERE file_path = ? AND (status = ? OR ? = '')
 	`)
 	if err != nil {
-		return fmt.Errorf("failed to prepare healthy statement: %w", err)
+		return nil, fmt.Errorf("failed to prepare healthy statement: %w", err)
 	}
 	defer stmtHealthy.Close()
 
@@ -1361,7 +1393,7 @@ func (r *HealthRepository) UpdateHealthStatusBulk(ctx context.Context, updates [
 		WHERE file_path = ? AND (status = ? OR ? = '')
 	`)
 	if err != nil {
-		return fmt.Errorf("failed to prepare retry statement: %w", err)
+		return nil, fmt.Errorf("failed to prepare retry statement: %w", err)
 	}
 	defer stmtRetry.Close()
 
@@ -1374,7 +1406,7 @@ func (r *HealthRepository) UpdateHealthStatusBulk(ctx context.Context, updates [
 		WHERE file_path = ? AND (status = ? OR ? = '')
 	`)
 	if err != nil {
-		return fmt.Errorf("failed to prepare repair statement: %w", err)
+		return nil, fmt.Errorf("failed to prepare repair statement: %w", err)
 	}
 	defer stmtRepair.Close()
 
@@ -1387,7 +1419,7 @@ func (r *HealthRepository) UpdateHealthStatusBulk(ctx context.Context, updates [
 		WHERE file_path = ? AND (status = ? OR ? = '')
 	`)
 	if err != nil {
-		return fmt.Errorf("failed to prepare repair trigger statement: %w", err)
+		return nil, fmt.Errorf("failed to prepare repair trigger statement: %w", err)
 	}
 	defer stmtRepairTrigger.Close()
 
@@ -1399,7 +1431,7 @@ func (r *HealthRepository) UpdateHealthStatusBulk(ctx context.Context, updates [
 		WHERE file_path = ? AND (status = ? OR ? = '')
 	`)
 	if err != nil {
-		return fmt.Errorf("failed to prepare corrupted statement: %w", err)
+		return nil, fmt.Errorf("failed to prepare corrupted statement: %w", err)
 	}
 	defer stmtCorrupted.Close()
 
@@ -1413,7 +1445,7 @@ func (r *HealthRepository) UpdateHealthStatusBulk(ctx context.Context, updates [
 		WHERE file_path = ? AND (status = ? OR ? = '')
 	`)
 	if err != nil {
-		return fmt.Errorf("failed to prepare degraded statement: %w", err)
+		return nil, fmt.Errorf("failed to prepare degraded statement: %w", err)
 	}
 	defer stmtDegraded.Close()
 
@@ -1428,11 +1460,24 @@ func (r *HealthRepository) UpdateHealthStatusBulk(ctx context.Context, updates [
 		WHERE file_path = ? AND (status = ? OR ? = '')
 	`)
 	if err != nil {
-		return fmt.Errorf("failed to prepare inconclusive statement: %w", err)
+		return nil, fmt.Errorf("failed to prepare inconclusive statement: %w", err)
 	}
 	defer stmtInconclusive.Close()
 
-	for _, update := range updates {
+	// stmtDeferred postpones a due check of a healthy file on peer evidence.
+	// It is not a check: last_checked, the counters and the error text stay.
+	stmtDeferred, err := tx.PrepareContext(ctx, `
+		UPDATE file_health
+		SET status = ?, error_details = ?, scheduled_check_at = ?,
+		    updated_at = datetime('now')
+		WHERE file_path = ? AND (status = ? OR ? = '')
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("failed to prepare deferred statement: %w", err)
+	}
+	defer stmtDeferred.Close()
+
+	for i, update := range updates {
 		if update.Skip {
 			continue
 		}
@@ -1443,32 +1488,43 @@ func (r *HealthRepository) UpdateHealthStatusBulk(ctx context.Context, updates [
 		if update.ExpectedStatus != nil {
 			expected = string(*update.ExpectedStatus)
 		}
+		var res sql.Result
 		switch update.Type {
 		case UpdateTypeHealthy:
 			// error_details is normally nil here (clearing the column as a
 			// healthy result always did); a content-verification outcome is
 			// the one payload a healthy record keeps.
-			_, err = stmtHealthy.ExecContext(ctx, update.ScheduledCheckAt, update.ErrorDetails, filePath, expected, expected)
+			res, err = stmtHealthy.ExecContext(ctx, update.ScheduledCheckAt, update.ErrorDetails, filePath, expected, expected)
 		case UpdateTypeRetry:
-			_, err = stmtRetry.ExecContext(ctx, update.ErrorMessage, update.ErrorDetails, update.ScheduledCheckAt, filePath, expected, expected)
+			res, err = stmtRetry.ExecContext(ctx, update.ErrorMessage, update.ErrorDetails, update.ScheduledCheckAt, filePath, expected, expected)
 		case UpdateTypeRepairTrigger:
-			_, err = stmtRepairTrigger.ExecContext(ctx, update.ErrorMessage, update.ErrorDetails, update.ScheduledCheckAt, filePath, expected, expected)
+			res, err = stmtRepairTrigger.ExecContext(ctx, update.ErrorMessage, update.ErrorDetails, update.ScheduledCheckAt, filePath, expected, expected)
 		case UpdateTypeRepairRetry:
-			_, err = stmtRepair.ExecContext(ctx, update.ErrorMessage, update.ErrorDetails, update.ScheduledCheckAt, filePath, expected, expected)
+			res, err = stmtRepair.ExecContext(ctx, update.ErrorMessage, update.ErrorDetails, update.ScheduledCheckAt, filePath, expected, expected)
 		case UpdateTypeCorrupted:
-			_, err = stmtCorrupted.ExecContext(ctx, update.ErrorMessage, update.ErrorDetails, filePath, expected, expected)
+			res, err = stmtCorrupted.ExecContext(ctx, update.ErrorMessage, update.ErrorDetails, filePath, expected, expected)
 		case UpdateTypeDegraded:
-			_, err = stmtDegraded.ExecContext(ctx, update.ErrorMessage, update.ErrorDetails, update.ScheduledCheckAt, filePath, expected, expected)
+			res, err = stmtDegraded.ExecContext(ctx, update.ErrorMessage, update.ErrorDetails, update.ScheduledCheckAt, filePath, expected, expected)
 		case UpdateTypeInconclusive:
-			_, err = stmtInconclusive.ExecContext(ctx, string(update.Status), update.ErrorMessage, update.ErrorDetails, update.ScheduledCheckAt, filePath, expected, expected)
+			res, err = stmtInconclusive.ExecContext(ctx, string(update.Status), update.ErrorMessage, update.ErrorDetails, update.ScheduledCheckAt, filePath, expected, expected)
+		case UpdateTypeDeferred:
+			res, err = stmtDeferred.ExecContext(ctx, string(update.Status), update.ErrorDetails, update.ScheduledCheckAt, filePath, expected, expected)
 		}
 
 		if err != nil {
-			return fmt.Errorf("failed to execute update for %s: %w", update.FilePath, err)
+			return nil, fmt.Errorf("failed to execute update for %s: %w", update.FilePath, err)
+		}
+		if res != nil {
+			if n, rErr := res.RowsAffected(); rErr == nil && n > 0 {
+				applied[i] = true
+			}
 		}
 	}
 
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return applied, nil
 }
 
 // UpdateType represents the type of health update
@@ -1487,6 +1543,10 @@ const (
 	// status the record must be restored to (it was set to 'checking' for the
 	// duration of the cycle).
 	UpdateTypeInconclusive UpdateType = 7
+	// UpdateTypeDeferred postpones one due check of a healthy file (peer
+	// evidence). It only moves scheduled_check_at and records the deferral in
+	// error_details; Status carries the status to restore.
+	UpdateTypeDeferred UpdateType = 8
 )
 
 // HealthStatusUpdate represents a single update request for batch processing

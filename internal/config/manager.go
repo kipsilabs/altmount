@@ -77,6 +77,7 @@ type Config struct {
 	// use the default.
 	UserAgent       string           `yaml:"user_agent" mapstructure:"user_agent" json:"user_agent"`
 	Par2Repair      Par2RepairConfig `yaml:"par2_repair" mapstructure:"par2_repair" json:"par2_repair"`
+	Peernet         PeernetConfig    `yaml:"peernet" mapstructure:"peernet" json:"peernet"`
 	MountPath       string           `yaml:"mount_path" mapstructure:"mount_path" json:"mount_path"`
 	MountType       MountType        `yaml:"mount_type" mapstructure:"mount_type" json:"mount_type"`
 	ProfilerEnabled bool             `yaml:"profiler_enabled" mapstructure:"profiler_enabled" json:"profiler_enabled" default:"false"`
@@ -1201,6 +1202,18 @@ func (c *Config) GetDownloadClientBaseURL() string {
 func (c *Config) Validate() error {
 	if c.WebDAV.Port <= 0 || c.WebDAV.Port > 65535 {
 		return fmt.Errorf("webdav port must be between 1 and 65535")
+	}
+
+	if c.Peernet.isUnset() {
+		// Section absent (hand-built config): fall back to the opt-in defaults.
+		c.Peernet = defaultPeernetConfig()
+	}
+	if c.Peernet.Enabled == nil {
+		disabled := false
+		c.Peernet.Enabled = &disabled
+	}
+	if err := c.Peernet.Validate(); err != nil {
+		return err
 	}
 
 	if c.Streaming.MaxPrefetch <= 0 {
@@ -2338,6 +2351,7 @@ func DefaultConfig(configDir ...string) *Config {
 				FileDeleteConfirmSeconds: 15,
 			},
 		},
+		Peernet: defaultPeernetConfig(),
 		Par2Repair: Par2RepairConfig{
 			Enabled:           &par2RepairEnabled,
 			MaxRepairRatio:    0.02, // matches the holes padding byte-ratio cap
