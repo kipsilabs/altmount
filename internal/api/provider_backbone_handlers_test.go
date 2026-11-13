@@ -1,73 +1,63 @@
 package api
 
-import "testing"
+import (
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
 
-func TestParseBackboneEntries(t *testing.T) {
-	// Shape mirrors the rexum /api/providers payload.
-	raw := []byte(`{
-		"providers": [
-			{
-				"name": "Newshosting",
-				"server": [
-					{"nntp": "news.newshosting.com", "backbone": "Omicron"},
-					{"nntp": "NEWS.NEWSHOSTING.COM", "backbone": "Omicron"}
-				]
-			},
-			{
-				"name": "Eweka",
-				"server": [
-					{"nntp": "news.eweka.nl", "backbone": "Eweka Internet Services"}
-				]
-			},
-			{
-				"name": "MissingBackbone",
-				"server": [
-					{"nntp": "reader.nobackbone.com", "backbone": ""}
-				]
-			},
-			{
-				"name": "MissingHost",
-				"server": [
-					{"nntp": "", "backbone": "Ghost"}
-				]
-			}
-		]
-	}`)
+	"github.com/gofiber/fiber/v2"
+	"github.com/kipsilabs/altmount/internal/providerbackbone"
+)
 
-	entries, err := parseBackboneEntries(raw)
+// The handler serves the shared cache; the dataset parsing itself is tested in
+// internal/providerbackbone.
+func TestHandleProviderBackbones(t *testing.T) {
+	status := http.StatusOK
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(`{"providers":[{"name":"Newshosting","server":[{"nntp":"news.newshosting.com","backbone":"Omicron"}]}]}`))
+	}))
+	defer upstream.Close()
+
+	orig := providerbackbone.Default
+	providerbackbone.Default = providerbackbone.NewCache(upstream.URL, time.Hour)
+	defer func() { providerbackbone.Default = orig }()
+
+	app := fiber.New()
+	s := &Server{}
+	app.Get("/providers/backbones", s.handleProviderBackbones)
+
+	status = http.StatusBadGateway
+	resp, err := app.Test(httptest.NewRequest(http.MethodGet, "/providers/backbones", nil))
 	if err != nil {
-		t.Fatalf("parseBackboneEntries() error = %v", err)
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("an unavailable source with nothing cached is 503, got %d", resp.StatusCode)
 	}
 
-	// Duplicate host (case-insensitive) collapses; entries missing host or
-	// backbone are skipped. Newshosting + Eweka => 2 entries.
-	if len(entries) != 2 {
-		t.Fatalf("got %d entries, want 2: %+v", len(entries), entries)
+	status = http.StatusOK
+	resp, err = app.Test(httptest.NewRequest(http.MethodGet, "/providers/backbones", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	var out struct {
+		Success bool            `json:"success"`
+		Data    []BackboneEntry `json:"data"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		t.Fatalf("%v: %s", err, body)
+	}
+	if resp.StatusCode != http.StatusOK || !out.Success || len(out.Data) != 1 || out.Data[0].Backbone != "Omicron" {
+		t.Fatalf("status %d body %s", resp.StatusCode, body)
 	}
 
-	byHost := map[string]BackboneEntry{}
-	for _, e := range entries {
-		byHost[e.Host] = e
-	}
-
-	nh, ok := byHost["news.newshosting.com"]
-	if !ok {
-		t.Fatalf("missing newshosting entry: %+v", entries)
-	}
-	if nh.Backbone != "Omicron" {
-		t.Errorf("newshosting backbone = %q, want %q", nh.Backbone, "Omicron")
-	}
-	if nh.Provider != "Newshosting" {
-		t.Errorf("newshosting provider = %q, want %q", nh.Provider, "Newshosting")
-	}
-
-	if _, ok := byHost["news.eweka.nl"]; !ok {
-		t.Errorf("missing eweka entry: %+v", entries)
-	}
-}
-
-func TestParseBackboneEntries_InvalidJSON(t *testing.T) {
-	if _, err := parseBackboneEntries([]byte("not json")); err == nil {
-		t.Error("expected error for invalid JSON, got nil")
+	// The peer network reads the same cache.
+	if got := providerbackbone.Default.Cached(); len(got) != 1 {
+		t.Fatalf("shared cache not filled: %v", got)
 	}
 }

@@ -87,6 +87,9 @@ type HealthWorker struct {
 	configGetter        config.ConfigGetter
 	progressBroadcaster *progress.ProgressBroadcaster // optional, may be nil
 	par2Repair          Par2RepairEnqueuer            // optional, may be nil
+	// healthyObserver is notified of fresh healthy results (see observer.go).
+	// Nil by default: no behaviour change and no overhead.
+	healthyObserver atomic.Pointer[observerHolder]
 
 	// Worker state
 	status   WorkerStatus
@@ -500,6 +503,30 @@ func (hw *HealthWorker) prepareUpdateForResult(ctx context.Context, fh *database
 		return update, sideEffect
 	}
 
+	// A deferred check ran nothing: the file keeps its status, counters and
+	// last-check time, its next check just moves out (never past what a real
+	// check would have scheduled), and the deferral is recorded so it cannot
+	// repeat before a real check runs.
+	if event.Type == EventTypeCheckDeferred {
+		status := event.Status
+		if status == "" {
+			status = fh.Status
+		}
+		if status == database.HealthStatusChecking || status == "" {
+			status = database.HealthStatusHealthy
+		}
+		update.Type = database.UpdateTypeDeferred
+		update.Status = status
+		update.ScheduledCheckAt = event.DeferUntil
+		update.ErrorDetails = database.WithPeerDeferral(fh.ErrorDetails, time.Now())
+		sideEffect = func() error {
+			slog.InfoContext(ctx, "Health check deferred once on peer evidence",
+				"file_path", fh.FilePath, "next_check", event.DeferUntil)
+			return nil
+		}
+		return update, sideEffect
+	}
+
 	if event.Type == EventTypeFileHealthy {
 		// File is now healthy
 		releaseDate := fh.ReleaseDate
@@ -514,9 +541,16 @@ func (hw *HealthWorker) prepareUpdateForResult(ctx context.Context, fh *database
 		// Normally nil, which clears the column as before. A content-verification
 		// outcome is the one thing a healthy record still carries.
 		update.ErrorDetails = event.Details
+		if event.ReducedByPeerAdvice {
+			// Remember that this check was a reduced one, so the next is a
+			// normal check. Any normal check rewrites the details and ends it.
+			update.ErrorDetails = database.WithPeerReduction(event.Details, time.Now())
+		}
 
 		sideEffect = func() error {
 			slog.InfoContext(ctx, "File is healthy", "file_path", fh.FilePath)
+			// The healthy observer is told after the write lands, not here
+			// (see notifyHealthyApplied).
 
 			return hw.metadataService.UpdateFileStatus(fh.FilePath, metapb.FileStatus_FILE_STATUS_HEALTHY)
 		}
@@ -543,7 +577,9 @@ func (hw *HealthWorker) prepareUpdateForResult(ctx context.Context, fh *database
 			text := event.Error.Error()
 			update.ErrorMessage = &text
 		}
-		update.ErrorDetails = event.Details
+		// No verdict, so a standing peer deferral stays standing.
+		update.ErrorDetails = database.CarryPeerReduction(
+			database.CarryPeerDeferral(event.Details, fh.ErrorDetails), fh.ErrorDetails)
 
 		sideEffect = func() error {
 			slog.WarnContext(ctx, "Health check inconclusive, rescheduling without counting a retry",
@@ -959,9 +995,11 @@ func (hw *HealthWorker) performDirectCheck(ctx context.Context, filePath string,
 	}
 
 	if !updatePtr.Skip {
-		if err := hw.healthRepo.UpdateHealthStatusBulk(ctx, []database.HealthStatusUpdate{*updatePtr}); err != nil {
+		applied, err := hw.healthRepo.UpdateHealthStatusBulkApplied(ctx, []database.HealthStatusUpdate{*updatePtr})
+		if err != nil {
 			return fmt.Errorf("failed to update health status: %w", err)
 		}
+		hw.notifyHealthyApplied([]database.HealthStatusUpdate{*updatePtr}, applied, map[string]HealthEvent{filePath: event})
 		hw.enqueueDegradedRepair(ctx, *updatePtr)
 		hw.broadcastHealthChanged()
 	}
@@ -1069,6 +1107,9 @@ func (hw *HealthWorker) runHealthCheckCycle(ctx context.Context) error {
 	// Process files in parallel with bounded concurrency
 	p := pool.New().WithMaxGoroutines(maxJobs)
 	var results []database.HealthStatusUpdate
+	// healthyEvents holds, only while an observer is installed, the healthy
+	// results to announce once their writes have landed.
+	healthyEvents := map[string]HealthEvent{}
 	var resultsMu sync.Mutex
 
 	// The regular-check writes are based on the record being 'checking' (set just above);
@@ -1095,7 +1136,11 @@ func (hw *HealthWorker) runHealthCheckCycle(ctx context.Context) error {
 		paths[i] = fh.FilePath
 		statuses[i] = fh.Status
 	}
-	events := hw.healthChecker.CheckFilesBatch(ctx, paths, statuses, CheckOptions{OnProgress: reportProgress})
+	checkOpts := CheckOptions{OnProgress: reportProgress}
+	if hw.healthChecker.peerAdviserOn() {
+		checkOpts.PeerFiles = peerFilesFor(unhealthyFiles)
+	}
+	events := hw.healthChecker.CheckFilesBatch(ctx, paths, statuses, checkOpts)
 
 	// Phase B: per-file result handling (repair side effects, ARR API calls,
 	// VFS notifications), bounded by maxJobs.
@@ -1121,13 +1166,19 @@ func (hw *HealthWorker) runHealthCheckCycle(ctx context.Context) error {
 
 			resultsMu.Lock()
 			results = append(results, *updatePtr)
+			if hw.healthyObserver.Load() != nil && event.Type == EventTypeFileHealthy {
+				healthyEvents[fh.FilePath] = event
+			}
 			resultsMu.Unlock()
 
 			// Notify VFS
 			hw.healthChecker.notifyRcloneVFS(fh.FilePath, event)
 
-			// Update cycle progress stats
+			// Update cycle progress stats (a deferred check was not a check)
 			hw.updateStats(func(s *WorkerStats) {
+				if event.Type == EventTypeCheckDeferred {
+					return
+				}
 				s.CurrentRunFilesChecked++
 				s.TotalFilesChecked++
 				switch event.Type {
@@ -1214,12 +1265,13 @@ func (hw *HealthWorker) runHealthCheckCycle(ctx context.Context) error {
 
 	// Perform bulk database update
 	if len(results) > 0 {
-		if err := hw.healthRepo.UpdateHealthStatusBulk(ctx, results); err != nil {
+		if applied, err := hw.healthRepo.UpdateHealthStatusBulkApplied(ctx, results); err != nil {
 			slog.ErrorContext(ctx, "Failed to perform bulk health status update", "error", err)
 		} else {
 			for _, result := range results {
 				hw.enqueueDegradedRepair(ctx, result)
 			}
+			hw.notifyHealthyApplied(results, applied, healthyEvents)
 		}
 		hw.broadcastHealthChanged()
 	}

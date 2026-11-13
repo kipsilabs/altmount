@@ -2,6 +2,7 @@ package database
 
 import (
 	"encoding/json"
+	"time"
 
 	"github.com/kipsilabs/altmount/internal/holes"
 )
@@ -37,6 +38,20 @@ type HealthErrorDetails struct {
 	// was never probed at all. Empty means verification did not run — the
 	// feature is off, or the file is not an eligible media type.
 	ContentVerification string `json:"content_verification,omitempty"`
+
+	// PeerDeferredAt is set while a due check of a healthy file was deferred
+	// once on the strength of peer evidence and no real check has run since.
+	// Every real check rewrites error_details, which ends the deferral.
+	PeerDeferredAt string `json:"peer_deferred_at,omitempty"`
+
+	// PeerReducedAt is set on a healthy record whose last check ran with a
+	// sample lowered by peer advice. The next check of the file must be a
+	// normal one; any normal check rewrites error_details and ends it.
+	PeerReducedAt string `json:"peer_reduced_at,omitempty"`
+
+	// Legacy holds details from before this envelope existed (a bare string,
+	// an array or plain text) that a marker had to be added next to.
+	Legacy string `json:"legacy,omitempty"`
 }
 
 // ContentVerification values for HealthErrorDetails.ContentVerification.
@@ -62,4 +77,107 @@ func (d *HealthErrorDetails) Marshal() *string {
 	}
 	s := string(data)
 	return &s
+}
+
+func parseDetails(raw *string) (HealthErrorDetails, bool) {
+	var d HealthErrorDetails
+	if raw == nil || *raw == "" {
+		return d, false
+	}
+	if err := json.Unmarshal([]byte(*raw), &d); err != nil {
+		return HealthErrorDetails{}, false
+	}
+	return d, true
+}
+
+// HasPeerDeferral reports whether the details record a peer-evidence deferral
+// that no real check has ended yet.
+func HasPeerDeferral(raw *string) bool {
+	d, _ := parseDetails(raw)
+	return d.PeerDeferredAt != ""
+}
+
+// WithPeerDeferral returns the details with the deferral marker set. Every
+// other field is kept; details that are not a JSON object are preserved under
+// the "legacy" key.
+func WithPeerDeferral(raw *string, at time.Time) *string {
+	return withDetailsKey(raw, "peer_deferred_at", at.UTC().Format(time.RFC3339))
+}
+
+// CarryPeerDeferral returns details with the deferral marker of from added
+// when from has one; otherwise details are returned untouched. It keeps an
+// inconclusive check (which proves nothing) from ending a deferral.
+func CarryPeerDeferral(details, from *string) *string {
+	d, _ := parseDetails(from)
+	if d.PeerDeferredAt == "" {
+		return details
+	}
+	return withDetailsKey(details, "peer_deferred_at", d.PeerDeferredAt)
+}
+
+// HasPeerReduction reports whether the details record that the last check of
+// the file was a peer-reduced one.
+func HasPeerReduction(raw *string) bool {
+	d, _ := parseDetails(raw)
+	return d.PeerReducedAt != ""
+}
+
+// WithPeerReduction returns the details with the reduction marker set, keeping
+// everything else.
+func WithPeerReduction(raw *string, at time.Time) *string {
+	return withDetailsKey(raw, "peer_reduced_at", at.UTC().Format(time.RFC3339))
+}
+
+// HasFailureDetails reports whether the details record a failure of any kind:
+// anything but the content-verification outcome a healthy record may carry.
+// Details that are not the envelope count as failure evidence (a healthy
+// record never has any).
+func HasFailureDetails(raw *string) bool {
+	if raw == nil || *raw == "" {
+		return false
+	}
+	d, ok := parseDetails(raw)
+	if !ok {
+		return true
+	}
+	return d.ErrorType != "" || d.MissingArticles > 0 || d.UnresolvedSegments > 0 ||
+		d.TerminatedEarly || d.PlaybackImpact != nil || d.Legacy != ""
+}
+
+// withDetailsKey sets one string key in the details JSON object, keeping every
+// other key as stored (including ad-hoc legacy ones). Details that are not a
+// JSON object (a bare string, an array, plain text) are kept verbatim under
+// the "legacy" key rather than replaced.
+func withDetailsKey(raw *string, key, value string) *string {
+	obj := map[string]json.RawMessage{}
+	if raw != nil && *raw != "" {
+		if err := json.Unmarshal([]byte(*raw), &obj); err != nil || obj == nil {
+			obj = map[string]json.RawMessage{}
+			if legacy, mErr := json.Marshal(*raw); mErr == nil {
+				obj["legacy"] = legacy
+			}
+		}
+	}
+	v, err := json.Marshal(value)
+	if err != nil {
+		return raw
+	}
+	obj[key] = v
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return raw
+	}
+	s := string(out)
+	return &s
+}
+
+// CarryPeerReduction returns details with the reduction marker of from added
+// when from has one; otherwise details are returned untouched. An inconclusive
+// check proves nothing, so it must not let a second reduced check through.
+func CarryPeerReduction(details, from *string) *string {
+	d, _ := parseDetails(from)
+	if d.PeerReducedAt == "" {
+		return details
+	}
+	return withDetailsKey(details, "peer_reduced_at", d.PeerReducedAt)
 }

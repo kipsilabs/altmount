@@ -448,14 +448,12 @@ func (mrf *MetadataRemoteFile) RenameFile(ctx context.Context, oldName, newName 
 
 	// Check if old path is a directory
 	if mrf.metadataService.DirectoryExists(normalizedOld) {
-		// Get the filesystem paths for the directories
-		oldDirPath := mrf.metadataService.GetMetadataDirectoryPath(normalizedOld)
-		newDirPath := mrf.metadataService.GetMetadataDirectoryPath(normalizedNew)
+		slog.InfoContext(ctx, "Moving metadata directory",
+			"from", mrf.metadataService.GetMetadataDirectoryPath(normalizedOld),
+			"to", mrf.metadataService.GetMetadataDirectoryPath(normalizedNew))
 
-		slog.InfoContext(ctx, "Moving metadata directory", "from", oldDirPath, "to", newDirPath)
-
-		// Rename the entire directory
-		if err := os.Rename(oldDirPath, newDirPath); err != nil {
+		// Rename the entire directory (also tells the metadata file observer)
+		if err := mrf.metadataService.RenameDirectory(normalizedOld, normalizedNew); err != nil {
 			return false, fmt.Errorf("failed to rename directory: %w", err)
 		}
 

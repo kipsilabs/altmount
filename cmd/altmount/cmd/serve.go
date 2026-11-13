@@ -194,6 +194,8 @@ func runServe(cmd *cobra.Command, args []string) error {
 	stremioCleanup.StartCleanup(ctx)
 
 	apiServer := setupAPIServer(app, repos, authService, configManager, metadataReader, metadataService, fs, poolManager, importerService, arrsService, mountService, progressBroadcaster, streamTracker, cacheSource)
+	peernetService := startPeernetService(ctx, cfg, db, metadataService, repos.HealthRepo, configManager)
+	apiServer.SetPeernetService(peernetService)
 	apiServer.SetLogFilePath(slogutil.GetLogFilePath(cfg.Log))
 	apiServer.SetMigrationRepo(db.MigrationRepo)
 
@@ -245,6 +247,11 @@ func runServe(cmd *cobra.Command, args []string) error {
 		logger.Warn("Health worker initialization failed", "err", err)
 	}
 	if healthWorker != nil {
+		// Healthy local checks feed the peer network's publishing (nil observer
+		// while the feature is off).
+		wirePeernetHealthObserver(healthWorker, cfg, peernetService, configManager.OnConfigChange)
+		// Peer evidence for scheduled checks (nil adviser while the feature is off).
+		wirePeernetHints(ctx, peernetService, healthWorker, apiServer, db, configManager, cfg)
 		apiServer.SetHealthWorker(healthWorker)
 	}
 	if par2RepairService != nil {
@@ -409,6 +416,9 @@ func runServe(cmd *cobra.Command, args []string) error {
 
 	// Stop metadata backup worker
 	metadataBackupWorker.Stop(ctx)
+
+	// Stop the peer network (no-op when disabled)
+	peernetService.Stop(ctx)
 
 	// Stop RClone mount service if running
 	if cfg.RClone.MountEnabled != nil && *cfg.RClone.MountEnabled {
