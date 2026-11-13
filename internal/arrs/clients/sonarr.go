@@ -47,4 +47,8 @@ type SonarrClient interface {
 	) (*sonarr.NotificationOutput, error)
 	GetHistoryPageContext(ctx context.Context, params *starr.PageReq) (*sonarr.History, error)
 	FailContext(ctx context.Context, historyID int64) error
+	// ParseContext asks Sonarr which series and episodes a release name is.
+	// The native (v5) adapter returns ErrParseUnsupported until the v5
+	// endpoint is confirmed; callers must treat an error as "unknown".
+	ParseContext(ctx context.Context, input *sonarr.ParseInput) (*sonarr.ParseOutput, error)
 }

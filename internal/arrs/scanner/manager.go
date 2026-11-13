@@ -893,6 +893,7 @@ func (m *Manager) triggerSonarrRescanByPath(ctx context.Context, client clients.
 	var targetSeriesTitle string
 	var targetEpisodeFileID int64
 	var sceneName string
+	var targetSeries *sonarr.Series
 	var err error
 
 	// ID-Based Precision: If we have the series ID from metadata, use it
@@ -933,7 +934,6 @@ func (m *Manager) triggerSonarrRescanByPath(ctx context.Context, client clients.
 		}
 
 		// Find the series that contains this file path
-		var targetSeries *sonarr.Series
 		for _, show := range series {
 			if strings.Contains(filePath, show.Path) {
 				targetSeries = show
@@ -965,9 +965,25 @@ func (m *Manager) triggerSonarrRescanByPath(ctx context.Context, client clients.
 				return err
 			}
 
-			return fmt.Errorf("no series found containing file path in library or queue: %s: %w", filePath, model.ErrPathMatchFailed)
+			// Fallback 2: Sonarr knows the episode under its
+			// own library path, not under the mount path. Find it by release
+			// name instead; see sonarr_parse_fallback.go for when this acts.
+			fb := m.sonarrParseFallback(ctx, client, instanceName, filePath)
+			switch fb.kind {
+			case parseFallbackCurrentFile:
+				targetSeriesID = fb.seriesID
+				targetSeriesTitle = "Series found by release name"
+				targetEpisodeFileID = fb.episodeFileID
+				sceneName = fb.sceneName
+			case parseFallbackMissing:
+				return m.searchSonarrMissingEpisodes(ctx, client, instanceName, fb)
+			default:
+				return fmt.Errorf("no series found containing file path in library or queue: %s: %w", filePath, model.ErrPathMatchFailed)
+			}
 		}
+	}
 
+	if targetEpisodeFileID == 0 && targetSeries != nil {
 		targetSeriesID = targetSeries.ID
 		targetSeriesTitle = targetSeries.Title
 
