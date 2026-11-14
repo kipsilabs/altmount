@@ -60,6 +60,7 @@ type Processor struct {
 	peerFastPath      atomic.Pointer[peerFastPathHolder] // optional; nil unless the peer network is on
 	pwRecorder        atomic.Pointer[nzbPasswordHolder]  // optional; nil unless the peer network is on
 	peerItems         sync.Map                           // queue id -> peerItemInfo
+	peerSkipOnce      sync.Map                           // queue id -> {}: skip the peer fast path once
 
 	// Pre-compiled regex patterns for RAR file sorting
 	rarPartPattern  *regexp.Regexp // pattern.part###.rar
@@ -1078,7 +1079,9 @@ func (proc *Processor) ProcessNzbFile(ctx context.Context, filePath, relativePat
 			// Trimmed here, not in the check: the warm-up reads n.Files until
 			// warmDone closes.
 			var pastEnd *articlesPastEndError
+			trimmed := false
 			if errors.As(fastFailErr, &pastEnd) {
+				trimmed = true
 				proc.parser.TrimArticles(ctx, n.Files, pastEnd.keep)
 				brokenIdx, missingIDs, degradedFiles, fastFailErr = proc.preParseFastFail(ctx, n, cfg, queueID, category, downloadID)
 			}
@@ -1105,7 +1108,7 @@ func (proc *Processor) ProcessNzbFile(ctx context.Context, filePath, relativePat
 			// The store built for the peer lookup describes this NZB exactly
 			// unless gap placeholders were inserted into it (a nested NZB, parsed
 			// afresh below, never reuses it).
-			if prebuilt != nil && gaps == 0 {
+			if prebuiltStillDescribes(prebuilt, gaps, trimmed) {
 				parseOpts.PrebuiltStore, parseOpts.PrebuiltIndex = prebuilt.store, prebuilt.index
 			}
 			prebuilt = nil

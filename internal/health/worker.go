@@ -604,6 +604,20 @@ func (hw *HealthWorker) prepareUpdateForResult(ctx context.Context, fh *database
 	update.ErrorMessage = errorMsg
 	update.ErrorDetails = event.Details
 
+	// A pending peer import never ends degraded: a release a peer vouched for
+	// that plays with missing segments is a failed one (the fast path then
+	// imports the NZB normally). It is written as corrupted so no degraded
+	// PAR2 repair is queued, and the gate is told (notifyPeerBundleResults).
+	if event.Classification != nil && event.Classification.Verdict == holes.VerdictDegraded &&
+		fh.Status != database.HealthStatusRepairTriggered && hw.peerImportFailsFor(ctx, fh.FilePath) {
+		update.Type = database.UpdateTypeCorrupted
+		update.Status = database.HealthStatusCorrupted
+		return update, func() error {
+			slog.WarnContext(ctx, "Peer import is degraded; it is failed and removed", "file_path", fh.FilePath)
+			return nil
+		}
+	}
+
 	// Degraded verdict: the confirmed holes are within the padding caps, so
 	// the file still plays (streaming zero-fills the gaps). Record it as
 	// degraded — no repair trigger, no safety-folder move, periodic re-check —

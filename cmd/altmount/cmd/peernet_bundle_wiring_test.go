@@ -10,6 +10,7 @@ import (
 	"github.com/kipsilabs/altmount/internal/database"
 	"github.com/kipsilabs/altmount/internal/health"
 	"github.com/kipsilabs/altmount/internal/importer"
+	"github.com/kipsilabs/altmount/internal/metadata"
 	"github.com/kipsilabs/altmount/internal/peernet/bundle"
 	"github.com/kipsilabs/altmount/internal/peernet/bundleimport"
 	"github.com/kipsilabs/altmount/internal/peernet/service"
@@ -265,3 +266,31 @@ func TestPeernetStagingRoot_IsAlwaysAbsoluteAndNeverTheWorkingDirectory(t *testi
 	}
 	assert.Equal(t, "/var/lib/altmount/.peernet-staging", peernetStagingRoot("/var/lib/altmount/altmount.db"))
 }
+
+// The production importer configuration must carry every collaborator the
+// accept pipeline needs: a nil Headers once made every bundle fail with
+// "no way to read article headers" at runtime while all unit tests passed.
+func TestProductionBundleImporterConfigHasEveryRequiredCollaborator(t *testing.T) {
+	db, err := database.NewDB(database.Config{DatabasePath: filepath.Join(t.TempDir(), "db")})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	cfg := config.DefaultConfig()
+	d := bundleWiringDeps{
+		Metadata: metadata.NewMetadataService(t.TempDir()), DB: db, Importer: &importer.Service{},
+		GetConfig: func() *config.Config { return cfg },
+	}
+	state := database.NewPeernetBundleImportRepository(db.Connection(), db.Dialect())
+	ic := bundleImporterConfig(d, state, t.TempDir(), &peernetBundleSeams{})
+	assert.Empty(t, ic.Missing(), "a missing collaborator makes the feature silently never work")
+	assert.NotNil(t, ic.Headers, "without a header reader every bundle is rejected as probe_inconclusive")
+
+	var bad bundleimport.Config
+	assert.Contains(t, bad.Missing(), "Headers", "the check itself must notice a nil Headers")
+}
+
+// The forced full check's header sample reaches the health worker through the
+// gate: the importer must satisfy both interfaces.
+var (
+	_ health.PeerBundleGate     = (*bundleimport.Importer)(nil)
+	_ health.PeerHeaderVerifier = (*bundleimport.Importer)(nil)
+)

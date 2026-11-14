@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/url"
 	"path/filepath"
@@ -40,6 +41,19 @@ type PeerPlayback interface {
 	HasOffer(ctx context.Context, releaseID string) bool
 	Play(ctx context.Context, req PeerPlayRequest) (PeerPlayResult, error)
 }
+
+// PeerRetryError is returned by PeerPlayback.Play when the release cannot be
+// fetched right now for a temporary reason (a rate limit, a publisher back-off).
+// After is the suggested wait in seconds.
+type PeerRetryError struct {
+	After int
+	Err   error
+}
+
+func (e *PeerRetryError) Error() string {
+	return "peer release temporarily unavailable: " + e.Err.Error()
+}
+func (e *PeerRetryError) Unwrap() error { return e.Err }
 
 type peerPlaybackHolder struct{ p PeerPlayback }
 
@@ -294,6 +308,13 @@ func (s *Server) handleStremioPeerPlay(c *fiber.Ctx) error {
 		return h.p.Play(workCtx, req)
 	})
 	if err != nil {
+		var retry *PeerRetryError
+		if errors.As(err, &retry) {
+			// A fetch limit or a publisher back-off is temporary: say so.
+			slog.InfoContext(ctx, "Peer network play deferred", "retry_after", retry.After)
+			c.Set("Retry-After", strconv.Itoa(max(retry.After, 1)))
+			return RespondError(c, fiber.StatusTooManyRequests, "RATE_LIMITED", "Peer release is not available right now", "try again shortly")
+		}
 		slog.WarnContext(ctx, "Peer network play failed", "error", err)
 		return RespondServiceUnavailable(c, "Failed to prepare peer release", "the release could not be verified here")
 	}

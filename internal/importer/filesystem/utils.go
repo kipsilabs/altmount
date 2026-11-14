@@ -336,6 +336,24 @@ const maxSafeFolderNameLen = 200
 // example the category folders) is refused. Unlike NzbFolderPath it can never
 // yield "." or "..".
 func SafeFolderName(title string, extraReserved ...string) (string, bool) {
+	// One pass can expose a new trailing extension (trimming "Movie.mkv."
+	// leaves "Movie.mkv"), so repeat until the name is a fixed point. Every
+	// pass that changes the name makes it strictly shorter, so this ends.
+	name, ok := safeFolderNameOnce(title, extraReserved)
+	for ok {
+		next, nok := safeFolderNameOnce(name, extraReserved)
+		if !nok {
+			return "", false
+		}
+		if next == name {
+			break
+		}
+		name = next
+	}
+	return name, ok
+}
+
+func safeFolderNameOnce(title string, extraReserved []string) (string, bool) {
 	name := strings.ToValidUTF8(title, "")
 	if i := strings.LastIndexAny(name, `/\`); i >= 0 {
 		name = name[i+1:]

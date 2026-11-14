@@ -420,10 +420,27 @@ func (r *Repository) UpdateQueueItemIndexer(ctx context.Context, id int64, index
 	return nil
 }
 
+// dropHeldHistory deletes the provisional history rows of the held peer-import
+// queue items matching the condition. A held item is not yet a finished import,
+// so nothing of it may outlive its queue row.
+func (r *Repository) dropHeldHistory(ctx context.Context, cond string, args ...any) error {
+	_, err := r.db.ExecContext(ctx,
+		`DELETE FROM import_history WHERE nzb_id IN (SELECT id FROM import_queue WHERE peer_hold <> 0 AND `+cond+`)`, args...)
+	if err != nil {
+		return fmt.Errorf("failed to drop the provisional history of a held peer import: %w", err)
+	}
+	return nil
+}
+
 // RemoveFromQueueByDownloadID removes an item from the queue by its DownloadID
 func (r *Repository) RemoveFromQueueByDownloadID(ctx context.Context, downloadID string) error {
 	query := `DELETE FROM import_queue WHERE download_id = ?`
 
+	// The provisional history of a held peer import goes first: once the queue
+	// row is gone its history row loses nzb_id and would show as Completed.
+	if err := r.dropHeldHistory(ctx, `download_id = ?`, downloadID); err != nil {
+		return err
+	}
 	result, err := r.db.ExecContext(ctx, query, downloadID)
 	if err != nil {
 		return fmt.Errorf("failed to remove from queue by download_id: %w", err)
@@ -497,6 +514,9 @@ func (r *Repository) HasActiveOrRecentQueueItemForStoragePath(
 
 // DeleteQueueItemsByPath removes items from the queue matching the given path
 func (r *Repository) DeleteQueueItemsByPath(ctx context.Context, path string) error {
+	if err := r.dropHeldHistory(ctx, `(storage_path = ? OR nzb_path = ?)`, path, path); err != nil {
+		return err
+	}
 	_, err := r.db.ExecContext(ctx,
 		`DELETE FROM import_queue WHERE storage_path = ? OR nzb_path = ?`, path, path)
 	if err != nil {

@@ -94,7 +94,7 @@ function BreakdownList({ title, counts, label }: BreakdownListProps) {
 function BundlesBlock({ status }: { status: PeernetStatus }) {
 	const b = status.bundles;
 	const imp = b?.import;
-	const serving = showBundleServing(status.networks);
+	const serving = showBundleServing(status.networks, b);
 	const backedOff = count(b?.fetch_backed_off);
 	return (
 		<div className="space-y-2 text-sm">

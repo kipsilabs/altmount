@@ -35,6 +35,32 @@ type Config struct {
 	Now           func() time.Time
 }
 
+// Missing lists the collaborators the accept pipeline cannot work without and
+// that are nil. A production wiring must call it and refuse to run with any
+// missing (a nil Headers, for example, rejects every bundle at the first
+// sample): optional pieces are only Config.AllowedExtensions and
+// Config.WillBeChecked (nil means "no restriction" and "every path").
+func (c Config) Missing() []string {
+	var out []string
+	add := func(nilDep bool, name string) {
+		if nilDep {
+			out = append(out, name)
+		}
+	}
+	add(c.Library == nil, "Library")
+	add(c.Stager == nil, "Stager")
+	add(c.Prober == nil, "Prober")
+	add(c.State == nil, "State")
+	add(c.Index == nil, "Index")
+	add(c.Fetcher == nil, "Fetcher")
+	add(c.Headers == nil, "Headers")
+	add(c.Recorder == nil, "Recorder")
+	add(c.Announcer == nil, "Announcer")
+	add(c.Reporter == nil, "Reporter")
+	add(c.HealthEnabled == nil, "HealthEnabled")
+	return out
+}
+
 // Importer accepts bundles. It is safe for concurrent use.
 type Importer struct {
 	cfg      Config
@@ -43,6 +69,12 @@ type Importer struct {
 	// reportedMu guards reported.
 	reportedMu sync.Mutex
 	flight     singleflight.Group
+	// mismatched holds the paths whose header sample contradicted the layout.
+	mismatched sync.Map
+
+	// writeMu: a write holds it shared from its first state row to its commit;
+	// Reconcile takes it exclusively, so it can never roll back a live write.
+	writeMu sync.RWMutex
 
 	tmu     sync.Mutex
 	targets map[string]*targetLock

@@ -47,7 +47,7 @@ func repeat32(v byte) []byte {
 }
 
 func TestHostileClipsCannotBloatVerify(t *testing.T) {
-	raw := hostileClipBundle(t, 200)
+	raw := hostileClipBundle(t, 50)
 	if len(raw) > MaxDecompressedSize {
 		t.Fatalf("test input is %d bytes canonical", len(raw))
 	}
@@ -63,7 +63,7 @@ func TestHostileClipsCannotBloatVerify(t *testing.T) {
 	var before, after runtime.MemStats
 	runtime.GC()
 	runtime.ReadMemStats(&before)
-	_, err = VerifyCanonical(raw, id, [32]byte{0xAA}, Options{})
+	_, err = VerifyCanonical(raw, id, [32]byte{0xAA})
 	runtime.ReadMemStats(&after)
 	if err == nil {
 		t.Fatal("hostile bundle verified")

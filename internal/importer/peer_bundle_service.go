@@ -104,6 +104,33 @@ func (s *Service) FailImport(ctx context.Context, queueID int64, reason string) 
 	return nil
 }
 
+// RequeueNormalImport puts the held queue item of a fast-path import back for
+// a normal import (the peer fast path is off for it, once), after its peer
+// files were removed. It reports false, changing nothing, for an item that has
+// no NZB to import from (a direct peer import, or an NZB that is gone).
+func (s *Service) RequeueNormalImport(ctx context.Context, queueID int64) (bool, error) {
+	item, err := s.database.Repository.GetQueueItem(ctx, queueID)
+	if err != nil {
+		return false, err
+	}
+	if item == nil || item.IsPeerImport() {
+		return false, nil
+	}
+	if _, err := os.Stat(item.NzbPath); err != nil {
+		return false, nil
+	}
+	s.processor.SkipPeerFastPathOnce(int(queueID))
+	changed, err := s.bundleState().RequeueHeldQueueItem(ctx, queueID)
+	if err != nil || !changed {
+		s.processor.ClearSkipPeerFastPath(int(queueID))
+		return false, err
+	}
+	if s.broadcaster != nil {
+		s.broadcaster.BroadcastQueueChanged()
+	}
+	return true, nil
+}
+
 // ReleaseHold lifts the hold of a queue item no peer file refers to any more.
 func (s *Service) ReleaseHold(ctx context.Context, queueID int64) error {
 	if err := s.bundleState().SetQueueHold(ctx, queueID, false); err != nil {

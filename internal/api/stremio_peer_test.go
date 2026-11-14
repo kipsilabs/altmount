@@ -434,3 +434,14 @@ func TestStreamList_MergeWithoutPeerStreamsIsByteIdenticalToTheFormerOutput(t *t
 	require.Len(t, merged, 3)
 	assert.Equal(t, "P", merged[1]["name"])
 }
+
+// A fetch rate limit or publisher back-off is not "the release could not be
+// verified": the player is told to retry later (429 + Retry-After).
+func TestPeerPlay_RateLimitedFetchAnswers429WithRetryAfter(t *testing.T) {
+	f := &fakePlayback{offers: map[string]bool{relA: true}, playErr: &PeerRetryError{After: 120, Err: assertErr("secret detail 10.0.0.5")}}
+	h := newPeerHarness(t, f)
+	resp := h.get(t, h.key, relA, "type=movie&id=tt1")
+	assert.Equal(t, http.StatusTooManyRequests, resp.StatusCode)
+	assert.Equal(t, "120", resp.Header.Get("Retry-After"))
+	assert.NotContains(t, readAll(t, resp), "10.0.0.5")
+}

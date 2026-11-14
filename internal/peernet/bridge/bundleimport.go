@@ -11,6 +11,7 @@ import (
 	metapb "github.com/kipsilabs/altmount/internal/metadata/proto"
 	"github.com/kipsilabs/altmount/internal/peernet/bundle"
 	"github.com/kipsilabs/altmount/internal/peernet/bundleimport"
+	"github.com/kipsilabs/altmount/internal/peernet/bundlex"
 	"github.com/kipsilabs/altmount/internal/peernet/contentid"
 	"github.com/kipsilabs/altmount/internal/peernet/service"
 )
@@ -92,6 +93,16 @@ func encodedSizes(store *metapb.NzbStore) [][]int64 {
 	return out
 }
 
+// subjectNames returns the file name each NZB entry's subject carries ("" when
+// it carries none), in NZB order.
+func subjectNames(store *metapb.NzbStore) []string {
+	out := make([]string, 0, len(store.GetFiles()))
+	for _, f := range store.GetFiles() {
+		out = append(out, bundleimport.SubjectFilename(f.GetSubject()))
+	}
+	return out
+}
+
 func canonicalIDs(store *metapb.NzbStore) [][]string {
 	out := make([][]string, 0, len(store.GetFiles()))
 	for _, f := range store.GetFiles() {
@@ -117,7 +128,17 @@ func (f *fastPath) TryBundle(ctx context.Context, req importer.PeerBundleRequest
 		return importer.PeerBundleOutcome{}, false
 	}
 	fetchCtx, cancel := context.WithTimeout(ctx, f.cfg.FetchTimeout)
-	b, origin, err := f.cfg.Fetcher.FetchBundle(fetchCtx, rid.String())
+	// The caller's requirements go to the fetcher, which filters the offers
+	// before dialing anyone: with the switch off an open-network offer is never
+	// contacted (a contact reveals the Release ID).
+	var b *bundle.Bundle
+	var origin bundleimport.Origin
+	if of, ok := f.cfg.Fetcher.(bundleimport.OptionFetcher); ok {
+		b, origin, err = of.FetchBundleWith(fetchCtx, rid.String(), bundleimport.FetchOptions{
+			AllowOpen: f.cfg.OpenFastPath != nil && f.cfg.OpenFastPath(), MinOpenCorroborators: minOpenCorroborators})
+	} else {
+		b, origin, err = f.cfg.Fetcher.FetchBundle(fetchCtx, rid.String())
+	}
 	cancel()
 	if err != nil || b == nil || b.Scheme != bundle.SchemeNZB || b.ReleaseID != rid {
 		return importer.PeerBundleOutcome{}, false
@@ -128,7 +149,7 @@ func (f *fastPath) TryBundle(ctx context.Context, req importer.PeerBundleRequest
 	acceptCtx, cancelAccept := context.WithTimeout(ctx, f.cfg.AcceptTimeout)
 	defer cancelAccept()
 	res, err := f.cfg.Acceptor.Accept(acceptCtx, bundleimport.Request{
-		Bundle: b, Origin: origin, ExpectedNZB: canonicalIDs(req.NZB), ExpectedNZBSizes: encodedSizes(req.NZB),
+		Bundle: b, Origin: origin, ExpectedNZB: canonicalIDs(req.NZB), ExpectedNZBSizes: encodedSizes(req.NZB), ExpectedNZBNames: subjectNames(req.NZB),
 		Target: bundleimport.Target{Dir: req.TargetDir, Category: req.Category, QueueID: int64(req.QueueID),
 			TargetPath: req.TargetPath, SkipArr: req.SkipArr},
 	})
@@ -215,6 +236,16 @@ func (a serviceAdapter) ReleaseHold(ctx context.Context, queueID int64) error {
 	return a.s.ReleaseHold(ctx, queueID)
 }
 
+// RequeueForNormalImport implements bundleimport.Requeuer when the service can.
+func (a serviceAdapter) RequeueForNormalImport(ctx context.Context, queueID int64) (bool, error) {
+	if rq, ok := a.s.(interface {
+		RequeueNormalImport(ctx context.Context, queueID int64) (bool, error)
+	}); ok {
+		return rq.RequeueNormalImport(ctx, queueID)
+	}
+	return false, nil
+}
+
 func (a serviceAdapter) RecordPeerImport(ctx context.Context, rec bundleimport.ImportRecord) (int64, error) {
 	return a.s.RecordPeerImport(ctx, importer.PeerImportRecord{
 		Title: rec.Title, Category: rec.Category, TargetPath: rec.TargetPath, ResultingPath: rec.ResultingPath,
@@ -243,11 +274,28 @@ func NewBundleFetcher(s BundleService) bundleimport.Fetcher {
 
 func (f bundleFetcher) FetchBundle(ctx context.Context, releaseID string) (*bundle.Bundle, bundleimport.Origin, error) {
 	b, src, err := f.s.FetchBundle(ctx, releaseID)
+	return originOf(b, src, err)
+}
+
+// FetchBundleWith filters the offers by the caller's requirements before any
+// peer is contacted, when the service can.
+func (f bundleFetcher) FetchBundleWith(ctx context.Context, releaseID string, o bundleimport.FetchOptions) (*bundle.Bundle, bundleimport.Origin, error) {
+	ws, ok := f.s.(interface {
+		FetchBundleWith(ctx context.Context, releaseID string, opts bundlex.FetchOptions) (*bundle.Bundle, service.FetchSource, error)
+	})
+	if !ok {
+		return f.FetchBundle(ctx, releaseID)
+	}
+	b, src, err := ws.FetchBundleWith(ctx, releaseID, bundlex.FetchOptions{Restrict: true, AllowOpen: o.AllowOpen, MinOpenCorroborators: o.MinOpenCorroborators})
+	return originOf(b, src, err)
+}
+
+func originOf(b *bundle.Bundle, src service.FetchSource, err error) (*bundle.Bundle, bundleimport.Origin, error) {
 	if err != nil {
 		return nil, bundleimport.Origin{}, err
 	}
 	return b, bundleimport.Origin{NetworkID: src.Network.String(), PublisherID: src.Publisher.String(),
-		Open: src.Network.IsOpen(), Corroborators: src.Corroborators}, nil
+		Open: src.Network.IsOpen(), Corroborators: src.Corroborators, BundleID: src.BundleID.String()}, nil
 }
 
 type bundleReporter struct{ s BundleService }
@@ -263,6 +311,16 @@ func NewBundleReporter(s BundleService) bundleimport.BadBundleReporter {
 
 func (r bundleReporter) ReportBadBundle(_ context.Context, o bundleimport.Origin, _ string) {
 	r.s.NoteBundleFullCheck(o.NetworkID, o.PublisherID, false)
+}
+
+// ReportFailedBundle puts a layout that failed local verification on the
+// negative cache when the service keeps one.
+func (r bundleReporter) ReportFailedBundle(_ context.Context, bundleID, releaseID string) {
+	if nf, ok := r.s.(interface {
+		NoteBundleFailed(bundleID, releaseID string)
+	}); ok {
+		nf.NoteBundleFailed(bundleID, releaseID)
+	}
 }
 
 func (r bundleReporter) ReportVerifiedBundle(_ context.Context, o bundleimport.Origin, _ string) {

@@ -1,6 +1,8 @@
 package bundle
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"sort"
 	"strings"
@@ -68,8 +70,13 @@ type validator struct {
 	b       *Bundle
 	segs    int
 	extents int
-	used    []bool // pool entries referenced (files scheme)
-	names   map[string]struct{}
+	// owner maps a pool entry to the segment table that references it (-1 =
+	// none). A pool entry belongs to exactly one table; two usages of one table
+	// (a shared outer volume, a PAR2 file listed by several files) are the same
+	// table only when every reference, size and range is identical.
+	owner  []int32
+	tables map[TableKey]int32
+	names  map[string]struct{}
 	// nzb scheme: the pool range of every NZB file entry, and which entries
 	// are read inline (once, by one file) or as shared outer/PAR2 sources.
 	entStart []int
@@ -103,7 +110,7 @@ func Validate(b *Bundle) error {
 	if err := checkPassword(b.NZBPassword); err != nil {
 		return err
 	}
-	v := &validator{b: b, names: map[string]struct{}{}}
+	v := &validator{b: b, names: map[string]struct{}{}, tables: map[TableKey]int32{}}
 	if err := v.checkPool(); err != nil {
 		return err
 	}
@@ -119,8 +126,8 @@ func Validate(b *Bundle) error {
 		}
 	}
 	if b.Scheme == SchemeFiles {
-		for i, used := range v.used {
-			if !used {
+		for i, o := range v.owner {
+			if o < 0 {
 				return fmt.Errorf("%w: pool entry %d is not referenced", ErrBadPool, i)
 			}
 		}
@@ -181,6 +188,7 @@ func (v *validator) checkPool() error {
 			pos += n
 		}
 		v.inline, v.sharedE = map[int]struct{}{}, map[int]struct{}{}
+		v.initOwner()
 		return nil
 	}
 	if len(b.ReleaseFiles) != 0 {
@@ -193,8 +201,15 @@ func (v *validator) checkPool() error {
 		}
 		seen[id] = struct{}{}
 	}
-	v.used = make([]bool, len(b.Pool))
+	v.initOwner()
 	return nil
+}
+
+func (v *validator) initOwner() {
+	v.owner = make([]int32, len(v.b.Pool))
+	for i := range v.owner {
+		v.owner[i] = -1
+	}
 }
 
 func validDate(d int64) bool { return d == 0 || (d >= 1 && d <= maxUnixSeconds) }
@@ -326,12 +341,43 @@ func (v *validator) checkInline(f *File) error {
 	return nil
 }
 
+// TableKey identifies a segment table by its whole content: every reference,
+// size and usable range, in order.
+type TableKey [32]byte
+
+// KeyOf hashes a segment table (references, sizes and ranges, in order).
+func KeyOf(segs []Segment) TableKey {
+	h := sha256.New()
+	var buf [32]byte
+	for _, s := range segs {
+		binary.BigEndian.PutUint64(buf[0:], uint64(s.Ref))
+		binary.BigEndian.PutUint64(buf[8:], uint64(s.Size))
+		binary.BigEndian.PutUint64(buf[16:], uint64(s.Start))
+		binary.BigEndian.PutUint64(buf[24:], uint64(s.End))
+		h.Write(buf[:])
+	}
+	var k TableKey
+	h.Sum(k[:0])
+	return k
+}
+
 // checkTable validates one segment table and returns the bytes it covers.
+//
+// A table reads one posted file front to back. Only its first segment may
+// start inside the article and only its last may end inside it (a single
+// segment may do both); every other segment is used whole, so no usable range
+// can hide bytes in the middle. A pool entry is referenced at most once within
+// a table, and by one table only unless the other usage is identical.
 func (v *validator) checkTable(segs []Segment) (int64, error) {
 	if v.segs += len(segs); v.segs > MaxSegments {
 		return 0, fmt.Errorf("%w: more than %d segments", ErrLimit, MaxSegments)
 	}
 	poolLen := int64(len(v.b.Pool))
+	ceiling := int64(MaxSegmentSize)
+	if v.b.Scheme == SchemeFiles {
+		ceiling = MaxFilesSchemeSegment
+	}
+	seen := make(map[int64]struct{}, len(segs))
 	var covered int64
 	for i, s := range segs {
 		switch {
@@ -340,17 +386,32 @@ func (v *validator) checkTable(segs []Segment) (int64, error) {
 			return 0, fmt.Errorf("%w: segment %d is a gap", ErrInvalidField, i)
 		case s.Ref < 0 || s.Ref >= poolLen:
 			return 0, fmt.Errorf("%w: segment %d references pool entry %d of %d", ErrOutOfRange, i, s.Ref, poolLen)
-		case s.Size > MaxSegmentSize:
+		case s.Size > ceiling:
 			return 0, fmt.Errorf("%w: segment %d is %d bytes", ErrImplausible, i, s.Size)
 		case s.Size < 1:
 			return 0, fmt.Errorf("%w: segment %d size %d", ErrOutOfRange, i, s.Size)
 		case s.Start < 0 || s.End < s.Start || s.End > s.Size-1:
 			return 0, fmt.Errorf("%w: segment %d range [%d,%d] of %d", ErrOutOfRange, i, s.Start, s.End, s.Size)
+		case i > 0 && s.Start != 0, i < len(segs)-1 && s.End != s.Size-1:
+			return 0, fmt.Errorf("%w: segment %d range [%d,%d] of %d", ErrPartialRange, i, s.Start, s.End, s.Size)
 		}
-		if s.Ref >= 0 && v.used != nil {
-			v.used[s.Ref] = true
+		if _, dup := seen[s.Ref]; dup {
+			return 0, fmt.Errorf("%w: segment %d repeats pool entry %d within one table", ErrCoverage, i, s.Ref)
 		}
+		seen[s.Ref] = struct{}{}
 		covered += s.End - s.Start + 1
+	}
+	key := KeyOf(segs)
+	if _, same := v.tables[key]; same {
+		return covered, nil
+	}
+	id := int32(len(v.tables))
+	v.tables[key] = id
+	for i, s := range segs {
+		if v.owner[s.Ref] >= 0 {
+			return 0, fmt.Errorf("%w: segment %d shares pool entry %d with a different table", ErrCoverage, i, s.Ref)
+		}
+		v.owner[s.Ref] = id
 	}
 	return covered, nil
 }

@@ -177,11 +177,47 @@ func (p peerBook) VerifiedPeer(ctx context.Context, nw netid.NetworkID, node ide
 		return recsync.Peer{}, false, err
 	}
 	trusted := row.Source == database.PeernetSourceUser || row.Source == database.PeernetSourceLocal
-	return recsync.Peer{NodeID: node, Address: row.Address, Trusted: trusted}, true, nil
+	ip, err := p.store.ConnectedIP(ctx, nw.String(), node.String())
+	if err != nil {
+		return recsync.Peer{}, false, err
+	}
+	return recsync.Peer{NodeID: node, Address: row.Address, Trusted: trusted, ConnectedIP: ip}, true, nil
 }
 
 func (p peerBook) Known(ctx context.Context, nw netid.NetworkID, nodes []string) (map[string]bool, error) {
 	return p.store.KnownAmong(ctx, nw.String(), nodes, knownPeerAge, time.Now())
+}
+
+// failedBundleBook adapts the bundle-import repository to bundlex.FailedBundles
+// (the negative cache of layouts that failed local verification): entries count
+// for failedBundleTTL.
+type failedBundleBook struct {
+	repo *database.PeernetBundleImportRepository
+}
+
+// failedBundleTTL is how long a failed Bundle ID is skipped. A layout is
+// content-addressed: it does not get better, so a week is a bound on memory,
+// not a belief that it might.
+const failedBundleTTL = 7 * 24 * time.Hour
+
+func (b failedBundleBook) IsFailedBundle(ctx context.Context, bundleID string) bool {
+	if b.repo == nil {
+		return false
+	}
+	bad, err := b.repo.IsFailedBundle(ctx, bundleID, time.Now().Add(-failedBundleTTL))
+	return err == nil && bad
+}
+
+// NoteBundleFailed puts a Bundle ID whose layout failed local verification on
+// the negative cache; the same layout offered by anyone is then skipped.
+func (s *Service) NoteBundleFailed(bundleID, releaseID string) {
+	n := s.currentNode()
+	if n == nil || n.deps.BundleState == nil || bundleID == "" {
+		return
+	}
+	ctx := context.Background()
+	_ = n.deps.BundleState.RecordFailedBundle(ctx, bundleID, releaseID, time.Now())
+	_ = n.deps.BundleState.PruneFailedBundles(ctx, time.Now().Add(-failedBundleTTL))
 }
 
 // startBuilder creates the bundle builder and the fetch client. Without a
@@ -195,6 +231,7 @@ func (n *node) startBuilder() {
 	n.fetcher = bundlex.NewFetcher(bundlex.FetchConfig{
 		Self: n.nodeID, Store: d.Records, Peers: peerBook{store: d.Peers, maxFailures: recsync.DefaultLimits().MaxPeerFailures},
 		Networks: n.rx, Dialer: n.client, Auth: authBridge{mem: n.mem, onRefused: n.noteRefused},
+		Failed: failedBundleBook{repo: d.BundleState},
 	})
 	src := d.BundleSource
 	if src == nil {
@@ -261,6 +298,12 @@ func (s *Service) BundleOffers(ctx context.Context, releaseID string) ([]Offer, 
 // limited and concurrency limited, and is never called speculatively by the
 // service itself.
 func (s *Service) FetchBundle(ctx context.Context, releaseID string) (*bundle.Bundle, FetchSource, error) {
+	return s.FetchBundleWith(ctx, releaseID, bundlex.FetchOptions{})
+}
+
+// FetchBundleWith is FetchBundle with the caller's requirements applied to the
+// offers before any peer is contacted.
+func (s *Service) FetchBundleWith(ctx context.Context, releaseID string, opts bundlex.FetchOptions) (*bundle.Bundle, FetchSource, error) {
 	n, err := s.requireNode()
 	if err != nil {
 		return nil, FetchSource{}, err
@@ -268,7 +311,7 @@ func (s *Service) FetchBundle(ctx context.Context, releaseID string) (*bundle.Bu
 	if n.fetcher == nil {
 		return nil, FetchSource{}, ErrBundlesUnavailable
 	}
-	return n.fetcher.Fetch(ctx, releaseID)
+	return n.fetcher.FetchWith(ctx, releaseID, opts)
 }
 
 // NoteBundleFullCheck tells the fetcher how the full local check of a release

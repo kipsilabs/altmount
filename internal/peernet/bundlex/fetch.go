@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -27,7 +28,10 @@ var (
 	ErrNoOffers    = errors.New("bundlex: no fetchable offer for this release")
 	ErrRateLimited = errors.New("bundlex: fetch rate limit reached")
 	ErrFetchBusy   = errors.New("bundlex: too many bundle downloads in progress")
-	ErrAllFailed   = errors.New("bundlex: no offered bundle could be fetched and verified")
+	// ErrBackedOff: every fetchable offer is backed off. It is also an
+	// ErrNoOffers, so callers that do not tell them apart keep working.
+	ErrBackedOff = fmt.Errorf("%w: every offer is backed off", ErrNoOffers)
+	ErrAllFailed = errors.New("bundlex: no offered bundle could be fetched and verified")
 )
 
 // Fetch failure reasons (counted in the status).
@@ -61,6 +65,34 @@ type ReceivingNetworks interface {
 	ReceivingNetworks() []recsync.NetworkInfo
 }
 
+// FailedBundles is the negative cache of Bundle IDs whose layout failed local
+// verification (nil: none). An offer for such a Bundle ID is skipped before any
+// peer is contacted, whoever announces it.
+type FailedBundles interface {
+	IsFailedBundle(ctx context.Context, bundleID string) bool
+}
+
+// FetchOptions are the caller's requirements, applied to the offers BEFORE any
+// peer is dialled (a contact reveals the Release ID, so an offer the caller
+// would discard after fetching must never be contacted). The zero value
+// restricts nothing.
+type FetchOptions struct {
+	// Restrict switches the open-network rules below on.
+	Restrict bool
+	// AllowOpen says offers of the open network may be taken at all.
+	AllowOpen bool
+	// MinOpenCorroborators is how many distinct network ranges must announce an
+	// open-network offer's Bundle ID.
+	MinOpenCorroborators int
+}
+
+func (o FetchOptions) permits(of Offer) bool {
+	if !o.Restrict || !of.Network.IsOpen() {
+		return true
+	}
+	return o.AllowOpen && of.Corroborators >= o.MinOpenCorroborators
+}
+
 // FetchConfig wires a Fetcher.
 type FetchConfig struct {
 	Self     identity.NodeID
@@ -71,6 +103,8 @@ type FetchConfig struct {
 	Auth     discovery.Authorizer
 	Limits   FetchLimits
 	Now      func() time.Time
+	// Failed is the negative cache of failed Bundle IDs (nil: none).
+	Failed FailedBundles
 }
 
 // Offer is one stored release record that announces a bundle for a release.
@@ -114,11 +148,12 @@ type Fetcher struct {
 	pub  *buckets
 	slot chan struct{}
 
-	mu      sync.Mutex
-	strikes map[string]*strike
-	ok      int64
-	failed  map[string]int64
-	refused int64
+	mu             sync.Mutex
+	refusedBundles map[bundle.BundleID]time.Time
+	strikes        map[string]*strike
+	ok             int64
+	failed         map[string]int64
+	refused        int64
 
 	// fcStrikes are the full-check penalties (see ReportBadBundle), kept apart
 	// from the strikes of hostile bytes.
@@ -195,6 +230,31 @@ func (f *Fetcher) backedOff(nw netid.NetworkID, p identity.NodeID) bool {
 	}
 	s := f.fcStrikes[strikeKey(nw, p)]
 	return s != nil && s.until.After(now)
+}
+
+// refuseBundle counts a plain refusal and skips that Bundle ID for SoftBackoff.
+func (f *Fetcher) refuseBundle(id bundle.BundleID) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failed[failRefused]++
+	if f.refusedBundles == nil {
+		f.refusedBundles = map[bundle.BundleID]time.Time{}
+	}
+	if len(f.refusedBundles) >= f.lim.MaxTracked {
+		f.refusedBundles = map[bundle.BundleID]time.Time{}
+	}
+	f.refusedBundles[id] = f.cfg.Now().Add(f.lim.SoftBackoff)
+}
+
+func (f *Fetcher) bundleRefused(id bundle.BundleID) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	until, ok := f.refusedBundles[id]
+	if ok && !f.cfg.Now().Before(until) {
+		delete(f.refusedBundles, id)
+		return false
+	}
+	return ok
 }
 
 func (f *Fetcher) fail(nw netid.NetworkID, p identity.NodeID, reason string, hostile bool) {
@@ -283,9 +343,23 @@ func (f *Fetcher) Offers(ctx context.Context, releaseHex string) ([]Offer, error
 			if err != nil {
 				return nil, err
 			}
+			var attNodes []string
 			for _, a := range atts {
 				if a.Healthy {
-					set[a.PublisherNodeID] = true
+					attNodes = append(attNodes, a.PublisherNodeID)
+				}
+			}
+			// An attestation counts only from a known verified peer: anyone
+			// can sign one.
+			if len(attNodes) > 0 {
+				kn, err := f.cfg.Peers.Known(ctx, nw, attNodes)
+				if err != nil {
+					return nil, err
+				}
+				for _, a := range attNodes {
+					if kn[a] {
+						set[a] = true
+					}
 				}
 			}
 			attesters[r.NetworkID] = set
@@ -326,17 +400,15 @@ func (f *Fetcher) Offers(ctx context.Context, releaseHex string) ([]Offer, error
 	return out, nil
 }
 
-// rangeOf returns the network range of a peer address: /24 for IPv4, /48 for
-// IPv6, the host itself for a name.
-func rangeOf(addr string) string {
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		host = addr
-	}
-	ip := net.ParseIP(host)
+// rangeOf returns the network range of the IP this node actually connected to
+// when it verified the peer: /24 for IPv4, /48 for IPv6, "" when none is
+// recorded (such a peer counts for nothing). The stored address string is never
+// used: a host name would let one server count as several ranges.
+func rangeOf(connectedIP string) string {
+	ip := net.ParseIP(strings.TrimSpace(connectedIP))
 	switch {
 	case ip == nil:
-		return "host:" + host
+		return ""
 	case ip.To4() != nil:
 		return ip.Mask(net.CIDRMask(24, 32)).String() + "/24"
 	}
@@ -362,7 +434,9 @@ func (f *Fetcher) corroborate(ctx context.Context, offers []Offer) error {
 		if ranges[o.BundleID] == nil {
 			ranges[o.BundleID] = map[string]struct{}{}
 		}
-		ranges[o.BundleID][rangeOf(peer.Address)] = struct{}{}
+		if r := rangeOf(peer.ConnectedIP); r != "" {
+			ranges[o.BundleID][r] = struct{}{}
+		}
 	}
 	for i := range offers {
 		offers[i].Corroborators = len(ranges[offers[i].BundleID])
@@ -401,6 +475,11 @@ func unhex(c byte) byte {
 // anything in the response. A publisher whose bytes fail verification is
 // backed off. Fetch never runs speculatively: only a local caller starts it.
 func (f *Fetcher) Fetch(ctx context.Context, releaseHex string) (*bundle.Bundle, FetchSource, error) {
+	return f.FetchWith(ctx, releaseHex, FetchOptions{})
+}
+
+// FetchWith is Fetch with the caller's requirements applied before dialing.
+func (f *Fetcher) FetchWith(ctx context.Context, releaseHex string, opts FetchOptions) (*bundle.Bundle, FetchSource, error) {
 	rid, err := contentid.ParseID(releaseHex)
 	if err != nil {
 		return nil, FetchSource{}, fmt.Errorf("bundlex: release id: %w", err)
@@ -410,12 +489,24 @@ func (f *Fetcher) Fetch(ctx context.Context, releaseHex string) (*bundle.Bundle,
 		return nil, FetchSource{}, err
 	}
 	var cands []Offer
+	backedOff := 0
 	for _, o := range offers {
-		if o.Fetchable && !f.backedOff(o.Network, o.Publisher) {
-			cands = append(cands, o)
+		if !o.Fetchable || !opts.permits(o) {
+			continue
 		}
+		if f.backedOff(o.Network, o.Publisher) || f.bundleRefused(o.BundleID) {
+			backedOff++
+			continue
+		}
+		if f.cfg.Failed != nil && f.cfg.Failed.IsFailedBundle(ctx, o.BundleID.String()) {
+			continue
+		}
+		cands = append(cands, o)
 	}
 	if len(cands) == 0 {
+		if backedOff > 0 {
+			return nil, FetchSource{}, ErrBackedOff
+		}
 		return nil, FetchSource{}, ErrNoOffers
 	}
 	select {
@@ -425,7 +516,7 @@ func (f *Fetcher) Fetch(ctx context.Context, releaseHex string) (*bundle.Bundle,
 		return nil, FetchSource{}, ErrFetchBusy
 	}
 	var errs []error
-	attempts := 0
+	attempts, pubLimited := 0, 0
 	for _, o := range cands {
 		if attempts >= f.lim.MaxAttempts || ctx.Err() != nil {
 			break
@@ -441,6 +532,10 @@ func (f *Fetcher) Fetch(ctx context.Context, releaseHex string) (*bundle.Bundle,
 			break
 		}
 		if !f.pub.take(strikeKey(o.Network, o.Publisher), 1, now) {
+			pubLimited++
+			f.mu.Lock()
+			f.refused++
+			f.mu.Unlock()
 			continue
 		}
 		attempts++
@@ -457,6 +552,9 @@ func (f *Fetcher) Fetch(ctx context.Context, releaseHex string) (*bundle.Bundle,
 		return nil, FetchSource{}, ctx.Err()
 	}
 	if len(errs) == 0 {
+		if pubLimited > 0 {
+			return nil, FetchSource{}, ErrRateLimited
+		}
 		return nil, FetchSource{}, ErrNoOffers
 	}
 	return nil, FetchSource{}, fmt.Errorf("%w: %w", ErrAllFailed, errors.Join(errs...))
@@ -497,6 +595,15 @@ func (f *Fetcher) attempt(ctx context.Context, o Offer, rid contentid.ID) (*bund
 		f.fail(o.Network, o.Publisher, reason, hostile)
 		return nil, &fetchError{reason}
 	}
+	if resp.StatusCode == http.StatusForbidden {
+		// The deliberately undecorated refusal (level lowered, release
+		// excluded, not a member) cannot be told apart by design: a plain
+		// refusal, never the publisher's fault. Only this bundle is skipped, and
+		// only briefly.
+		_ = resp.Body.Close()
+		f.refuseBundle(o.BundleID)
+		return nil, &fetchError{failRefused}
+	}
 	if err := f.cfg.Auth.VerifyResponse(ctx, o.Network, o.Publisher, resp.StatusCode, resp.Header); err != nil {
 		_ = resp.Body.Close()
 		f.fail(o.Network, o.Publisher, failMembership, false)
@@ -505,7 +612,7 @@ func (f *Fetcher) attempt(ctx context.Context, o Offer, rid contentid.ID) (*bund
 	if resp.StatusCode != http.StatusOK {
 		_ = resp.Body.Close()
 		reason := failStatus
-		if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests {
+		if resp.StatusCode == http.StatusTooManyRequests {
 			reason = failRefused
 		}
 		f.fail(o.Network, o.Publisher, reason, false)
@@ -520,7 +627,11 @@ func (f *Fetcher) attempt(ctx context.Context, o Offer, rid contentid.ID) (*bund
 		f.fail(o.Network, o.Publisher, reason, hostile)
 		return nil, &fetchError{reason}
 	}
-	b, err := bundle.Verify(wire, o.BundleID, rid)
+	b, err := bundle.VerifyContext(ctx, wire, o.BundleID, rid)
+	if err != nil && ctx.Err() != nil {
+		// Waiting for the verification slot ran out of time: nobody's fault.
+		return nil, &fetchError{failTransport}
+	}
 	if err != nil {
 		f.fail(o.Network, o.Publisher, failVerification, true)
 		return nil, &fetchError{failVerification}

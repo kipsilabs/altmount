@@ -1,7 +1,6 @@
 package bundle
 
 import (
-	"bytes"
 	"fmt"
 	"math"
 
@@ -612,7 +611,7 @@ func decodeRaw(raw []byte) (*Bundle, error) {
 					// Validate each file as soon as it is decoded so a
 					// hostile bundle fails before the next one is expanded.
 					if val == nil {
-						val = &validator{b: b, names: map[string]struct{}{}}
+						val = &validator{b: b, names: map[string]struct{}{}, tables: map[TableKey]int32{}}
 						err = val.checkPool()
 					}
 					if err == nil {
@@ -649,7 +648,7 @@ func Decode(raw []byte) (*Bundle, error) {
 	if err := Validate(b); err != nil {
 		return nil, err
 	}
-	if !bytes.Equal(encodeUnchecked(b), raw) {
+	if !matchesCanonical(b, raw) {
 		return nil, fmt.Errorf("%w: not the canonical encoding", ErrMalformed)
 	}
 	return b, nil

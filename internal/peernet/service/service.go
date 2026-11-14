@@ -46,6 +46,10 @@ type Deps struct {
 	// ever published. Exclusions is read on every publish, so config changes
 	// apply at once; nil means none. Backbones may be nil: no attestation is
 	// then published.
+	// BundleState is the bundle-import repository; its negative cache of failed
+	// Bundle IDs lets the fetcher skip a layout that failed local verification.
+	// Nil: no negative cache.
+	BundleState  *database.PeernetBundleImportRepository
 	PublishState *database.PeernetPublishStateRepository
 	Origins      *database.PeernetOriginRepository
 	Exclusions   func() publish.Exclusions

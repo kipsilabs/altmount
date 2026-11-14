@@ -138,6 +138,9 @@ func FuzzValidate(f *testing.F) {
 	f.Add([]byte{}, uint8(3), int64(-1))
 	f.Add([]byte{}, uint8(36), int64(1<<62))
 	f.Add([]byte{}, uint8(70), int64(576))
+	// The good bundles are built (and their ids hashed) once; every exec
+	// mutates a cheap deep copy, so the fuzzer spends its time on Validate.
+	bases := []*Bundle{goodBundle(f), goodNZBBundle(f)}
 	f.Fuzz(func(t *testing.T, data []byte, sel uint8, v int64) {
 		check := func(b *Bundle) {
 			if err := Validate(b); err != nil {
@@ -158,8 +161,8 @@ func FuzzValidate(f *testing.F) {
 		if b, err := decodeRaw(data); err == nil {
 			check(b)
 		}
-		for _, mk := range []func() *Bundle{func() *Bundle { return goodBundle(t) }, func() *Bundle { return goodNZBBundle(t) }} {
-			b := mk()
+		for _, base := range bases {
+			b := clone(base)
 			mutateBundle(b, sel, v)
 			check(b)
 		}

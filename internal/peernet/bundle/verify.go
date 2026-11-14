@@ -1,19 +1,11 @@
 package bundle
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/kipsilabs/altmount/internal/peernet/contentid"
 )
-
-// Options lets the caller replace the files-scheme Release ID function, so
-// this package does not depend on the one in contentid until it exists.
-type Options struct {
-	// FilesReleaseID computes the Release ID of the files scheme from the File
-	// IDs, which are passed sorted ascending bytewise. Nil selects
-	// FilesReleaseID.
-	FilesReleaseID func(sortedFileIDs []contentid.ID) contentid.ID
-}
 
 // FilesReleaseID is the files-scheme Release ID, as defined by
 // contentid.ReleaseIDFromFiles: SHA-256 over the "altmount-peernet/release-files/v1"
@@ -48,20 +40,38 @@ func Pack(b *Bundle) (wire []byte, id BundleID, err error) {
 // segments; the Release ID recomputed for the declared scheme equals both the
 // bundle's own and the announced one. It does not touch the network.
 func Verify(wire []byte, announcedBundle BundleID, announcedRelease contentid.ID) (*Bundle, error) {
-	return VerifyWith(wire, announcedBundle, announcedRelease, Options{})
+	return VerifyContext(context.Background(), wire, announcedBundle, announcedRelease)
 }
 
-// VerifyWith is Verify with options.
-func VerifyWith(wire []byte, announcedBundle BundleID, announcedRelease contentid.ID, o Options) (*Bundle, error) {
+// verifySlot admits one verification at a time, node-wide: decoding a large
+// bundle peaks at several times its canonical size, so concurrent fetches, fast
+// paths and playback requests must queue.
+var verifySlot = make(chan struct{}, 1)
+
+// verifyEnterHook is a test seam; it returns the function to call on leaving.
+var verifyEnterHook func() func()
+
+// VerifyContext is Verify that waits for the node-wide verification slot and
+// gives up when ctx ends first.
+func VerifyContext(ctx context.Context, wire []byte, announcedBundle BundleID, announcedRelease contentid.ID) (*Bundle, error) {
+	select {
+	case verifySlot <- struct{}{}:
+		defer func() { <-verifySlot }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	if verifyEnterHook != nil {
+		defer verifyEnterHook()()
+	}
 	raw, err := Decompress(wire)
 	if err != nil {
 		return nil, err
 	}
-	return VerifyCanonical(raw, announcedBundle, announcedRelease, o)
+	return VerifyCanonical(raw, announcedBundle, announcedRelease)
 }
 
 // VerifyCanonical is Verify for bytes that are already decompressed.
-func VerifyCanonical(canonical []byte, announcedBundle BundleID, announcedRelease contentid.ID, o Options) (*Bundle, error) {
+func VerifyCanonical(canonical []byte, announcedBundle BundleID, announcedRelease contentid.ID) (*Bundle, error) {
 	if len(canonical) > MaxDecompressedSize {
 		return nil, fmt.Errorf("%w: %d bytes uncompressed", ErrTooLarge, len(canonical))
 	}
@@ -91,11 +101,7 @@ func VerifyCanonical(canonical []byte, announcedBundle BundleID, announcedReleas
 			return nil, fmt.Errorf("%w: %v", ErrReleaseIDMismatch, err)
 		}
 	default:
-		fn := o.FilesReleaseID
-		if fn == nil {
-			fn = FilesReleaseID
-		}
-		got = fn(ids)
+		got = FilesReleaseID(ids)
 	}
 	if got != b.ReleaseID || got != announcedRelease {
 		return nil, ErrReleaseIDMismatch

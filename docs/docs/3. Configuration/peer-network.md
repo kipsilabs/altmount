@@ -181,7 +181,13 @@ Before anything is written the layout is also checked against the articles thems
 - **Folder name.** The release folder comes from the title with the media extension removed first; names that are empty, hidden (start with a dot), reserved by AltMount or equal to a category folder are refused, so a title can never point outside the category folder.
 - **Offers.** Of several offers, the bundle announced identically by publishers in the most distinct network ranges is preferred; a publisher's own attestation never raises the rank of its own offer.
 
-What this proves: the articles exist on your providers, sampled articles match the layout, and the media container is structurally sound. It does not prove the whole file is the titled content; that is the same risk as a mislabelled NZB from an indexer. It does not prove the whole file is the titled content; that is the same risk as a mislabelled NZB from an indexer.
+- **Plain layouts only from the open network.** A bundle offered through the open network is accepted only when every file is exactly one plain run of articles: archive volumes (nested layouts), encryption keys and multi-clip files are refused with `layout_not_allowed_open`, and media whose container has no structural check (anything but Matroska/WebM, MP4/MOV and MPEG-TS/M2TS) with `container_not_verifiable`. This is a stated limitation, not a bug: those layouts cannot be bound to the articles without reading archive headers, which is planned. Private networks still accept them.
+- **Sampling.** Every run of articles is sampled: its first and last article and at least one random one in between (one per 500 for a media file, at least three) have their yEnc headers (part size, offset, total) compared with the layout, up to 600 articles and 512 MiB; a release with more archive volumes than that is refused (`too_many_tables`). A single movie file reads about 5 articles (4 MB), a 50-volume release 150 (115 MB), a 200-volume release 600 (461 MB). With your NZB at hand the first article's yEnc file name must also match the NZB entry it belongs to. The forced full check reads a further random sample of headers (1 percent of the articles, 20 to 500) and fails the import on a contradiction. It samples; it does not prove.
+- **Media structure.** Besides the end of the file, the container is read at random positions inside the file (Matroska: three random 1 MiB windows must contain cluster data; MPEG-TS: eight random packet positions must be in sync; fragmented MP4 must end in a real `moof`+`mdat` pair or `mfra`). What remains unprovable: bytes inside MP4 `mdat`, inside a Matroska frame or between sampled positions.
+- **Degraded means failed.** A peer release whose full check finds the media playable but with missing segments is failed and removed, never announced. When you supplied the NZB the queue item is not marked failed: it is imported normally from your NZB, once, so you get what a normal import would have produced. A release imported directly (Stremio peer play) is failed. A missing article alone does not count against the publisher (it can be propagation just after posting); only a contradiction between the layout and the articles' own headers does, and that layout is then ignored whoever offers it, for 7 days.
+- **Corroboration** counts distinct /24 (IPv4) or /48 (IPv6) ranges of the address this node actually connected to when it last verified the publisher, never host names; with the open-network switch off, open-network publishers are not even contacted.
+
+What this proves: the articles exist on your providers, sampled articles match the layout, and the media container is structurally sound at the places it was read. It does not prove that the content between the sampled points is the titled media; that is the same class of risk as a mislabelled NZB from an indexer.
 
 ### Stremio peer candidates
 
@@ -191,7 +197,7 @@ Playing one asks your node (not the player) to fetch the bundle, verify it as de
 
 ### Limits
 
-- Bundles: 8 MB compressed, 64 MB decompressed, 500,000 segments and 10,000 files at most; a receiving node also refuses releases over 2 TiB or 2,000 files.
+- Bundles: 8 MB compressed, 16 MB decompressed (about 340,000 segments of a typical release, roughly 250 GB), 500,000 segments and 10,000 files at most; a receiving node also refuses releases over 2 TiB or 2,000 files.
 - Fetching: on demand only, never speculative; at most 3 attempts of 60 seconds per request, 60 attempts per hour overall, 12 per publisher, 2 downloads at once.
 - The health check must be enabled to receive bundles, because the full check must be able to run.
 - A bundle is for the exact release: two NZBs of the same movie with different article sets are different releases.

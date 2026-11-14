@@ -37,6 +37,9 @@ func (i *Importer) Reconcile(ctx context.Context) {
 }
 
 func (i *Importer) rollbackUncommitted(ctx context.Context) {
+	// Every uncommitted row is rolled back, so no write may be in flight.
+	i.writeMu.Lock()
+	defer i.writeMu.Unlock()
 	rows, err := i.cfg.State.ListUncommitted(ctx, 5000)
 	if err != nil {
 		slog.WarnContext(ctx, "could not list unfinished peer imports", "error", err)

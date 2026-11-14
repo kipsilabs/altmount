@@ -6,6 +6,7 @@ import (
 
 	"github.com/kipsilabs/altmount/internal/api"
 	"github.com/kipsilabs/altmount/internal/peernet/bundleimport"
+	"github.com/kipsilabs/altmount/internal/peernet/bundlex"
 	"github.com/kipsilabs/altmount/internal/peernet/service"
 )
 
@@ -67,6 +68,12 @@ func (p stremioPeerPlayback) Play(ctx context.Context, req api.PeerPlayRequest) 
 		DirFunc: func(title string) string { return p.dirs.PeerImportDir(req.Category, title) },
 	})
 	if err != nil {
+		switch {
+		case errors.Is(err, bundlex.ErrRateLimited):
+			return api.PeerPlayResult{}, &api.PeerRetryError{After: 60, Err: err}
+		case errors.Is(err, bundlex.ErrBackedOff):
+			return api.PeerPlayResult{}, &api.PeerRetryError{After: 300, Err: err}
+		}
 		return api.PeerPlayResult{}, err
 	}
 	return api.PeerPlayResult{Paths: res.Paths, Sizes: res.Sizes}, nil

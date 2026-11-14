@@ -123,7 +123,7 @@ func mkvFile(size int) []byte {
 	// A Cluster whose 8-byte size covers the filler.
 	fill := size - len(out) - 12 - 9
 	out = append(out, 0x1F, 0x43, 0xB6, 0x75, 0x01, 0, byte(fill>>40), byte(fill>>32), byte(fill>>24), byte(fill>>16), byte(fill>>8), byte(fill))
-	out = append(out, make([]byte, fill)...)
+	out = append(out, simpleBlocks(fill)...) // a real Cluster body
 	return append(out, append(append([]byte{}, cues...), 0x84, 0, 0, 0, 0)...)
 }
 
@@ -227,6 +227,16 @@ func TestBundleImportEndToEnd_FullCheckFailureBacksThePublisherOffForFetches(t *
 		t.Fatal(err)
 	}
 	path := res.Paths[0]
+	// Only a contradiction between the layout and an article's own header is
+	// the publisher's doing (missing articles can be propagation): find one in
+	// the sampled headers, as the forced full check does.
+	id := "seg-005@news.test"
+	beh := r.pool.BehaviorFor(id)
+	beh.YEnc.PartBegin += 3
+	r.pool.SetBehavior(id, beh)
+	if err := r.imp.VerifyPeerHeaders(ctx, path); err == nil {
+		t.Fatal("the header sample must contradict the layout")
+	}
 	r.imp.FullCheckFailed(ctx, path)
 	r.imp.FullCheckFailed(ctx, path) // reported once per release
 
@@ -276,4 +286,23 @@ func TestBundleImportEndToEnd_ArticlesMissingOnTheReceiversProvidersRejectsAndLe
 	if len(r.rec.recs) != 0 || r.ann.count() != 0 {
 		t.Fatal("a rejected import must not be recorded or announced")
 	}
+}
+
+// simpleBlocks returns exactly n bytes (n >= 7) of consecutive Matroska
+// SimpleBlock elements, what the body of a real Cluster looks like.
+func simpleBlocks(n int) []byte {
+	out := make([]byte, 0, n)
+	for k := 0; len(out) < n; k++ {
+		remaining := n - len(out)
+		want := min(remaining, 90+(k*37)%300)
+		if remaining-want < 7 {
+			want = remaining
+		}
+		body := want - 3
+		out = append(out, 0xA3, 0x40|byte(body>>8), byte(body), 0x81, byte(k>>8), byte(k), 0x80)
+		for j := 0; j < body-4; j++ {
+			out = append(out, byte(1+(len(out)*7+k)%250))
+		}
+	}
+	return out
 }

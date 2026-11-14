@@ -44,7 +44,7 @@ func TestValidateRejects(t *testing.T) {
 			s := &fileNamed(t, b, "movie.mkv").Segments[0]
 			s.Size, s.End = math.MaxInt64, math.MaxInt64-1
 		}, ErrImplausible},
-		{"one byte gap inside the extents", false, func(b *Bundle) { fileNamed(t, b, "movie.mkv").Segments[1].Start = 1 }, ErrSizeMismatch},
+		{"one byte gap inside the extents", false, func(b *Bundle) { fileNamed(t, b, "movie.mkv").Segments[1].Start = 1 }, ErrPartialRange},
 		{"declared size far beyond the segments", false, func(b *Bundle) {
 			f := fileNamed(t, b, "movie.mkv")
 			b.TotalSize += (1 << 40) - f.Size

@@ -38,8 +38,13 @@ const (
 	// peer requests, node-wide.
 	serveBuildsPerHour = 360
 	serveBuildBurst    = 3
-	negativeTTL        = time.Minute
-	maxNegative        = 256
+	// serveBuildsPerRequesterPerHour is what one requester (a node ID, or a
+	// public address) may use of that: a sixth. Its burst is one, so no
+	// requester can spend more than a third of the node-wide burst.
+	serveBuildsPerRequesterPerHour = serveBuildsPerHour / 6
+	serveBuildRequesterBurst       = 1
+	negativeTTL                    = time.Minute
+	maxNegative                    = 256
 )
 
 // NotShareableError says a release cannot be shared as a bundle, for a
@@ -79,6 +84,8 @@ type Builder struct {
 	// own publishing builds, and bound them node-wide whoever asks.
 	serveSlot chan struct{}
 	rate      *buckets
+	byNode    *buckets // per requesting node ID
+	byIP      *buckets // per public requesting address
 	neg       map[string]negEntry
 
 	mu       sync.Mutex
@@ -110,7 +117,9 @@ func NewBuilder(cfg BuilderConfig) *Builder {
 		cfg.BuildWait = defaultBuildWait
 	}
 	return &Builder{cfg: cfg, slot: make(chan struct{}, 1), serveSlot: make(chan struct{}, 1),
-		rate: newBuckets(serveBuildsPerHour, serveBuildBurst, 1), neg: map[string]negEntry{}, cache: map[string]cacheEntry{},
+		rate:   newBuckets(serveBuildsPerHour, serveBuildBurst, 1),
+		byNode: newBuckets(serveBuildsPerRequesterPerHour, serveBuildRequesterBurst, maxRequesters),
+		byIP:   newBuckets(serveBuildsPerRequesterPerHour, serveBuildRequesterBurst, maxRequesters), neg: map[string]negEntry{}, cache: map[string]cacheEntry{},
 		byBundle: map[bundle.BundleID]string{}, notShare: map[string]int64{}}
 }
 
@@ -243,19 +252,69 @@ func (b *Builder) buildAndStore(ctx context.Context, releaseHex, title string, p
 	return built, err
 }
 
+// Requester identifies who asked for a build, so the node-wide build budget can
+// be shared between requesters.
+type Requester struct {
+	// Node is the authenticated node ID, IP the remote address (may be empty).
+	Node, IP string
+}
+
+type requesterKey struct{}
+
+// WithRequester attaches the requester to ctx for BuildForServe.
+func WithRequester(ctx context.Context, node, ip string) context.Context {
+	return context.WithValue(ctx, requesterKey{}, Requester{Node: node, IP: ip})
+}
+
+// maxRequesters bounds the per-requester accounting tables.
+const maxRequesters = 4096
+
+// spendServeBudget takes one build from the requester's node and address
+// shares and from the node-wide budget, all or nothing. It is called only once
+// the build slot is held and the build is about to start: a request that found
+// the slot taken, timed out, was cancelled or hit the cache costs nothing.
+func (b *Builder) spendServeBudget(ctx context.Context) bool {
+	now := b.cfg.Now()
+	req, _ := ctx.Value(requesterKey{}).(Requester)
+	type taken struct {
+		bk  *buckets
+		key string
+	}
+	var got []taken
+	take := func(bk *buckets, key string) bool {
+		if !bk.take(key, 1, now) {
+			return false
+		}
+		got = append(got, taken{bk, key})
+		return true
+	}
+	ok := true
+	if req.Node != "" {
+		ok = take(b.byNode, req.Node)
+	}
+	if ok && req.IP != "" && !sharedIP(req.IP) { // a LAN address is shared by honest nodes
+		ok = take(b.byIP, req.IP)
+	}
+	ok = ok && take(b.rate, "all")
+	if !ok {
+		for _, g := range got {
+			g.bk.give(g.key, 1)
+		}
+	}
+	return ok
+}
+
 // BuildForServe is Build for a request from a peer: it has its own build slot
 // (so a stream of peer requests can never starve this node's own publishing
-// builds), a node-wide build rate independent of who asks, and remembers an
-// unbuildable release for a short while.
+// builds), a node-wide build rate that no single requester (node ID or public
+// address) can use more than a sixth of, and remembers an unbuildable release
+// for a short while. The budget is spent only when a build actually starts.
 func (b *Builder) BuildForServe(ctx context.Context, releaseHex, title string, posted time.Time) (*Built, error) {
 	if c, ok := b.cached(releaseHex); ok {
 		return c, nil
 	}
 	if err := b.negative(releaseHex); err != nil {
 		return nil, err
-	}
-	if !b.rate.take("all", 1, b.cfg.Now()) {
-		return nil, ErrBusy
 	}
 	t := time.NewTimer(b.cfg.BuildWait)
 	defer t.Stop()
@@ -269,6 +328,12 @@ func (b *Builder) BuildForServe(ctx context.Context, releaseHex, title string, p
 	defer func() { <-b.serveSlot }()
 	if c, ok := b.cached(releaseHex); ok {
 		return c, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if !b.spendServeBudget(ctx) {
+		return nil, ErrBusy
 	}
 	built, err := b.buildAndStore(ctx, releaseHex, title, posted)
 	var ns *NotShareableError

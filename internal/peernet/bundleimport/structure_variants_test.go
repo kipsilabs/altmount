@@ -22,7 +22,7 @@ func structureOf(t *testing.T, data []byte, name string) error {
 	t.Helper()
 	fs := afero.NewMemMapFs()
 	require.NoError(t, afero.WriteFile(fs, name, data, 0o644))
-	return verifyStructure(context.Background(), memOpener{fs}, name, int64(len(data)))
+	return verifyStructure(context.Background(), memOpener{fs}, name, int64(len(data)), false)
 }
 
 func requireAccepted(t *testing.T, data []byte, name string) {
@@ -64,7 +64,7 @@ func mkvNoSeekHead(size int, live bool) []byte {
 	out[len(out)-3] = byte(fill >> 16)
 	out[len(out)-2] = byte(fill >> 8)
 	out = append(out, byte(fill))
-	out = append(out, bytes.Repeat([]byte{0x5A}, size-len(out))...)
+	out = append(out, simpleBlocks(size-len(out))...)
 	return out
 }
 
@@ -137,7 +137,8 @@ func mp4Fragmented(pairs int, lastMdat int, mfra bool) []byte {
 		out = append(out, mp4Box("mdat", n)...)
 	}
 	if mfra {
-		out = append(out, mp4Box("mfra", 24)...)
+		// A real mfra: its only child is the mfro, which states the mfra's size.
+		out = append(out, box("mfra", box("mfro", []byte{0, 0, 0, 0, 0, 0, 0, 24}))...)
 	}
 	return out
 }

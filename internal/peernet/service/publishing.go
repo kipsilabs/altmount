@@ -302,6 +302,10 @@ type pipeline struct {
 
 	backMu  sync.Mutex
 	backoff map[string]backoffEntry // network|release
+
+	levelMu     sync.Mutex
+	seenLevels  map[string]int // network -> level at the last upkeep pass
+	catchUpMore atomic.Bool    // a catch-up pass left releases for the next one
 }
 
 func newPipeline(cfg pipelineConfig) (*pipeline, error) {
@@ -739,6 +743,12 @@ func (n *node) maintainPublishing(ctx context.Context, orphans bool) {
 	}
 	n.pipe.reannounce(ctx, reannounceBatch)
 	n.pipe.reannounceLevelChanges(ctx, reannounceBatch)
+	// The catch-up scan of the content index runs when a network's level rose
+	// to publishing, while an earlier pass found more than one batch, and on the
+	// orphan cadence (not on the very first pass after start); never on every pass.
+	if n.pipe.levelsRose() || (orphans && n.maintRuns.Load() > 0) || n.pipe.catchUpMore.Swap(false) {
+		n.pipe.catchUp(ctx, reannounceBatch)
+	}
 }
 
 // retractExcluded deletes this node's own records and publish state of
@@ -803,6 +813,72 @@ func (p *pipeline) reannounceLevelChanges(ctx context.Context, limit int) {
 				p.clearFailure(nw.ID, r.ReleaseID)
 			} else {
 				p.noteFailure(nw.ID, r.ReleaseID, now)
+			}
+		}
+	}
+}
+
+// levelsRose records the publishing networks' levels and reports whether any
+// network started publishing (level 2 or higher) or rose since the last call.
+func (p *pipeline) levelsRose() bool {
+	p.levelMu.Lock()
+	defer p.levelMu.Unlock()
+	seen := p.seenLevels
+	p.seenLevels = map[string]int{}
+	rose := false
+	for _, nw := range p.cfg.Networks() {
+		k := nw.ID.String()
+		p.seenLevels[k] = nw.Level
+		if old, ok := seen[k]; !ok || nw.Level > old {
+			rose = true
+		}
+	}
+	return rose && seen != nil // the first pass after start is not a level change
+}
+
+// catchUp publishes, up to limit releases per network, the release records of
+// indexed releases that were never published on a network that publishes now:
+// files that became healthy while the network was below level 2 were skipped
+// (not_publishing) and would otherwise wait for their next health check. Each
+// release goes through the re-announce guard (every indexed file locally
+// healthy, a peer import verified, exclusions applied). Attestations are never
+// touched: they come only from a new real check. A release that cannot be
+// published backs off like any re-announce, so it does not take later slots.
+func (p *pipeline) catchUp(ctx context.Context, limit int) {
+	now := p.cfg.Now()
+	for _, nw := range p.cfg.Networks() {
+		if ctx.Err() != nil {
+			return
+		}
+		ids, err := p.cfg.State.ListUnpublishedReleases(ctx, nw.ID.String(), min(limit+p.backoffCount(now), reannounceScanMax))
+		if err != nil {
+			p.cfg.Log(ctx, "publish: list releases to catch up", err)
+			return
+		}
+		p.cfg.Log(ctx, "publish: list releases to catch up", nil)
+		done := 0
+		for _, id := range ids {
+			if ctx.Err() != nil {
+				return
+			}
+			rel, err := contentid.ParseID(id)
+			if err != nil || p.backedOff(nw.ID, id, now) {
+				continue
+			}
+			if done >= limit {
+				p.catchUpMore.Store(true)
+				break
+			}
+			done++
+			t := publish.Tracked{Network: nw.ID, Kind: records.KindRelease, ReleaseID: records.ReleaseID(rel)}
+			if p.reannounceOne(ctx, t, id) {
+				p.clearFailure(nw.ID, id)
+				// A first publication, not a refresh: keep the re-announce counter honest.
+				p.stats.mu.Lock()
+				p.stats.reannounced--
+				p.stats.mu.Unlock()
+			} else {
+				p.noteFailure(nw.ID, id, now)
 			}
 		}
 	}

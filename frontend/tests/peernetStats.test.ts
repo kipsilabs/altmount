@@ -138,6 +138,9 @@ const BACKEND_IMPORT_REJECT_KEYS = [
 	"size_implausible",
 	"yenc_mismatch",
 	"structure_invalid",
+	"layout_not_allowed_open",
+	"container_not_verifiable",
+	"too_many_tables",
 ];
 
 describe("bundle reason coverage", () => {
@@ -167,6 +170,10 @@ describe("bundle block visibility", () => {
 		expect(showBundlesBlock([{ level: 1 }])).toBe(true);
 		expect(showBundleServing([{ level: 2 }])).toBe(false);
 		expect(showBundleServing([{ level: 1 }, { level: 3 }])).toBe(true);
+		// Serving numbers the API reports are never hidden by the level check.
+		expect(showBundleServing([{ level: 1 }], { announced: 8 })).toBe(true);
+		expect(showBundleServing([{ level: 2 }], { serve_refused: { busy: 2 } })).toBe(true);
+		expect(showBundleServing([{ level: 2 }], { announced: 0, fetched: 4 })).toBe(false);
 	});
 	test("activity detection ignores junk", () => {
 		expect(bundleHasActivity(undefined)).toBe(false);

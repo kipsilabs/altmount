@@ -80,6 +80,15 @@ func (proc *Processor) SetPeerBundleFastPath(h PeerBundleFastPath) {
 	proc.peerFastPath.Store(&peerFastPathHolder{h: h})
 }
 
+// SkipPeerFastPathOnce makes the next import of the queue item skip the peer
+// fast path (a degraded peer import is being redone from its NZB).
+func (proc *Processor) SkipPeerFastPathOnce(queueID int) {
+	proc.peerSkipOnce.Store(queueID, struct{}{})
+}
+
+// ClearSkipPeerFastPath undoes SkipPeerFastPathOnce.
+func (proc *Processor) ClearSkipPeerFastPath(queueID int) { proc.peerSkipOnce.Delete(queueID) }
+
 func (proc *Processor) setPeerItem(queueID int, info peerItemInfo) {
 	proc.peerItems.Store(queueID, info)
 }
@@ -101,6 +110,9 @@ func (proc *Processor) tryPeerBundle(ctx context.Context, n *nzbparser.Nzb, file
 			result, written, taken = "", nil, false
 		}
 	}()
+	if _, skip := proc.peerSkipOnce.LoadAndDelete(queueID); skip {
+		return "", nil, false, nil
+	}
 	// The common case: no peer offers anything. Nothing is hashed or built.
 	if !holder.h.MayHaveOffers(ctx) {
 		return "", nil, false, nil
@@ -132,6 +144,13 @@ func (proc *Processor) tryPeerBundle(ctx context.Context, n *nzbparser.Nzb, file
 	}
 	proc.updateProgress(queueID, 100)
 	return out.ResultPath, out.WrittenPaths, true, nil
+}
+
+// prebuiltStillDescribes says whether the store built for the peer lookup can
+// be reused by the import's parse: only when the NZB was neither given gap
+// placeholders nor had dead past-the-end articles trimmed meanwhile.
+func prebuiltStillDescribes(p *prebuiltStore, gaps int, trimmed bool) bool {
+	return p != nil && gaps == 0 && !trimmed
 }
 
 // prebuiltStore is the NZB store (and message-id index) built for the peer

@@ -120,6 +120,46 @@ func TestPeerHold_FailedIsFailedInHistoryWithMessage(t *testing.T) {
 	})
 }
 
+func TestPeerHold_RequeueTurnsAHeldItemIntoAPendingOneWithoutHistory(t *testing.T) {
+	forEachBundleImportBackend(t, func(t *testing.T, r *PeernetBundleImportRepository) {
+		ctx := context.Background()
+		f := newHoldFixture(t, r, "requeue", false)
+		changed, err := r.RequeueHeldQueueItem(ctx, f.id)
+		require.NoError(t, err)
+		assert.False(t, changed, "only a held item can be requeued")
+
+		require.NoError(t, r.SetQueueHold(ctx, f.id, true))
+		changed, err = r.RequeueHeldQueueItem(ctx, f.id)
+		require.NoError(t, err)
+		require.True(t, changed)
+		got, err := f.repo.GetQueueItem(ctx, f.id)
+		require.NoError(t, err)
+		assert.Equal(t, QueueStatusPending, got.Status)
+		assert.False(t, got.PeerHold)
+		assert.NotContains(t, f.historyStatuses(t), f.id, "the provisional history is gone")
+	})
+}
+
+func TestPeerHold_SettledHoldsAreOnlyFinishedImportsOwingNoARR(t *testing.T) {
+	forEachBundleImportBackend(t, func(t *testing.T, r *PeernetBundleImportRepository) {
+		ctx := context.Background()
+		f := newHoldFixture(t, r, "settled", false)
+		require.NoError(t, r.SetQueueHold(ctx, f.id, true))
+		row := bundleRow("m/a.mkv", f.id)
+		row.ArrOwed = false
+		require.NoError(t, r.Upsert(ctx, []PeernetBundleImport{row}))
+		ids, err := r.SettledHolds(ctx)
+		require.NoError(t, err)
+		assert.Empty(t, ids, "a pending, uncommitted row is not settled")
+		_, err = r.MarkPassed(ctx, "m/a.mkv")
+		require.NoError(t, err)
+		require.NoError(t, r.CommitRows(ctx, []string{"m/a.mkv"}))
+		ids, err = r.SettledHolds(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, []int64{f.id}, ids)
+	})
+}
+
 func TestPeerHold_UserSkipStaysHidden(t *testing.T) {
 	forEachBundleImportBackend(t, func(t *testing.T, r *PeernetBundleImportRepository) {
 		ctx := context.Background()

@@ -70,6 +70,31 @@ func (s *peernetBundleSeams) FetchBundle(ctx context.Context, releaseID string) 
 	return f.FetchBundle(ctx, releaseID)
 }
 
+// FetchBundleWith forwards the caller's requirements to the connected fetcher
+// when it can apply them before dialing; otherwise it fetches unfiltered.
+func (s *peernetBundleSeams) FetchBundleWith(ctx context.Context, releaseID string, o bundleimport.FetchOptions) (*bundle.Bundle, bundleimport.Origin, error) {
+	s.mu.RLock()
+	f := s.fetcher
+	s.mu.RUnlock()
+	if f == nil {
+		return nil, bundleimport.Origin{}, errNoBundleFetcher
+	}
+	if of, ok := f.(bundleimport.OptionFetcher); ok {
+		return of.FetchBundleWith(ctx, releaseID, o)
+	}
+	return f.FetchBundle(ctx, releaseID)
+}
+
+// ReportFailedBundle forwards a failed layout to the connected reporter.
+func (s *peernetBundleSeams) ReportFailedBundle(ctx context.Context, bundleID, releaseID string) {
+	s.mu.RLock()
+	r := s.reporter
+	s.mu.RUnlock()
+	if fr, ok := r.(bundleimport.BundleFailedReporter); ok {
+		fr.ReportFailedBundle(ctx, bundleID, releaseID)
+	}
+}
+
 // ReportBadBundle forwards to the connected reporter; with none it logs.
 func (s *peernetBundleSeams) ReportBadBundle(ctx context.Context, o bundleimport.Origin, releaseID string) {
 	s.mu.RLock()
@@ -266,21 +291,34 @@ func newPeernetBundleHost(d bundleWiringDeps, seams *peernetBundleSeams) *peerne
 			return err != nil || n > 0
 		},
 		build: func() *bundleimport.Importer {
-			return bundleimport.New(bundleimport.Config{
-				Library:           d.Metadata,
-				Stager:            bundleimport.NewFSStager(bundleimport.FSStagerDeps{Pool: d.Pool, Config: d.GetConfig, Cache: d.Cache, Root: stagingRoot}),
-				Prober:            bridge.NewReleaseProber(d.Importer),
-				State:             state,
-				Index:             database.NewPeernetContentRepository(conn, dialect),
-				Fetcher:           seams,
-				Recorder:          bridge.NewRecorder(d.Importer),
-				Announcer:         bridge.NewAnnouncer(d.Importer),
-				Reporter:          seams,
-				HealthEnabled:     func() bool { return d.GetConfig().GetHealthEnabled() },
-				WillBeChecked:     func(p string) bool { return postprocessor.WillScheduleHealth(d.GetConfig(), p) },
-				AllowedExtensions: func() []string { return d.GetConfig().Import.AllowedFileExtensions },
-			})
+			cfg := bundleImporterConfig(d, state, stagingRoot, seams)
+			if missing := cfg.Missing(); len(missing) > 0 {
+				// A programming error: the accept pipeline would reject every
+				// bundle at runtime. Say so loudly instead of failing quietly.
+				slog.Error("Peer bundle import is wired without required collaborators", "missing", missing)
+			}
+			return bundleimport.New(cfg)
 		},
+	}
+}
+
+// bundleImporterConfig is the production configuration of the bundle importer.
+func bundleImporterConfig(d bundleWiringDeps, state *database.PeernetBundleImportRepository, stagingRoot string, seams *peernetBundleSeams) bundleimport.Config {
+	conn, dialect := d.DB.Connection(), d.DB.Dialect()
+	return bundleimport.Config{
+		Library:           d.Metadata,
+		Stager:            bundleimport.NewFSStager(bundleimport.FSStagerDeps{Pool: d.Pool, Config: d.GetConfig, Cache: d.Cache, Root: stagingRoot}),
+		Prober:            bridge.NewReleaseProber(d.Importer),
+		State:             state,
+		Index:             database.NewPeernetContentRepository(conn, dialect),
+		Fetcher:           seams,
+		Headers:           bundleimport.NewPoolHeaderReader(d.Pool),
+		Recorder:          bridge.NewRecorder(d.Importer),
+		Announcer:         bridge.NewAnnouncer(d.Importer),
+		Reporter:          seams,
+		HealthEnabled:     func() bool { return d.GetConfig().GetHealthEnabled() },
+		WillBeChecked:     func(p string) bool { return postprocessor.WillScheduleHealth(d.GetConfig(), p) },
+		AllowedExtensions: func() []string { return d.GetConfig().Import.AllowedFileExtensions },
 	}
 }
 

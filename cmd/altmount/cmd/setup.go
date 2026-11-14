@@ -505,6 +505,8 @@ func peernetDeps(
 		// Record exchange: stored records and the per-peer sync positions.
 		Records: database.NewPeernetRecordRepository(conn, d),
 		Cursors: database.NewPeernetSyncCursorRepository(conn, d),
+		// Negative cache of Bundle IDs that failed local verification.
+		BundleState: database.NewPeernetBundleImportRepository(conn, d),
 		// Publishing of this node's own healthy releases (levels 2 and 3).
 		PublishState: database.NewPeernetPublishStateRepository(conn, d),
 		Origins:      database.NewPeernetOriginRepository(conn, d),

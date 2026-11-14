@@ -174,3 +174,22 @@ func (r *PeernetSyncCursorRepository) DeleteOrphans(ctx context.Context) (int64,
 	}
 	return rowsAffected(res, "delete orphan peernet cursors")
 }
+
+// LastPullAt returns when a cursor of the network that had pulled records was
+// last updated (zero: none). It lets the status show the last pull after a
+// restart; a push updates the same row, so it is the last sync activity of a
+// peer we pulled from.
+func (r *PeernetSyncCursorRepository) LastPullAt(ctx context.Context, networkID string) (time.Time, error) {
+	if !isLowerHexID(networkID) {
+		return time.Time{}, errors.New("peernet cursors: invalid network id")
+	}
+	var at sql.NullInt64
+	err := r.db.QueryRowContext(ctx, `SELECT MAX(updated_at) FROM peernet_sync_cursors WHERE network_id = ? AND pulled_seq > 0`, networkID).Scan(&at)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("peernet cursors: last pull: %w", err)
+	}
+	if !at.Valid {
+		return time.Time{}, nil
+	}
+	return timeOrZero(at.Int64), nil
+}

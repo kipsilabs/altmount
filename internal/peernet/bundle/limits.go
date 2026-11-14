@@ -3,7 +3,7 @@ package bundle
 import "errors"
 
 // Limits. Several are design calls the owner may tune; the hard caps named in
-// the design (8 MB compressed, 64 MB decompressed, 500k segments, 10k files)
+// the design (8 MB compressed, 16 MB decompressed, 500k segments, 10k files)
 // are enforced while streaming and again on the decoded structure.
 const (
 	// SchemaVersion is the only major version this package reads and writes.
@@ -13,7 +13,7 @@ const (
 	MaxCompressedSize = 8 << 20
 	// MaxDecompressedSize bounds the canonical (uncompressed) bytes. The
 	// decompressor stops as soon as the output would exceed it.
-	MaxDecompressedSize = 64 << 20
+	MaxDecompressedSize = 16 << 20
 	// MaxWindowSize is the largest zstd window a frame may ask for. The
 	// builder uses the same value, so honest bundles always fit.
 	MaxWindowSize = 8 << 20
@@ -58,6 +58,11 @@ const (
 	// MaxSegmentSize is the largest decoded size of one article: real posts
 	// are 0.25-1 MB, a few go to a few MB.
 	MaxSegmentSize = 8 << 20
+	// MaxFilesSchemeSegment bounds a declared segment size in the "files"
+	// scheme, where no NZB confirms it. Posters use 0.25-1 MB articles
+	// (the importer's own estimates assume ~768 KB) and a few go to a few MB;
+	// nothing in the importer or the readers expects more than 4 MiB.
+	MaxFilesSchemeSegment = 4 << 20
 	// MaxFileSize caps one file and the bundle total (1 PiB, as records).
 	MaxFileSize = int64(1) << 50
 	// MaxClipDelta bounds a clip's 90 kHz offset (about 10 years).
@@ -96,5 +101,6 @@ var (
 	ErrNotShareable       = errors.New("bundle: release is not shareable")
 	ErrUnresolved         = errors.New("bundle: metadata segments are not resolved")
 	ErrCoverage           = errors.New("bundle: segments are not exactly one NZB file entry")
+	ErrPartialRange       = errors.New("bundle: an interior segment skips bytes")
 	ErrSegmentNotInNZB    = errors.New("bundle: file segment is not in the release segment list")
 )

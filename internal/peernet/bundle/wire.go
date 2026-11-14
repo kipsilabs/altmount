@@ -1,6 +1,7 @@
 package bundle
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"fmt"
 
@@ -185,32 +186,65 @@ func appendFile(f *File) []byte {
 }
 
 // encodeUnchecked writes the canonical bytes without validating b. Callers
-// validate first; the decoder uses it only for the canonical re-encode check.
+// validate first.
 func encodeUnchecked(b *Bundle) []byte {
 	var out []byte
-	out = appendVarint(out, fVersion, SchemaVersion)
-	out = appendVarint(out, fScheme, uint64(b.Scheme))
-	out = appendBytes(out, fReleaseID, b.ReleaseID[:])
-	out = appendString(out, fTitle, b.Title)
-	out = appendVarint(out, fPosted, uint64(b.PostedUnix))
-	out = appendVarint(out, fTotal, uint64(b.TotalSize))
+	encodeTo(b, func(chunk []byte) bool { out = append(out, chunk...); return true })
+	return out
+}
+
+// matchesCanonical reports whether b encodes to exactly raw, comparing chunk
+// by chunk so no second full-size buffer exists.
+func matchesCanonical(b *Bundle, raw []byte) bool {
+	pos := 0
+	ok := encodeTo(b, func(chunk []byte) bool {
+		if len(raw)-pos < len(chunk) || !bytes.Equal(raw[pos:pos+len(chunk)], chunk) {
+			return false
+		}
+		pos += len(chunk)
+		return true
+	})
+	return ok && pos == len(raw)
+}
+
+// encodeTo feeds the canonical encoding of b to emit in order. It stops and
+// returns false as soon as emit does. The chunk is only valid during the call.
+func encodeTo(b *Bundle, emit func([]byte) bool) bool {
+	var buf []byte
+	put := func(chunk []byte) bool { return emit(chunk) }
+	buf = appendVarint(buf[:0], fVersion, SchemaVersion)
+	buf = appendVarint(buf, fScheme, uint64(b.Scheme))
+	buf = appendBytes(buf, fReleaseID, b.ReleaseID[:])
+	buf = appendString(buf, fTitle, b.Title)
+	buf = appendVarint(buf, fPosted, uint64(b.PostedUnix))
+	buf = appendVarint(buf, fTotal, uint64(b.TotalSize))
 	if b.NZBPassword != "" {
-		out = appendString(out, fPassword, b.NZBPassword)
+		buf = appendString(buf, fPassword, b.NZBPassword)
+	}
+	if !put(buf) {
+		return false
 	}
 	for _, id := range b.Pool {
-		out = appendString(out, fPool, id)
+		buf = appendString(buf[:0], fPool, id)
+		if !put(buf) {
+			return false
+		}
 	}
 	if b.Scheme == SchemeNZB {
 		var rb []byte
 		for _, n := range b.ReleaseFiles {
 			rb = protowire.AppendVarint(rb, uint64(n))
 		}
-		out = appendBytes(out, fReleaseFiles, rb)
+		if !put(appendBytes(buf[:0], fReleaseFiles, rb)) {
+			return false
+		}
 	}
 	for i := range b.Files {
-		out = appendBytes(out, fFiles, appendFile(&b.Files[i]))
+		if !put(appendBytes(buf[:0], fFiles, appendFile(&b.Files[i]))) {
+			return false
+		}
 	}
-	return out
+	return true
 }
 
 // Encode validates b and returns its canonical uncompressed bytes.

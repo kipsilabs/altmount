@@ -61,7 +61,7 @@ func TestDecompressRejects(t *testing.T) {
 		{"garbage", []byte("this is not zstd at all, just text"), ErrMalformed},
 		{"truncated frame", good[:len(good)-2], ErrMalformed},
 		{"input over 8 MB", make([]byte, MaxCompressedSize+1), ErrTooLarge},
-		{"bomb over 64 MB", zeroBomb(t, MaxDecompressedSize+1, 0), ErrTooLarge},
+		{"bomb over the cap", zeroBomb(t, MaxDecompressedSize+1, 0), ErrTooLarge},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

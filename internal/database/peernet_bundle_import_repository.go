@@ -343,6 +343,26 @@ func (r *PeernetBundleImportRepository) FailHeldQueueItem(ctx context.Context, q
 	return true, nil
 }
 
+// RequeueHeldQueueItem puts a held queue item back as pending, with its
+// provisional history gone, so it is imported again from its NZB. It reports
+// whether an item was held and changed.
+func (r *PeernetBundleImportRepository) RequeueHeldQueueItem(ctx context.Context, queueID int64) (bool, error) {
+	now := time.Now().UTC()
+	res, err := r.db.ExecContext(ctx, `UPDATE import_queue SET status = 'pending', error_message = NULL, peer_hold = 0,
+		started_at = NULL, completed_at = NULL, updated_at = ? WHERE id = ? AND peer_hold <> 0`, now, queueID)
+	if err != nil {
+		return false, fmt.Errorf("peernet bundle import: requeue held item: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil || n == 0 {
+		return false, err
+	}
+	if _, err := r.db.ExecContext(ctx, `DELETE FROM import_history WHERE nzb_id = ?`, queueID); err != nil {
+		return true, fmt.Errorf("peernet bundle import: drop history of a requeued item: %w", err)
+	}
+	return true, nil
+}
+
 // SetQueue links the rows of the given paths to a queue item.
 func (r *PeernetBundleImportRepository) SetQueue(ctx context.Context, paths []string, queueID int64) error {
 	for len(paths) > 0 {
@@ -512,4 +532,98 @@ func (r *PeernetBundleImportRepository) OrphanedHolds(ctx context.Context) ([]in
 		out = append(out, id)
 	}
 	return out, rows.Err()
+}
+
+// SettledHolds lists the held queue items whose import is finished and owes
+// nobody anything: every row is passed and committed and no ARR is to be told.
+// Such a hold can only still be set because releasing it failed once.
+func (r *PeernetBundleImportRepository) SettledHolds(ctx context.Context) ([]int64, error) {
+	rows, err := r.db.QueryContext(ctx, `SELECT q.id FROM import_queue q
+		WHERE q.peer_hold <> 0
+		  AND EXISTS (SELECT 1 FROM peernet_bundle_imports b WHERE b.queue_id = q.id)
+		  AND NOT EXISTS (SELECT 1 FROM peernet_bundle_imports b WHERE b.queue_id = q.id
+		                  AND (b.state <> 'passed' OR b.committed = 0 OR b.arr_owed <> 0))
+		ORDER BY q.id LIMIT 1000`)
+	if err != nil {
+		return nil, fmt.Errorf("peernet bundle import: settled holds: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
+// SetBundleID records the Bundle ID the rows of the given paths were accepted
+// from.
+func (r *PeernetBundleImportRepository) SetBundleID(ctx context.Context, paths []string, bundleID string) error {
+	for len(paths) > 0 {
+		n := min(len(paths), maxBundleImportBatch)
+		args := []any{bundleID}
+		for _, p := range paths[:n] {
+			args = append(args, normalizeHealthPath(p))
+		}
+		paths = paths[n:]
+		if _, err := r.db.ExecContext(ctx, `UPDATE peernet_bundle_imports SET bundle_id = ? WHERE file_path IN (`+inList(n)+`)`, args...); err != nil {
+			return fmt.Errorf("peernet bundle import: set bundle id: %w", err)
+		}
+	}
+	return nil
+}
+
+// BundleIDOf returns the Bundle ID a row was accepted from ("" if unknown).
+func (r *PeernetBundleImportRepository) BundleIDOf(ctx context.Context, filePath string) (string, error) {
+	var id string
+	err := r.db.QueryRowContext(ctx, `SELECT bundle_id FROM peernet_bundle_imports WHERE file_path = ?`, normalizeHealthPath(filePath)).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("peernet bundle import: bundle id: %w", err)
+	}
+	return id, nil
+}
+
+// maxFailedBundles bounds the negative cache: the oldest entries go first.
+const maxFailedBundles = 10_000
+
+// RecordFailedBundle puts a Bundle ID whose layout failed local verification on
+// the negative cache (the same layout from another publisher is then skipped).
+func (r *PeernetBundleImportRepository) RecordFailedBundle(ctx context.Context, bundleID, releaseID string, at time.Time) error {
+	if bundleID == "" {
+		return nil
+	}
+	if _, err := r.db.ExecContext(ctx, `INSERT INTO peernet_failed_bundles (bundle_id, release_id, failed_at) VALUES (?, ?, ?)
+		ON CONFLICT (bundle_id) DO UPDATE SET failed_at = excluded.failed_at`, bundleID, releaseID, at.Unix()); err != nil {
+		return fmt.Errorf("peernet bundle import: record failed bundle: %w", err)
+	}
+	// Bounded: keep the newest maxFailedBundles.
+	if _, err := r.db.ExecContext(ctx, `DELETE FROM peernet_failed_bundles WHERE bundle_id IN (
+		SELECT bundle_id FROM peernet_failed_bundles ORDER BY failed_at DESC LIMIT 1000000 OFFSET ?)`, maxFailedBundles); err != nil {
+		return fmt.Errorf("peernet bundle import: trim failed bundles: %w", err)
+	}
+	return nil
+}
+
+// IsFailedBundle reports whether the Bundle ID failed local verification at or
+// after notBefore.
+func (r *PeernetBundleImportRepository) IsFailedBundle(ctx context.Context, bundleID string, notBefore time.Time) (bool, error) {
+	var n int
+	err := r.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM peernet_failed_bundles WHERE bundle_id = ? AND failed_at >= ?`,
+		bundleID, notBefore.Unix()).Scan(&n)
+	if err != nil {
+		return false, fmt.Errorf("peernet bundle import: failed bundle lookup: %w", err)
+	}
+	return n > 0, nil
+}
+
+// PruneFailedBundles removes entries older than before.
+func (r *PeernetBundleImportRepository) PruneFailedBundles(ctx context.Context, before time.Time) error {
+	_, err := r.db.ExecContext(ctx, `DELETE FROM peernet_failed_bundles WHERE failed_at < ?`, before.Unix())
+	return err
 }

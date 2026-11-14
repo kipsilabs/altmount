@@ -79,7 +79,7 @@ const SERVE_REFUSED_LABELS: ReadonlyMap<string, string> = new Map([
 ]);
 
 const FETCH_FAILED_LABELS: ReadonlyMap<string, string> = new Map([
-	["refused", "Peer refused the request"],
+	["refused", "The peer declined to serve this bundle"],
 	["bad_status", "Peer answered with an error"],
 	["transport", "Connection problem"],
 	["truncated", "Download was cut short"],
@@ -113,6 +113,15 @@ const IMPORT_REJECT_LABELS: ReadonlyMap<string, string> = new Map([
 	["size_implausible", "Declared file sizes do not fit your NZB"],
 	["yenc_mismatch", "Sampled articles contradict the bundle"],
 	["structure_invalid", "Media file structure is broken"],
+	[
+		"layout_not_allowed_open",
+		"Archive or encrypted layouts are not accepted from the open network",
+	],
+	[
+		"container_not_verifiable",
+		"Media container cannot be checked, so the open network does not carry it",
+	],
+	["too_many_tables", "More archive volumes than the verification budget covers"],
 ]);
 
 export function notShareableLabel(key: string): string {
@@ -214,9 +223,18 @@ export function showBundlesBlock(networks: readonly HasLevel[]): boolean {
 	return networks.some((n) => n.level >= 1);
 }
 
-/** Only level 3 serves bundles. */
-export function showBundleServing(networks: readonly HasLevel[]): boolean {
-	return networks.some((n) => n.level >= 3);
+/**
+ * Level 3 serves bundles. The serving numbers also show whenever any of them is
+ * non-zero (announced, built, served, refused), so they never stay hidden while
+ * the API reports them, whatever level a network is shown at.
+ */
+export function showBundleServing(networks: readonly HasLevel[], bundles?: unknown): boolean {
+	if (networks.some((n) => n.level >= 3)) return true;
+	if (!bundles || typeof bundles !== "object") return false;
+	const b = bundles as Record<string, unknown>;
+	return ["announced", "built", "served", "served_bytes", "not_shareable", "serve_refused"].some(
+		(key) => anyPositive(b[key]),
+	);
 }
 
 function positive(n: unknown): boolean {

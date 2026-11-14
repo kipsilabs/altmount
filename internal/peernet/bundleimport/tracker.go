@@ -6,10 +6,39 @@ import (
 	"time"
 
 	"github.com/kipsilabs/altmount/internal/database"
+	"github.com/kipsilabs/altmount/internal/peernet/contentid"
 )
 
 // Tracker methods: the state machine of an accepted import. They are the
 // read and write side of "from the peer network, full check pending".
+
+// isForeign reports whether the file at the row's path is another file than
+// the one the row describes (a normal import or the user replaced it). A
+// missing or unreadable file is not foreign: a rename may be in flight, and
+// removing a missing file is harmless. Every action on a path (a delete, a
+// hold, a forced check) first asks this; a foreign row is dropped.
+func (i *Importer) isForeign(ctx context.Context, r database.PeernetBundleImport) bool {
+	if !i.cfg.Library.FileExists(r.FilePath) {
+		return false
+	}
+	m, err := i.cfg.Library.ReadFileMetadata(r.FilePath)
+	if err != nil || m == nil {
+		return false
+	}
+	id, err := contentid.FileID(m)
+	return err == nil && id.String() != r.FileID
+}
+
+// dropForeign deletes the row of a foreign file and reports whether it did.
+func (i *Importer) dropForeign(ctx context.Context, r database.PeernetBundleImport) bool {
+	if !i.isForeign(ctx, r) {
+		return false
+	}
+	slog.InfoContext(ctx, "peer import row dropped: the file at its path is not the imported one", "file_path", r.FilePath)
+	_ = i.cfg.State.Delete(context.WithoutCancel(ctx), []string{r.FilePath})
+	i.releaseOrphanHolds(ctx)
+	return true
+}
 
 // PendingFullCheck returns which of paths are peer-bundle files whose full
 // check has not passed. The health worker forces a full check for them and
@@ -26,7 +55,10 @@ func (i *Importer) PendingFullCheck(ctx context.Context, paths []string) map[str
 		return all
 	}
 	out := make(map[string]struct{}, len(rows))
-	for p := range rows {
+	for p, r := range rows {
+		if i.dropForeign(ctx, r) {
+			continue
+		}
 		out[p] = struct{}{}
 	}
 	return out
@@ -39,7 +71,10 @@ func (i *Importer) IsPendingPeerImport(ctx context.Context, filePath string) boo
 		return false
 	}
 	row, ok, err := i.cfg.State.Get(ctx, filePath)
-	return err == nil && ok && row.State == "pending"
+	if err != nil || !ok || row.State != "pending" {
+		return false
+	}
+	return !i.dropForeign(ctx, row)
 }
 
 // PeerBundleStatus is the read method the publisher uses: fromPeer says the
@@ -77,6 +112,9 @@ func (i *Importer) QueueHasPending(ctx context.Context, queueID int64) bool {
 // FullCheckPassed records that a file's full check passed. When it was the
 // last file of its import, the ARRs are told, exactly once.
 func (i *Importer) FullCheckPassed(ctx context.Context, filePath string) {
+	if row, ok, err := i.cfg.State.Get(ctx, filePath); err == nil && ok && i.dropForeign(ctx, row) {
+		return
+	}
 	won, err := i.cfg.State.MarkPassed(ctx, filePath)
 	if err != nil || !won {
 		if err != nil {
@@ -94,7 +132,10 @@ func (i *Importer) FullCheckPassed(ctx context.Context, filePath string) {
 		// No ARR is told about this import (the caller suppressed it, or it is a
 		// direct import), so nothing else lifts the hold.
 		if fh, ok := i.cfg.Announcer.(FailureHandler); ok && row.QueueID > 0 {
-			_ = fh.ReleaseHold(ctx, row.QueueID)
+			if err := fh.ReleaseHold(ctx, row.QueueID); err != nil {
+				// Housekeeping retries: SettledHolds finds this item again.
+				slog.WarnContext(ctx, "could not release the hold of a verified peer import; will retry", "queue_id", row.QueueID, "error", err)
+			}
 		}
 	}
 	if v, ok := i.cfg.Reporter.(BundleVerifiedReporter); ok && !i.QueueHasPending(ctx, row.QueueID) {
@@ -126,7 +167,7 @@ func (i *Importer) announce(ctx context.Context, queueID int64) {
 // release as having served a bad bundle.
 func (i *Importer) FullCheckFailed(ctx context.Context, filePath string) {
 	row, ok, err := i.cfg.State.Get(ctx, filePath)
-	if err != nil || !ok {
+	if err != nil || !ok || i.dropForeign(ctx, row) {
 		return
 	}
 	won, err := i.cfg.State.MarkFailed(ctx, filePath)
@@ -134,10 +175,16 @@ func (i *Importer) FullCheckFailed(ctx context.Context, filePath string) {
 		return
 	}
 	i.cnt.add(func(c *counters) { c.failed++ })
-	i.failImport(ctx, row, failReasonCheck)
-	if i.cfg.Reporter == nil {
+	bundleID, _ := i.cfg.State.BundleIDOf(context.WithoutCancel(ctx), row.FilePath) // before the rows go
+	i.failImport(ctx, row, failReasonCheck, false)
+	// Only a contradiction between the layout and the articles' own headers
+	// (VerifyPeerHeaders) is the publisher's doing. A missing article shortly
+	// after posting can be propagation, and a degraded or unreadable file says
+	// nothing about the publisher, so none of those is reported.
+	if i.cfg.Reporter == nil || !i.takeMismatch(row.FilePath) {
 		return
 	}
+	i.noteFailedBundle(ctx, bundleID, row.ReleaseID)
 	i.reportedMu.Lock()
 	first := i.reported == nil || !i.reported[row.ReleaseID+"/"+row.PublisherID]
 	if i.reported == nil || len(i.reported) >= maxReported {
@@ -154,10 +201,31 @@ func (i *Importer) FullCheckFailed(ctx context.Context, filePath string) {
 	i.cnt.add(func(c *counters) { c.reports++ })
 }
 
+// FullCheckDegraded ends a pending import whose full check found the media
+// playable with a few missing segments. A release a peer vouched for must be
+// whole, so it is failed at once (never announced, published or kept). When the
+// user supplied the NZB (the fast path) the queue item is not failed: it is put
+// back and imported normally, once, so the user gets what a normal import
+// would have produced. The publisher is not reported (missing articles are not
+// attributable).
+func (i *Importer) FullCheckDegraded(ctx context.Context, filePath string) {
+	row, ok, err := i.cfg.State.Get(ctx, filePath)
+	if err != nil || !ok || i.dropForeign(ctx, row) {
+		return
+	}
+	won, err := i.cfg.State.MarkFailed(ctx, filePath)
+	if err != nil || !won {
+		return
+	}
+	i.cnt.add(func(c *counters) { c.failed++ })
+	i.failImport(ctx, row, failReasonDegraded, true)
+}
+
 // Messages a failed peer import carries in the SABnzbd-compatible history.
 const (
-	failReasonCheck = "Peer-supplied release failed its full health check and was removed"
-	failReasonStale = "Peer-supplied release was not fully verified within 7 days and was removed"
+	failReasonCheck    = "Peer-supplied release failed its full health check and was removed"
+	failReasonStale    = "Peer-supplied release was not fully verified within 7 days and was removed"
+	failReasonDegraded = "Peer-supplied release played with missing segments and was removed"
 )
 
 // failImport ends a peer import that failed its full check, or never got one:
@@ -168,7 +236,10 @@ const (
 // does not stay in the library and the surviving files of the release cannot
 // complete the import by passing later. It touches only the rows of this
 // import, and every step is idempotent.
-func (i *Importer) failImport(ctx context.Context, row database.PeernetBundleImport, reason string) {
+//
+// With requeue set (a degraded import) the queue item is put back for a normal
+// import instead of failed, after the files are gone so the two cannot race.
+func (i *Importer) failImport(ctx context.Context, row database.PeernetBundleImport, reason string, requeue bool) {
 	bg := context.WithoutCancel(ctx)
 	fh, _ := i.cfg.Announcer.(FailureHandler)
 	rows := []database.PeernetBundleImport{row}
@@ -176,7 +247,7 @@ func (i *Importer) failImport(ctx context.Context, row database.PeernetBundleImp
 		if l, err := i.cfg.State.ListByQueue(bg, row.QueueID); err == nil && len(l) > 0 {
 			rows = l
 		}
-		if fh != nil {
+		if fh != nil && !requeue {
 			if err := fh.FailImport(bg, row.QueueID, reason); err != nil {
 				slog.WarnContext(ctx, "could not mark a failed peer import as failed in the queue", "queue_id", row.QueueID, "error", err)
 			}
@@ -185,6 +256,9 @@ func (i *Importer) failImport(ctx context.Context, row database.PeernetBundleImp
 	paths := make([]string, 0, len(rows))
 	for _, r := range rows {
 		paths = append(paths, r.FilePath)
+		if i.isForeign(ctx, r) {
+			continue // another file sits there now: never remove it
+		}
 		var err error
 		if fh != nil {
 			err = fh.RemoveFailedFile(bg, r.FilePath)
@@ -201,6 +275,18 @@ func (i *Importer) failImport(ctx context.Context, row database.PeernetBundleImp
 	if err := i.cfg.State.Delete(bg, paths); err != nil {
 		slog.WarnContext(ctx, "could not drop the state of a failed peer import", "error", err)
 	}
+	if requeue && row.QueueID > 0 && fh != nil {
+		if rq, ok := fh.(Requeuer); ok {
+			if done, err := rq.RequeueForNormalImport(bg, row.QueueID); err != nil {
+				slog.WarnContext(ctx, "could not put a degraded peer import back for a normal import", "queue_id", row.QueueID, "error", err)
+			} else if done {
+				return
+			}
+		}
+		if err := fh.FailImport(bg, row.QueueID, reason); err != nil {
+			slog.WarnContext(ctx, "could not mark a failed peer import as failed in the queue", "queue_id", row.QueueID, "error", err)
+		}
+	}
 }
 
 // releaseOrphanHolds lifts the hold of every queue item that no state row
@@ -216,9 +302,15 @@ func (i *Importer) releaseOrphanHolds(ctx context.Context) {
 		slog.WarnContext(ctx, "could not list orphaned peer holds", "error", err)
 		return
 	}
+	// Holds of finished imports whose release failed once are retried here.
+	if settled, err := i.cfg.State.SettledHolds(ctx); err != nil {
+		slog.WarnContext(ctx, "could not list settled peer holds", "error", err)
+	} else {
+		ids = append(ids, settled...)
+	}
 	for _, id := range ids {
 		if err := fh.ReleaseHold(ctx, id); err != nil {
-			slog.WarnContext(ctx, "could not release an orphaned peer hold", "queue_id", id, "error", err)
+			slog.WarnContext(ctx, "could not release a peer hold", "queue_id", id, "error", err)
 		}
 	}
 }
@@ -258,9 +350,12 @@ func (i *Importer) EscalateStale(ctx context.Context) int {
 	}
 	n := 0
 	for _, r := range rows {
+		if i.dropForeign(ctx, r) {
+			continue
+		}
 		if won, err := i.cfg.State.MarkFailed(ctx, r.FilePath); err == nil && won {
 			n++
-			i.failImport(ctx, r, failReasonStale)
+			i.failImport(ctx, r, failReasonStale, false)
 		}
 	}
 	if n > 0 {

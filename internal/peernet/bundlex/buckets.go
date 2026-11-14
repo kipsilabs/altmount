@@ -54,6 +54,15 @@ func (b *buckets) take(key string, n float64, now time.Time) bool {
 	return true
 }
 
+// give returns n units to key's bucket (undoing a take).
+func (b *buckets) give(key string, n float64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if e := b.m[key]; e != nil {
+		e.tokens = min(b.burst, e.tokens+n)
+	}
+}
+
 // counter caps concurrent holders per key.
 type counter struct {
 	mu sync.Mutex

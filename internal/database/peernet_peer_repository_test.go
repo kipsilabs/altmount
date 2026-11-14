@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -143,9 +145,38 @@ func TestPeerRepo_KnownPrefixesReportTheVerifiedAddressPrefix(t *testing.T) {
 		require.NoError(t, r.RecordSuccess(ctx, p.NetworkID, p.NodeID, "", peerT0, peerT0.Add(time.Hour)))
 	}
 	require.NoError(t, r.RecordSuccess(ctx, young.NetworkID, young.NodeID, "", peerT0.Add(20*time.Hour), peerT0.Add(21*time.Hour)))
+	for _, p := range []PeernetPeer{a, b, v6} {
+		host, _, _ := net.SplitHostPort(p.Address)
+		require.NoError(t, r.RecordConnectedIP(ctx, p.NetworkID, p.NodeID, strings.Trim(host, "[]")))
+	}
 	got, err := r.KnownPrefixes(ctx, a.NetworkID, []string{a.NodeID, b.NodeID, v6.NodeID, young.NodeID, nodeHex(9)}, 24*time.Hour, peerT0.Add(25*time.Hour))
 	require.NoError(t, err)
 	assert.Equal(t, map[string]string{a.NodeID: "8.8.8.0/24", b.NodeID: "8.8.8.0/24", v6.NodeID: "2001:db8:1::/48"}, got)
+}
+
+// Two DNS names for one server are one range: corroboration keys on the IP the
+// node actually connected to, never on the stored address string.
+func TestPeerRepo_KnownPrefixesKeyOnTheConnectedIPNotTheName(t *testing.T) {
+	r := newPeerTestRepo(t)
+	ctx := context.Background()
+	a, b, c, d := mkPeer(1, PeernetSourceExchange, peerT0), mkPeer(2, PeernetSourceExchange, peerT0),
+		mkPeer(3, PeernetSourceExchange, peerT0), mkPeer(4, PeernetSourceExchange, peerT0)
+	a.Address, b.Address, c.Address, d.Address = "one.example.org:7000", "two.example.org:7000", "[2001:db8::9]:7000", "ip.example.org:7000"
+	for _, p := range []PeernetPeer{a, b, c, d} {
+		_, _ = r.Insert(ctx, p, PeernetPeerCaps{})
+		require.NoError(t, r.RecordSuccess(ctx, p.NetworkID, p.NodeID, "", peerT0, peerT0.Add(time.Hour)))
+	}
+	require.NoError(t, r.RecordConnectedIP(ctx, a.NetworkID, a.NodeID, "203.0.113.7"))
+	require.NoError(t, r.RecordConnectedIP(ctx, b.NetworkID, b.NodeID, "203.0.113.200"))
+	require.NoError(t, r.RecordConnectedIP(ctx, c.NetworkID, c.NodeID, "2001:db8:1:2::5"))
+	// d never recorded a connected IP.
+	got, err := r.KnownPrefixes(ctx, a.NetworkID, []string{a.NodeID, b.NodeID, c.NodeID, d.NodeID}, 24*time.Hour, peerT0.Add(25*time.Hour))
+	require.NoError(t, err)
+	assert.Equal(t, map[string]string{a.NodeID: "203.0.113.0/24", b.NodeID: "203.0.113.0/24", c.NodeID: "2001:db8:1::/48"}, got,
+		"two names, one /24; a peer without a connected IP counts for nothing")
+	ip, err := r.ConnectedIP(ctx, a.NetworkID, a.NodeID)
+	require.NoError(t, err)
+	assert.Equal(t, "203.0.113.7", ip)
 }
 
 func TestPeerRepo_PerSourceCapEvictsStalestUnverifiedOfSource(t *testing.T) {

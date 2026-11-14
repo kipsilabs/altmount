@@ -168,7 +168,7 @@ func TestBundleFetcherAdapterMapsSourceToOrigin(t *testing.T) {
 	b, o, err := NewBundleFetcher(svc).FetchBundle(context.Background(), "rel")
 	require.NoError(t, err)
 	assert.Same(t, svc.b, b)
-	assert.Equal(t, bundleimport.Origin{NetworkID: nw.String(), PublisherID: pub.String(), Open: true}, o)
+	assert.Equal(t, bundleimport.Origin{NetworkID: nw.String(), PublisherID: pub.String(), Open: true, BundleID: strings.Repeat("0", 64)}, o)
 	assert.Equal(t, "rel", svc.gotRel)
 	svc.err = errors.New("no offers")
 	_, _, err = NewBundleFetcher(svc).FetchBundle(context.Background(), "rel")
@@ -233,4 +233,35 @@ func TestFastPath_VerificationThatDoesNotFitDeclinesInsteadOfStallingTheImport(t
 	_, ok := h.TryBundle(context.Background(), req())
 	assert.False(t, ok)
 	assert.Less(t, time.Since(start), 2*time.Second)
+}
+
+// optionFetcher records the requirements it is asked to apply.
+type optionFetcher struct {
+	originFetcher
+	opts  []bundleimport.FetchOptions
+	plain atomic.Int32
+}
+
+func (f *optionFetcher) FetchBundle(ctx context.Context, id string) (*bundle.Bundle, bundleimport.Origin, error) {
+	f.plain.Add(1)
+	return f.originFetcher.FetchBundle(ctx, id)
+}
+
+func (f *optionFetcher) FetchBundleWith(ctx context.Context, id string, o bundleimport.FetchOptions) (*bundle.Bundle, bundleimport.Origin, error) {
+	f.opts = append(f.opts, o)
+	return f.originFetcher.FetchBundle(ctx, id)
+}
+
+// The switch and the corroboration floor are handed to the fetcher so offers
+// are filtered before any peer is dialled (a contact reveals the Release ID).
+func TestFastPath_RequirementsGoToTheFetcherBeforeAnyDial(t *testing.T) {
+	for _, on := range []bool{false, true} {
+		f := &optionFetcher{originFetcher: originFetcher{b: matching(t), o: bundleimport.Origin{NetworkID: "p"}}}
+		h := NewPeerBundleFastPath(FastPathConfig{Acceptor: &fakeAcceptor{res: &bundleimport.Result{Dir: "d", Paths: []string{"d/a.mkv"}}}, Fetcher: f,
+			Enabled: func() bool { return true }, OpenFastPath: func() bool { return on }})
+		_, _ = h.TryBundle(context.Background(), req())
+		assert.Zero(t, f.plain.Load(), "the unfiltered fetch is never used when the fetcher can filter")
+		require.Len(t, f.opts, 1)
+		assert.Equal(t, bundleimport.FetchOptions{AllowOpen: on, MinOpenCorroborators: minOpenCorroborators}, f.opts[0])
+	}
 }

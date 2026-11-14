@@ -51,19 +51,41 @@ const (
 
 var errStructure = errors.New("media structure is not valid")
 
+// errNotVerifiable says the container has no structural check here: the open
+// network does not carry such media.
+var errNotVerifiable = errors.New("container has no structural check")
+
 type readerAt struct {
 	ctx  context.Context
 	f    io.ReaderAt
 	size int64
 	n    int // reads made, bounded
+	hn   int // box-header reads made, bounded
 }
 
 const maxStructReads = 64
+
+// maxHeaderReads bounds the 16-byte box-header reads of a top-level MP4 walk,
+// counted apart from the other reads so a legitimate file with many top-level
+// boxes is not rejected for the number of reads.
+const maxHeaderReads = 256
 
 func (r *readerAt) read(off int64, n int) ([]byte, error) {
 	if r.n++; r.n > maxStructReads {
 		return nil, fmt.Errorf("%w: too many reads", errStructure)
 	}
+	return r.readRaw(off, n)
+}
+
+// readHeader reads a box header (at most 16 bytes) against its own budget.
+func (r *readerAt) readHeader(off int64) ([]byte, error) {
+	if r.hn++; r.hn > maxHeaderReads {
+		return nil, fmt.Errorf("%w: too many top-level boxes", errStructure)
+	}
+	return r.readRaw(off, 16)
+}
+
+func (r *readerAt) readRaw(off int64, n int) ([]byte, error) {
 	if off < 0 || off >= r.size {
 		return nil, fmt.Errorf("%w: offset %d outside the file", errStructure, off)
 	}
@@ -80,7 +102,7 @@ func (r *readerAt) read(off int64, n int) ([]byte, error) {
 }
 
 // verifyStructure runs the container check for the staged file name.
-func verifyStructure(ctx context.Context, op contentverify.Opener, name string, size int64) error {
+func verifyStructure(ctx context.Context, op contentverify.Opener, name string, size int64, open bool) error {
 	ctx, cancel := context.WithTimeout(ctx, structReadTimeout)
 	defer cancel()
 	ctx = context.WithValue(ctx, utils.MaxPrefetchKey, 1)
@@ -102,6 +124,9 @@ func verifyStructure(ctx context.Context, op contentverify.Opener, name string, 
 		return verifyMP4(r)
 	case tsStride(r) != 0:
 		return verifyTS(r, tsStride(r))
+	}
+	if open {
+		return fmt.Errorf("%w: %s", errNotVerifiable, name)
 	}
 	return verifyWindows(r)
 }
@@ -146,7 +171,7 @@ func verifyMP4(r *readerAt) error {
 		if boxes > maxBoxes {
 			return fmt.Errorf("%w: too many boxes", errStructure)
 		}
-		hdr, err := r.read(off, 16)
+		hdr, err := r.readHeader(off)
 		if err != nil {
 			return err
 		}
@@ -223,9 +248,11 @@ func (r *readerAt) tailIsZero(off int64) bool {
 	return true
 }
 
-// verifyFragmentedTail requires a fragment-family box that ends exactly at the
-// end of the file, found in a tail window. Random bytes at the end do not
-// satisfy it: a header with a known type whose size lands on the last byte.
+// verifyFragmentedTail requires the end of a fragmented file to be a real
+// fragment-family structure, found by walking backwards from the last byte:
+// optionally free/skip boxes, then either an mfra whose mfro states the mfra's
+// own size, or an mdat directly preceded by a moof that ends exactly where the
+// mdat starts. Random bytes, or one 8-byte box header, do not satisfy it.
 func verifyFragmentedTail(r *readerAt) error {
 	for _, w := range fragTailWindows {
 		n := min(w, r.size)
@@ -234,20 +261,66 @@ func verifyFragmentedTail(r *readerAt) error {
 		if err != nil {
 			return err
 		}
-		for o := 0; o+8 <= len(buf); o++ {
-			size := int64(uint32(buf[o])<<24 | uint32(buf[o+1])<<16 | uint32(buf[o+2])<<8 | uint32(buf[o+3]))
-			if size < 8 || int64(o)+size != int64(len(buf)) {
-				continue
-			}
-			if fragmentBoxTypes[string(buf[o+4:o+8])] {
-				return nil
-			}
+		if tailIsFragmentFamily(buf) {
+			return nil
 		}
 		if n == r.size {
 			break
 		}
 	}
-	return fmt.Errorf("%w: no box ends at the end of the fragmented file", errStructure)
+	return fmt.Errorf("%w: the fragmented file does not end in a moof+mdat pair or an mfra", errStructure)
+}
+
+func be32(b []byte) int {
+	return int(uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3]))
+}
+
+// boxEndingAt finds the smallest fragment-family box in buf that ends exactly
+// at end, scanning backwards.
+func boxEndingAt(buf []byte, end int) (off int, typ string, ok bool) {
+	for o := end - 8; o >= 0; o-- {
+		size := be32(buf[o:])
+		if size < 8 || o+size != end {
+			continue
+		}
+		if t := string(buf[o+4 : o+8]); fragmentBoxTypes[t] {
+			return o, t, true
+		}
+	}
+	return 0, "", false
+}
+
+func tailIsFragmentFamily(buf []byte) bool {
+	end := len(buf)
+	for k := 0; k < 4; k++ { // trailing free/skip padding
+		o, t, ok := boxEndingAt(buf, end)
+		if !ok || (t != "free" && t != "skip") {
+			break
+		}
+		end = o
+	}
+	o, t, ok := boxEndingAt(buf, end)
+	if !ok {
+		return false
+	}
+	switch t {
+	case "mfra":
+		return mfraIsValid(buf[o:end])
+	case "mdat":
+		_, pt, pok := boxEndingAt(buf, o)
+		return pok && pt == "moof"
+	}
+	return false
+}
+
+// mfraIsValid checks that the last 16 bytes of an mfra are an mfro whose size
+// field equals the mfra's own size.
+func mfraIsValid(mfra []byte) bool {
+	if len(mfra) < 8+16 {
+		return false
+	}
+	mfro := mfra[len(mfra)-16:]
+	return be32(mfro) == 16 && string(mfro[4:8]) == "mfro" && be32(mfro[12:]) == len(mfra)
 }
 
 func printableBoxType(t string) bool {
@@ -279,6 +352,9 @@ func tsStride(r *readerAt) int64 {
 	return 0
 }
 
+// tsRandomChecks is how many random packet positions are checked for sync.
+const tsRandomChecks = 8
+
 func verifyTS(r *readerAt, stride int64) error {
 	sync := int64(0)
 	if stride == 192 {
@@ -290,6 +366,12 @@ func verifyTS(r *readerAt, stride int64) error {
 	}
 	for _, q := range []int64{1, 2, 3} {
 		if err := tsSync(r, packets/4*q*stride+sync); err != nil {
+			return err
+		}
+	}
+	// Positions the publisher cannot predict, on the packet grid.
+	for range tsRandomChecks {
+		if err := tsSync(r, int64(randN(int(min(packets, 1<<30))))*stride+sync); err != nil {
 			return err
 		}
 	}
@@ -377,7 +459,10 @@ func verifyMatroska(r *readerAt) error {
 			return fmt.Errorf("%w: Segment ends at %d, file is %d bytes", errStructure, end, r.size)
 		}
 	}
-	return verifySeekHead(r, start)
+	if err := verifySeekHead(r, start); err != nil {
+		return err
+	}
+	return verifyMatroskaInterior(r, start)
 }
 
 // level1IDs are the elements that can start a Segment's children.
@@ -493,10 +578,96 @@ func parseSeek(b []byte) (id []byte, pos int64, err error) {
 // structureReason maps a structure error to the rejection reason.
 func structureReason(err error) Reason {
 	switch {
+	case errors.Is(err, errNotVerifiable):
+		return ReasonContainerNotVerifiable
 	case errors.Is(err, errStructure):
 		return ReasonStructureInvalid
 	case errors.Is(err, nntppool.ErrArticleNotFound):
 		return ReasonMediaMissing
 	}
 	return ReasonMediaInconclusive
+}
+
+// ---- Matroska interior ----
+
+// Interior elements that follow one another inside Clusters.
+var interiorIDs = map[uint64]bool{
+	0xA3: true /* SimpleBlock */, 0xA0: true /* BlockGroup */, 0xE7: true /* Timecode */, 0x1F43B675: true, /* Cluster */
+}
+
+const (
+	interiorWindow   = 1 << 20 // bytes read at one interior position
+	interiorTries    = 3       // fresh random positions per check before giving up
+	interiorChecks   = 3       // interior positions that must parse
+	interiorWholeMax = 256 << 10
+)
+
+// interiorChain reports whether win holds two consecutive interior elements
+// (an element header whose size lands on the header of another interior
+// element, or a Cluster header followed by one). Zeros and random bytes do not
+// form such a chain.
+func interiorChain(win []byte) bool {
+	for i := 0; i+16 < len(win); i++ {
+		id, idn, _, ok := ebmlVint(win[i:], true)
+		if !ok || !interiorIDs[id] {
+			continue
+		}
+		sz, sn, unknown, ok := ebmlVint(win[i+idn:], false)
+		if !ok || unknown {
+			continue
+		}
+		next := int64(i + idn + sn)
+		if id != 0x1F43B675 { // a Cluster is entered, anything else is skipped
+			next += int64(sz)
+		}
+		if next < 0 || next+8 > int64(len(win)) {
+			continue
+		}
+		id2, _, _, ok := ebmlVint(win[next:], true)
+		if ok && interiorIDs[id2] {
+			return true
+		}
+	}
+	return false
+}
+
+// verifyMatroskaInterior reads a few random interior positions and requires
+// each to parse as Matroska interior structure. The SeekHead and the tail alone
+// cannot tell a real file from a valid head and tail around garbage. Inside a
+// frame nothing can be checked, so this proves the positions read, not the
+// bytes between them.
+func verifyMatroskaInterior(r *readerAt, segStart int64) error {
+	if r.size <= interiorWholeMax {
+		win, err := r.read(segStart, int(min(r.size-segStart, int64(interiorWholeMax))))
+		if err != nil {
+			return err
+		}
+		if !interiorChain(win) {
+			return fmt.Errorf("%w: no Matroska cluster data in the body of the file", errStructure)
+		}
+		return nil
+	}
+	lo := r.size / 8
+	hi := r.size - tailWindow - interiorWindow
+	if hi <= lo {
+		lo, hi = r.size/4, r.size/2
+	}
+	for range interiorChecks {
+		found := false
+		for range interiorTries {
+			off := lo + int64(randN(int(min(hi-lo, 1<<30))))
+			win, err := r.read(off, interiorWindow)
+			if err != nil {
+				return err
+			}
+			if interiorChain(win) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("%w: a random position inside the file holds no Matroska cluster data", errStructure)
+		}
+	}
+	return nil
 }

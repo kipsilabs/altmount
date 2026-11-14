@@ -52,6 +52,9 @@ type Peer struct {
 	// Trusted marks an address from local configuration rather than learned
 	// from a peer (see transport.CallOptions.TrustedAddress).
 	Trusted bool
+	// ConnectedIP is the literal IP this node last connected to when it
+	// verified the peer ("" when none is recorded). Corroboration keys on it.
+	ConnectedIP string
 }
 
 // PeerSource lists the verified peers of a network, at most limit of them.

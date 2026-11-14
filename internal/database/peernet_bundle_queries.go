@@ -169,3 +169,27 @@ func (r *PeernetPublishStateRepository) CountAnnouncedBundles(ctx context.Contex
 	}
 	return n, nil
 }
+
+// ListUnpublishedReleases returns up to limit release IDs of the content index
+// that have no release-record publish state on network: releases that became
+// eligible while the network did not publish (level below 2).
+func (r *PeernetPublishStateRepository) ListUnpublishedReleases(ctx context.Context, network string, limit int) ([]string, error) {
+	rows, err := r.db.QueryContext(ctx, `SELECT DISTINCT c.release_id FROM peernet_content_index c
+		WHERE c.release_id <> ''
+		  AND NOT EXISTS (SELECT 1 FROM peernet_publish_state s
+		                  WHERE s.network_id = ? AND s.kind = ? AND s.release_id = c.release_id)
+		ORDER BY c.release_id LIMIT ?`, network, PeernetRecordKindRelease, limit)
+	if err != nil {
+		return nil, fmt.Errorf("peernet publish state: list unpublished releases: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}

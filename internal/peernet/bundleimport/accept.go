@@ -104,6 +104,11 @@ func (i *Importer) Accept(ctx context.Context, req Request) (*Result, error) {
 		return i.rejected(r, err)
 	}
 	b, loc = subset(b, loc, keep)
+	if req.Origin.Open {
+		if err := plainLayoutOnly(b); err != nil {
+			return i.rejected(ReasonLayoutNotAllowedOpen, err)
+		}
+	}
 
 	paths := make([]string, len(loc.Files))
 	for n, lf := range loc.Files {
@@ -133,16 +138,22 @@ func (i *Importer) Accept(ctx context.Context, req Request) (*Result, error) {
 		}
 		return i.rejected(ReasonProbeInconclusive, err)
 	}
-	if r, err := i.verifyYenc(ctx, b); err != nil {
-		if r == ReasonYencMismatch && i.cfg.Reporter != nil {
+	if r, attributable, err := i.verifyYenc(ctx, b, req.ExpectedNZBNames); err != nil {
+		if attributable && i.cfg.Reporter != nil {
 			// The layout contradicts the articles themselves: the publisher
 			// served a bad bundle, which is attributable (fetch domain only).
 			i.cfg.Reporter.ReportBadBundle(ctx, req.Origin, b.ReleaseID.String())
 			i.cnt.add(func(c *counters) { c.reports++ })
 		}
+		if attributable {
+			i.noteFailedBundle(ctx, req.Origin.BundleID, b.ReleaseID.String())
+		}
 		return i.rejected(r, err)
 	}
-	if r, err := i.probeMedia(ctx, loc); err != nil {
+	if r, err := i.probeMedia(ctx, loc, req.Origin.Open); err != nil {
+		if r == ReasonMediaInvalid || r == ReasonStructureInvalid {
+			i.noteFailedBundle(ctx, req.Origin.BundleID, b.ReleaseID.String())
+		}
 		return i.rejected(r, err)
 	}
 
@@ -158,11 +169,46 @@ func (i *Importer) Accept(ctx context.Context, req Request) (*Result, error) {
 		i.cnt.add(func(c *counters) { c.already++ })
 		return res, nil
 	}
-	if err := i.write(ctx, b, loc, req, res); err != nil {
+	i.writeMu.RLock()
+	err = i.write(ctx, b, loc, req, res)
+	i.writeMu.RUnlock()
+	if err != nil {
 		return i.rejected(ReasonWriteFailed, err)
 	}
 	i.cnt.add(func(c *counters) { c.accepted++ })
 	return res, nil
+}
+
+// plainLayoutOnly requires every written file to be exactly one inline segment
+// table: no outer volumes, extents, AES key or clips. Archive layouts cannot be
+// bound to the articles without reading archive headers, so the open network
+// does not carry them (private networks do).
+func plainLayoutOnly(b *bundle.Bundle) error {
+	for k := range b.Files {
+		f := &b.Files[k]
+		switch {
+		case len(f.Outer) > 0 || len(f.Extents) > 0:
+			return fmt.Errorf("%s: read through outer archive volumes", f.Name)
+		case len(f.AESKey) > 0:
+			return fmt.Errorf("%s: encrypted", f.Name)
+		case len(f.Clips) > 0:
+			return fmt.Errorf("%s: clipped", f.Name)
+		case len(f.Segments) == 0:
+			return fmt.Errorf("%s: no inline segments", f.Name)
+		}
+	}
+	return nil
+}
+
+// noteFailedBundle puts a layout that contradicted the articles or the media on
+// the negative cache (when the reporter keeps one).
+func (i *Importer) noteFailedBundle(ctx context.Context, bundleID, releaseID string) {
+	if bundleID == "" {
+		return
+	}
+	if r, ok := i.cfg.Reporter.(BundleFailedReporter); ok {
+		r.ReportFailedBundle(ctx, bundleID, releaseID)
+	}
 }
 
 // verifyIdentity recomputes every File ID and the Release ID from the layout
@@ -278,7 +324,7 @@ func probeFiles(loc *bundle.Local) []ProbeFile {
 
 // probeMedia reads the head of the main media file(s) through the real reader
 // stack, in a hidden staging area that is removed on every outcome.
-func (i *Importer) probeMedia(ctx context.Context, loc *bundle.Local) (Reason, error) {
+func (i *Importer) probeMedia(ctx context.Context, loc *bundle.Local, open bool) (Reason, error) {
 	var media []bundle.LocalFile
 	for _, lf := range loc.Files {
 		if fileinfo.IsVerifiableMediaFile(lf.Name) {
@@ -310,7 +356,7 @@ func (i *Importer) probeMedia(ctx context.Context, loc *bundle.Local) (Reason, e
 		default:
 			return ReasonMediaInconclusive, fmt.Errorf("%s: %w", lf.Name, res.Err)
 		}
-		if err := verifyStructure(ctx, st.Opener(), lf.Name, lf.Meta.FileSize); err != nil {
+		if err := verifyStructure(ctx, st.Opener(), lf.Name, lf.Meta.FileSize, open); err != nil {
 			return structureReason(err), fmt.Errorf("%s: %w", lf.Name, err)
 		}
 	}
@@ -357,6 +403,11 @@ func (i *Importer) write(ctx context.Context, b *bundle.Bundle, loc *bundle.Loca
 	rowsDone = true // set first: a failed batch may have inserted some rows
 	if err := i.cfg.State.Upsert(ctx, rows); err != nil {
 		return err
+	}
+	if req.Origin.BundleID != "" {
+		if err := i.cfg.State.SetBundleID(ctx, res.Paths, req.Origin.BundleID); err != nil {
+			return err
+		}
 	}
 	if i.crashAt("rows") {
 		return errCrashed

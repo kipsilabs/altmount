@@ -112,7 +112,7 @@ type announcerFunc func(Announcement) error
 
 func (f announcerFunc) AnnounceVerifiedImport(_ context.Context, a Announcement) error { return f(a) }
 
-func TestTracker_FailedFullCheckReportsPublisherAndNeverAnnounces(t *testing.T) {
+func TestTracker_FailedFullCheckWithoutAMismatchDoesNotReportThePublisher(t *testing.T) {
 	e := newEnv(t)
 	b, res := e.accept("bad", mkvSpec("a.mkv"), mkvSpec("b.mkv"))
 	ctx := context.Background()
@@ -120,14 +120,15 @@ func TestTracker_FailedFullCheckReportsPublisherAndNeverAnnounces(t *testing.T) 
 	e.imp.FullCheckFailed(ctx, res.Paths[1])
 	e.imp.FullCheckFailed(ctx, res.Paths[0]) // passed already: no-op
 
-	assert.Equal(t, []string{strings.Repeat("d", 64) + "/" + b.ReleaseID.String()}, e.rep.got)
+	_ = b
+	assert.Empty(t, e.rep.got, "a missing-only failure may be propagation: the publisher is not reported")
 	assert.Empty(t, e.ann.got)
 	_, passed, _ := e.imp.PeerBundleStatus(ctx, res.Paths[1])
 	assert.False(t, passed, "a failed file never becomes publish-eligible")
 	c := e.imp.Counters()
 	assert.Equal(t, uint64(1), c.FullCheckFailed)
 	assert.Equal(t, uint64(1), c.FullCheckPassed)
-	assert.Equal(t, uint64(1), c.BadBundleReports)
+	assert.Equal(t, uint64(0), c.BadBundleReports)
 }
 
 func TestTracker_CallerSuppressedARRIsNeverAnnounced(t *testing.T) {

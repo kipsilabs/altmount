@@ -217,7 +217,7 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		s.deny(w, "excluded")
 		return
 	}
-	built, err := s.cfg.Provider.Bundle(r.Context(), ann.ReleaseID)
+	built, err := s.cfg.Provider.Bundle(WithRequester(r.Context(), peer.String(), ip), ann.ReleaseID)
 	switch {
 	case errors.Is(err, ErrBusy):
 		s.refuse("busy")

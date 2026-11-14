@@ -247,3 +247,29 @@ func TestPeernetBundleImport_MoveDeleteAndPendingCounts(t *testing.T) {
 		assert.True(t, ok)
 	})
 }
+
+func TestPeerBundleImport_BundleIDAndFailedBundleCache(t *testing.T) {
+	forEachBundleImportBackend(t, func(t *testing.T, r *PeernetBundleImportRepository) {
+		ctx := context.Background()
+		require.NoError(t, r.Upsert(ctx, []PeernetBundleImport{bundleRow("m/a.mkv", 5)}))
+		require.NoError(t, r.SetBundleID(ctx, []string{"m/a.mkv"}, hex64("e")))
+		got, err := r.BundleIDOf(ctx, "m/a.mkv")
+		require.NoError(t, err)
+		assert.Equal(t, hex64("e"), got)
+
+		now := time.Now()
+		bad, err := r.IsFailedBundle(ctx, hex64("e"), now.Add(-time.Hour))
+		require.NoError(t, err)
+		assert.False(t, bad)
+		require.NoError(t, r.RecordFailedBundle(ctx, hex64("e"), hex64("b"), now))
+		bad, err = r.IsFailedBundle(ctx, hex64("e"), now.Add(-time.Hour))
+		require.NoError(t, err)
+		assert.True(t, bad)
+		bad, err = r.IsFailedBundle(ctx, hex64("e"), now.Add(time.Hour))
+		require.NoError(t, err)
+		assert.False(t, bad, "an entry older than the window no longer counts")
+		require.NoError(t, r.PruneFailedBundles(ctx, now.Add(time.Hour)))
+		bad, _ = r.IsFailedBundle(ctx, hex64("e"), now.Add(-time.Hour))
+		assert.False(t, bad, "pruned")
+	})
+}

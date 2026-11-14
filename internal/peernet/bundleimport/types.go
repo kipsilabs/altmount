@@ -40,6 +40,9 @@ type Origin struct {
 	// Corroborators is how many distinct network ranges announced this very
 	// Bundle ID.
 	Corroborators int
+	// BundleID is the Bundle ID (64 hex) the bundle was fetched under; it keys
+	// the negative cache of layouts that failed local verification.
+	BundleID string
 }
 
 // Fetcher returns a bundle that is already hash- and ID-verified (bundle.Verify)
@@ -47,6 +50,30 @@ type Origin struct {
 // implemented by the peer network service and injected later.
 type Fetcher interface {
 	FetchBundle(ctx context.Context, releaseID string) (*bundle.Bundle, Origin, error)
+}
+
+// FetchOptions are the caller's requirements for the offers, applied before
+// any peer is contacted.
+type FetchOptions struct {
+	// AllowOpen says offers of the open network may be taken at all.
+	AllowOpen bool
+	// MinOpenCorroborators is how many distinct network ranges must announce an
+	// open-network offer's Bundle ID.
+	MinOpenCorroborators int
+}
+
+// OptionFetcher is optionally implemented by a Fetcher: it filters the offers
+// by the caller's requirements before dialing anything.
+type OptionFetcher interface {
+	FetchBundleWith(ctx context.Context, releaseID string, o FetchOptions) (*bundle.Bundle, Origin, error)
+}
+
+// BundleFailedReporter is optionally implemented by a BadBundleReporter: it is
+// told that a Bundle ID's layout failed local verification (an attributable
+// contradiction), so the same layout is skipped from every publisher for a
+// while.
+type BundleFailedReporter interface {
+	ReportFailedBundle(ctx context.Context, bundleID, releaseID string)
 }
 
 // BadBundleReporter is told when a publisher served a bundle whose release
@@ -141,6 +168,9 @@ type State interface {
 	ListByQueue(ctx context.Context, queueID int64) ([]database.PeernetBundleImport, error)
 	ListAfter(ctx context.Context, afterPath string, limit int) ([]database.PeernetBundleImport, error)
 	OrphanedHolds(ctx context.Context) ([]int64, error)
+	SetBundleID(ctx context.Context, paths []string, bundleID string) error
+	BundleIDOf(ctx context.Context, filePath string) (string, error)
+	SettledHolds(ctx context.Context) ([]int64, error)
 }
 
 // Announcement is what the ARRs are told about once every file of a bundle
@@ -171,6 +201,14 @@ type FailureHandler interface {
 	RemoveFailedFile(ctx context.Context, virtualPath string) error
 	// ReleaseHold lifts the hold of a queue item that no file refers to any more.
 	ReleaseHold(ctx context.Context, queueID int64) error
+}
+
+// Requeuer is optionally implemented by the FailureHandler. It puts the held
+// queue item of a fast-path import (one the user supplied an NZB for) back for
+// a normal import, with the peer fast path off for that item once, and reports
+// whether it did. A direct import has no NZB and is not requeueable (false).
+type Requeuer interface {
+	RequeueForNormalImport(ctx context.Context, queueID int64) (bool, error)
 }
 
 // Recorder creates the queue and history entries of a direct import (one with
@@ -224,6 +262,14 @@ const (
 	ReasonStructureInvalid  Reason = "structure_invalid"  // media structure check failed beyond the first bytes
 	ReasonForbiddenFile     Reason = "forbidden_file"     // a file a media server or the OS could act on
 	ReasonSidecarTooLarge   Reason = "sidecar_too_large"  // a subtitle or nfo over its size cap
+	// ReasonLayoutNotAllowedOpen: the open network only carries plain layouts.
+	ReasonLayoutNotAllowedOpen Reason = "layout_not_allowed_open"
+	// ReasonContainerNotVerifiable: the open network only carries media whose
+	// container has a real structural check.
+	ReasonContainerNotVerifiable Reason = "container_not_verifiable"
+	// ReasonTooManyTables: the layout has more segment tables than the yEnc
+	// sampling budget can cover at the minimum rate.
+	ReasonTooManyTables Reason = "too_many_tables"
 )
 
 // RejectError is the typed rejection Accept returns.
@@ -263,11 +309,14 @@ type Policy struct {
 	MediaProbeTimeout time.Duration
 	// AcceptTimeout bounds the whole of Accept.
 	AcceptTimeout time.Duration
-	// MaxYencSamples caps the articles whose yEnc headers are read, and
-	// YencRandomPerTable is how many random ones each segment table adds to the
-	// first and last.
-	MaxYencSamples     int
-	YencRandomPerTable int
+	// MaxYencSamples caps the articles whose yEnc headers are read, MaxYencBytes
+	// the declared bytes those reads cost (the pool reads whole articles) and
+	// YencTimeout the time of the whole sampling. Every segment table gets its
+	// first, last and at least one random interior article; a layout whose
+	// tables do not fit the cap at that rate is rejected, never left unsampled.
+	MaxYencSamples int
+	MaxYencBytes   int64
+	YencTimeout    time.Duration
 	// MaxMediaFiles caps the media files a bundle may write (each is verified).
 	MaxMediaFiles int
 	// MaxSidecars caps the small allow-listed files (subtitles, nfo) written.
@@ -280,17 +329,18 @@ type Policy struct {
 // DefaultPolicy returns the default local limits.
 func DefaultPolicy() Policy {
 	return Policy{
-		MaxTotalSize:       int64(2) << 40, // 2 TiB
-		MaxFiles:           2_000,
-		MaxMediaProbes:     4,
-		MediaProbeTimeout:  30 * time.Second,
-		AcceptTimeout:      2 * time.Minute,
-		MaxYencSamples:     24,
-		YencRandomPerTable: 2,
-		MaxMediaFiles:      40,
-		MaxSidecars:        50,
-		MaxSubtitleBytes:   16 << 20,
-		MaxNfoBytes:        1 << 20,
+		MaxTotalSize:      int64(2) << 40, // 2 TiB
+		MaxFiles:          2_000,
+		MaxMediaProbes:    4,
+		MediaProbeTimeout: 30 * time.Second,
+		AcceptTimeout:     2 * time.Minute,
+		MaxYencSamples:    600,
+		MaxYencBytes:      512 << 20,
+		YencTimeout:       90 * time.Second,
+		MaxMediaFiles:     40,
+		MaxSidecars:       50,
+		MaxSubtitleBytes:  16 << 20,
+		MaxNfoBytes:       1 << 20,
 	}
 }
 
@@ -345,6 +395,11 @@ type Request struct {
 	// percent above decoded ones, so they only bound the bundle's declared
 	// decoded sizes; they cannot prove them.
 	ExpectedNZBSizes [][]int64
+	// ExpectedNZBNames, when set with ExpectedNZB, is the subject file name of
+	// every NZB entry ("" when its subject has none). The first sampled
+	// article of a table must carry the same yEnc name as its NZB entry, which
+	// binds the table to that entry.
+	ExpectedNZBNames []string
 }
 
 // Result describes an accepted bundle.
@@ -402,17 +457,23 @@ func (c *counters) snapshot() Counters {
 		FullCheckFailed: c.failed, Announced: c.announce, BadBundleReports: c.reports}
 }
 
-// YencSamples and YencRandom return the sampling bounds with defaults.
+// YencSamples returns the sampling bound with its default.
 func (p Policy) YencSamples() int {
 	return defaultInt(p.MaxYencSamples, DefaultPolicy().MaxYencSamples)
 }
 
-func (p Policy) YencRandom() int {
-	if p.YencRandomPerTable < 0 {
-		return 0
+// YencBytes is the byte budget of the yEnc sampling.
+func (p Policy) YencBytes() int64 {
+	if p.MaxYencBytes <= 0 {
+		return DefaultPolicy().MaxYencBytes
 	}
-	if p.YencRandomPerTable == 0 {
-		return DefaultPolicy().YencRandomPerTable
+	return p.MaxYencBytes
+}
+
+// YencTimeoutOrDefault is the time budget of the yEnc sampling.
+func (p Policy) YencTimeoutOrDefault() time.Duration {
+	if p.YencTimeout <= 0 {
+		return DefaultPolicy().YencTimeout
 	}
-	return p.YencRandomPerTable
+	return p.YencTimeout
 }

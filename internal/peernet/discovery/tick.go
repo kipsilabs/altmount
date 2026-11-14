@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -317,6 +318,11 @@ func (s *Service) contact(ctx context.Context, nc NetworkConfig, p database.Peer
 			promote = addr
 		}
 		serr := s.cfg.Store.RecordSuccess(sctx, p.NetworkID, p.NodeID, promote, now, now.Add(s.limits.RefreshInterval))
+		s.contactErrs.Delete(p.NetworkID + "|" + p.NodeID)
+		if ip, ok := s.connIPs.LoadAndDelete(p.NodeID); ok && serr == nil {
+			// The IP the verified handshake really reached, for corroboration.
+			serr = s.cfg.Store.RecordConnectedIP(sctx, p.NetworkID, p.NodeID, ip.(string))
+		}
 		s.logChange(ctx, s.problemKey("record success", nc), serr)
 		return learned, serr
 	}
@@ -326,6 +332,14 @@ func (s *Service) contact(ctx context.Context, nc NetworkConfig, p database.Peer
 	if p.Source == database.PeernetSourceUser && errors.Is(err, transport.ErrNodeIDMismatch) {
 		s.flagChanged(sctx, nc, p)
 	}
+	// Remember why, so the status can show it (the text is bounded and holds no
+	// secret: it names the address the user or the network gave us).
+	s.contactErrs.Store(p.NetworkID+"|"+p.NodeID, truncate(strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return ' '
+		}
+		return r
+	}, err.Error()), 200))
 	_, ferr := s.cfg.Store.RecordFailure(sctx, p.NetworkID, p.NodeID, now, s.backoffFor(p))
 	s.logChange(ctx, s.problemKey("record failure", nc), ferr)
 	return learned, err

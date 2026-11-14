@@ -2,8 +2,12 @@ package bundle
 
 import (
 	"bytes"
+	"context"
 	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/kipsilabs/altmount/internal/peernet/contentid"
 )
@@ -156,32 +160,6 @@ func rebuildPoolDropping(t testing.TB, b *Bundle) *Bundle {
 	return n
 }
 
-func TestVerifyWithCustomFilesReleaseID(t *testing.T) {
-	b := goodBundle(t)
-	custom := contentid.ID{7, 7, 7}
-	b.ReleaseID = custom
-	wire, id := pack(t, b)
-	called := 0
-	opts := Options{FilesReleaseID: func(ids []contentid.ID) contentid.ID {
-		called++
-		if len(ids) != len(b.Files) {
-			t.Errorf("got %d ids", len(ids))
-		}
-		for i := 1; i < len(ids); i++ {
-			if bytes.Compare(ids[i-1][:], ids[i][:]) >= 0 {
-				t.Error("ids not sorted ascending")
-			}
-		}
-		return custom
-	}}
-	if _, err := VerifyWith(wire, id, custom, opts); err != nil || called != 1 {
-		t.Fatalf("err %v called %d", err, called)
-	}
-	if _, err := Verify(wire, id, custom); !errors.Is(err, ErrReleaseIDMismatch) {
-		t.Fatalf("default function must not accept the custom id: %v", err)
-	}
-}
-
 func TestFilesReleaseID(t *testing.T) {
 	ids := []contentid.ID{{3}, {1}, {2}}
 	want := testFilesRelease(ids)
@@ -199,10 +177,10 @@ func TestFilesReleaseID(t *testing.T) {
 func TestVerifyCanonical(t *testing.T) {
 	b := goodNZBBundle(t)
 	raw := mustEncode(t, b)
-	if _, err := VerifyCanonical(raw, ComputeID(raw), b.ReleaseID, Options{}); err != nil {
+	if _, err := VerifyCanonical(raw, ComputeID(raw), b.ReleaseID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := VerifyCanonical(raw, BundleID{}, b.ReleaseID, Options{}); !errors.Is(err, ErrBundleIDMismatch) {
+	if _, err := VerifyCanonical(raw, BundleID{}, b.ReleaseID); !errors.Is(err, ErrBundleIDMismatch) {
 		t.Fatal(err)
 	}
 }
@@ -216,5 +194,51 @@ func TestVerifyNZBSchemeRecomputesTheFullList(t *testing.T) {
 	wire, id := pack(t, trimmed)
 	if _, err := Verify(wire, id, b.ReleaseID); !errors.Is(err, ErrReleaseIDMismatch) {
 		t.Fatalf("got %v", err)
+	}
+}
+
+// Verifying decodes tens of MB at its peak, so only one bundle is verified at a
+// time node-wide; waiters respect their context.
+func TestVerifyIsSerialisedNodeWide(t *testing.T) {
+	b := goodBundle(t)
+	wire, id := pack(t, b)
+	var cur, peak atomic.Int32
+	verifyEnterHook = func() func() {
+		n := cur.Add(1)
+		for {
+			p := peak.Load()
+			if n <= p || peak.CompareAndSwap(p, n) {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+		return func() { cur.Add(-1) }
+	}
+	t.Cleanup(func() { verifyEnterHook = nil })
+	var wg sync.WaitGroup
+	for range 6 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := Verify(wire, id, b.ReleaseID); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	wg.Wait()
+	if peak.Load() != 1 {
+		t.Fatalf("%d bundles were verified at once, want 1", peak.Load())
+	}
+}
+
+func TestVerifyWaitersRespectTheirContext(t *testing.T) {
+	b := goodBundle(t)
+	wire, id := pack(t, b)
+	verifySlot <- struct{}{} // another verification is running
+	defer func() { <-verifySlot }()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	if _, err := VerifyContext(ctx, wire, id, b.ReleaseID); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("want the context error, got %v", err)
 	}
 }

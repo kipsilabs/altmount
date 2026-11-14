@@ -49,7 +49,11 @@ func (a *fakeAnnouncer) AnnounceVerifiedImport(_ context.Context, an Announcemen
 	return nil
 }
 
-type fakeReporter struct{ got, verified []string }
+type fakeReporter struct{ got, verified, failedBundles []string }
+
+func (r *fakeReporter) ReportFailedBundle(_ context.Context, bundleID, release string) {
+	r.failedBundles = append(r.failedBundles, bundleID+"/"+release)
+}
 
 func (r *fakeReporter) ReportVerifiedBundle(_ context.Context, o Origin, release string) {
 	r.verified = append(r.verified, o.PublisherID+"/"+release)
@@ -128,9 +132,7 @@ func mkvPlain(size int) []byte {
 	out = append(out, append(append([]byte{}, info...), 0x84, 0, 0, 0, 0)...)
 	fill := size - len(out) - 6 - 9
 	out = append(out, 0x1F, 0x43, 0xB6, 0x75, byte(0x40|fill>>8), byte(fill))
-	for k := 0; k < fill; k++ {
-		out = append(out, byte((k*7+13)%251))
-	}
+	out = append(out, simpleBlocks(fill)...) // a real Cluster body: SimpleBlocks
 	out = append(out, append(append([]byte{}, cues...), 0x84, 0, 0, 0, 0)...)
 	return out
 }
@@ -553,4 +555,30 @@ func TestAccept_ResultCarriesFileSizesInPathOrder(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, meta.FileSize, res.Sizes[n], p)
 	}
+}
+
+// Open network: only plain layouts are accepted (no outer sources, extents,
+// AES key or clips); a private network keeps accepting them.
+func TestAccept_OpenNetworkRejectsEncryptedLayout(t *testing.T) {
+	e := newEnv(t)
+	b := e.mkBundle("openaes", fileSpec{name: "movie.mkv", plain: mkvPlain(512), segSize: 128, key: testKey})
+	req := e.req(b)
+	req.Origin.Open = true
+	_, err := e.imp.Accept(context.Background(), req)
+	require.Error(t, err)
+	assert.Equal(t, ReasonLayoutNotAllowedOpen, ReasonOf(err), "%v", err)
+	e.assertNothingBehind()
+
+	req.Origin.Open = false
+	_, err = e.imp.Accept(context.Background(), req)
+	require.NoError(t, err, "a private network may still carry encrypted layouts")
+}
+
+func TestAccept_OpenNetworkAcceptsPlainLayout(t *testing.T) {
+	e := newEnv(t)
+	b := e.mkBundle("openplain", mkvSpec("movie.mkv"))
+	req := e.req(b)
+	req.Origin.Open = true
+	_, err := e.imp.Accept(context.Background(), req)
+	require.NoError(t, err)
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"net"
 	"net/http"
 	"sync"
 	"testing"
@@ -13,6 +14,7 @@ import (
 	metapb "github.com/kipsilabs/altmount/internal/metadata/proto"
 	"github.com/kipsilabs/altmount/internal/peernet/bundle"
 	"github.com/kipsilabs/altmount/internal/peernet/contentid"
+	"github.com/kipsilabs/altmount/internal/peernet/discovery"
 	"github.com/kipsilabs/altmount/internal/peernet/identity"
 	"github.com/kipsilabs/altmount/internal/peernet/netid"
 	"github.com/kipsilabs/altmount/internal/peernet/recsync"
@@ -365,7 +367,8 @@ func TestOffersPreferBundlesAnnouncedByMostDistinctNetworkRanges(t *testing.T) {
 	mk := func() identity.NodeID { k, _ := identity.GenerateKey(); return k.NodeID() }
 	announce := func(id identity.NodeID, addr, bundleID string, age time.Duration) {
 		e.book.known[id.String()] = true
-		e.book.peers[id] = recsync.Peer{NodeID: id, Address: addr, Trusted: true}
+		host, _, _ := net.SplitHostPort(addr)
+		e.book.peers[id] = recsync.Peer{NodeID: id, Address: addr, Trusted: true, ConnectedIP: host}
 		e.offers.rows = append(e.offers.rows, database.PeernetBundleOffer{NetworkID: nwA.String(), PublisherNodeID: id.String(),
 			BundleID: bundleID, ReleaseScheme: database.PeernetSchemeNZB, CreatedAt: time.Now().Add(-age), Source: database.PeernetRecordSourcePeer})
 	}
@@ -393,5 +396,209 @@ func TestOffersPreferBundlesAnnouncedByMostDistinctNetworkRanges(t *testing.T) {
 	}
 	if got[0].Publisher != a || got[1].Publisher != b {
 		t.Fatalf("the corroborated bundle must rank first, got %v then %v", got[0].Publisher, got[1].Publisher)
+	}
+}
+
+// Two DNS names for one server are one range, and a peer with no recorded
+// connected IP counts for nothing.
+func TestCorroborationKeysOnTheConnectedIPNotTheName(t *testing.T) {
+	e := newFetchEnv(t, FetchLimits{})
+	mk := func() identity.NodeID { k, _ := identity.GenerateKey(); return k.NodeID() }
+	x := e.built.ID.String()
+	add := func(id identity.NodeID, addr, ip string) {
+		e.book.known[id.String()] = true
+		e.book.peers[id] = recsync.Peer{NodeID: id, Address: addr, Trusted: true, ConnectedIP: ip}
+		e.offers.rows = append(e.offers.rows, database.PeernetBundleOffer{NetworkID: nwA.String(), PublisherNodeID: id.String(),
+			BundleID: x, ReleaseScheme: database.PeernetSchemeNZB, CreatedAt: time.Now(), Source: database.PeernetRecordSourcePeer})
+	}
+	a, b, c := mk(), mk(), mk()
+	add(a, "one.example.org:8470", "198.51.100.7")
+	add(b, "two.example.org:8470", "198.51.100.88") // same /24 under another name
+	add(c, "three.example.org:8470", "")            // never recorded
+	got, err := e.f.Offers(context.Background(), e.rel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, o := range got {
+		if o.Corroborators != 1 {
+			t.Fatalf("%v: %d ranges, want 1 (two names, one /24; a peer without a connected IP counts nothing)", o.Publisher, o.Corroborators)
+		}
+	}
+}
+
+// An attestation from a node that is not a known peer must not rank an offer.
+func TestAttestersMustBeKnown(t *testing.T) {
+	e := newFetchEnv(t, FetchLimits{})
+	mk := func() identity.NodeID { k, _ := identity.GenerateKey(); return k.NodeID() }
+	pub, stranger := mk(), mk()
+	e.book.known[pub.String()] = true
+	e.book.peers[pub] = recsync.Peer{NodeID: pub, Address: "10.1.1.1:8470", Trusted: true, ConnectedIP: "10.1.1.1"}
+	e.offers.rows = append(e.offers.rows, database.PeernetBundleOffer{NetworkID: nwA.String(), PublisherNodeID: pub.String(),
+		BundleID: e.built.ID.String(), ReleaseScheme: database.PeernetSchemeNZB, CreatedAt: time.Now(), Source: database.PeernetRecordSourcePeer})
+	e.offers.atts = []database.PeernetAttestation{{PublisherNodeID: stranger.String(), Healthy: true}}
+	got, err := e.f.Offers(context.Background(), e.rel)
+	if err != nil || len(got) != 1 {
+		t.Fatalf("%v %v", got, err)
+	}
+	if got[0].AttestedHealthy {
+		t.Fatal("an unknown node's attestation must not count")
+	}
+	e.book.known[stranger.String()] = true
+	if got, _ = e.f.Offers(context.Background(), e.rel); !got[0].AttestedHealthy {
+		t.Fatal("control: a known attester counts")
+	}
+}
+
+type openRecv struct{}
+
+func (openRecv) ReceivingNetworks() []recsync.NetworkInfo {
+	return []recsync.NetworkInfo{{ID: netid.Open(), Level: 3}}
+}
+
+type failedSet map[string]bool
+
+func (f failedSet) IsFailedBundle(_ context.Context, id string) bool { return f[id] }
+
+// The caller's requirements filter the offers BEFORE anything is dialled: an
+// open-network offer the caller will not take is never contacted (the contact
+// itself reveals the Release ID).
+func TestFetchWithFiltersOffersBeforeDialing(t *testing.T) {
+	e := newFetchEnv(t, FetchLimits{})
+	e.f.cfg.Networks = openRecv{}
+	var hits int
+	var mu sync.Mutex
+	addr, id := hostile(t, func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hits++
+		mu.Unlock()
+		w.Header().Set("Content-Length", itoa(len(e.built.Wire)))
+		_, _ = w.Write(e.built.Wire)
+	})
+	e.book.known[id.String()] = true
+	e.book.peers[id] = recsync.Peer{NodeID: id, Address: addr, Trusted: true, ConnectedIP: "127.0.0.1"}
+	e.offers.rows = append(e.offers.rows, database.PeernetBundleOffer{NetworkID: netid.Open().String(), PublisherNodeID: id.String(),
+		BundleID: e.built.ID.String(), ReleaseScheme: database.PeernetSchemeNZB, CreatedAt: time.Now(), Source: database.PeernetRecordSourcePeer})
+	ctx := context.Background()
+
+	for name, opts := range map[string]FetchOptions{
+		"open not allowed":           {Restrict: true},
+		"one corroborator, two need": {Restrict: true, AllowOpen: true, MinOpenCorroborators: 2},
+	} {
+		if _, _, err := e.f.FetchWith(ctx, e.rel, opts); !errors.Is(err, ErrNoOffers) {
+			t.Fatalf("%s: want ErrNoOffers, got %v", name, err)
+		}
+		mu.Lock()
+		n := hits
+		mu.Unlock()
+		if n != 0 {
+			t.Fatalf("%s: the peer was dialled %d times", name, n)
+		}
+	}
+	if _, _, err := e.f.FetchWith(ctx, e.rel, FetchOptions{Restrict: true, AllowOpen: true, MinOpenCorroborators: 1}); err != nil {
+		t.Fatalf("control: %v", err)
+	}
+}
+
+// A Bundle ID that failed local verification is skipped, whoever offers it.
+func TestFetchSkipsBundlesOnTheNegativeCache(t *testing.T) {
+	e := newFetchEnv(t, FetchLimits{})
+	var hits int
+	var mu sync.Mutex
+	addr, id := hostile(t, func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hits++
+		mu.Unlock()
+		w.Header().Set("Content-Length", itoa(len(e.built.Wire)))
+		_, _ = w.Write(e.built.Wire)
+	})
+	e.publisher(addr, id, time.Hour)
+	e.f.cfg.Failed = failedSet{e.built.ID.String(): true}
+	if _, _, err := e.f.Fetch(context.Background(), e.rel); !errors.Is(err, ErrNoOffers) {
+		t.Fatalf("want ErrNoOffers, got %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if hits != 0 {
+		t.Fatalf("dialled %d times", hits)
+	}
+}
+
+// A publisher that lowered its level or excluded the release answers with the
+// deliberately undecorated 403, which a membership-checking authoriser cannot
+// tell from a non-member. It must count as a plain refusal ("refused"), back
+// off that bundle only for a short while, and never as the publisher's fault.
+type undecoratedRefusalAuth struct{ discovery.AllowAll }
+
+func (undecoratedRefusalAuth) VerifyResponse(_ context.Context, _ netid.NetworkID, _ identity.NodeID, status int, _ http.Header) error {
+	if status == http.StatusForbidden {
+		return errors.New("response is not decorated")
+	}
+	return nil
+}
+
+func TestFetchUndecoratedRefusalIsNeutralAndOnlyBacksOffThatBundle(t *testing.T) {
+	e := newFetchEnv(t, FetchLimits{})
+	e.f.cfg.Auth = undecoratedRefusalAuth{}
+	refuse := true
+	var mu sync.Mutex
+	addr, id := hostile(t, func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		if refuse {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		w.Header().Set("Content-Length", itoa(len(e.built.Wire)))
+		_, _ = w.Write(e.built.Wire)
+	})
+	e.publisher(addr, id, time.Hour)
+	now := time.Now()
+	e.f.cfg.Now = func() time.Time { return now }
+	if _, _, err := e.f.Fetch(context.Background(), e.rel); err == nil {
+		t.Fatal("the refusal must fail the fetch")
+	}
+	st := e.f.Status()
+	if st.Failed[failMembership] != 0 || st.Failed[failRefused] != 1 {
+		t.Fatalf("an undecorated refusal is 'refused', not 'membership': %+v", st.Failed)
+	}
+	if st.BackedOff != 0 {
+		t.Fatalf("the publisher must not be struck: %+v", st)
+	}
+	// The same bundle is skipped for the short soft back-off only.
+	if _, _, err := e.f.Fetch(context.Background(), e.rel); !errors.Is(err, ErrNoOffers) {
+		t.Fatalf("the refused bundle is skipped briefly: %v", err)
+	}
+	mu.Lock()
+	refuse = false
+	mu.Unlock()
+	now = now.Add(e.f.lim.SoftBackoff + time.Second)
+	if _, _, err := e.f.Fetch(context.Background(), e.rel); err != nil {
+		t.Fatalf("the publisher returned to serving: %v", err)
+	}
+}
+
+// A per-publisher limit and a publisher back-off are not "no offer".
+func TestFetchReportsPublisherLimitAndBackOffAsTheirOwnErrors(t *testing.T) {
+	e := newFetchEnv(t, FetchLimits{PerPublisherPerHour: 1, PerPublisherBurst: 1})
+	addr, id := honest(t, e)
+	e.publisher(addr, id, time.Hour)
+	if _, _, err := e.f.Fetch(context.Background(), e.rel); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := e.f.Fetch(context.Background(), e.rel)
+	if !errors.Is(err, ErrRateLimited) {
+		t.Fatalf("a per-publisher limit must be ErrRateLimited, got %v", err)
+	}
+	if e.f.Status().RateLimited != 1 {
+		t.Fatalf("fetch_rate_limited stays %d", e.f.Status().RateLimited)
+	}
+
+	e2 := newFetchEnv(t, FetchLimits{})
+	addr2, id2 := honest(t, e2)
+	e2.publisher(addr2, id2, time.Hour)
+	e2.f.ReportBadBundle(nwA, id2)
+	_, _, err = e2.f.Fetch(context.Background(), e2.rel)
+	if !errors.Is(err, ErrBackedOff) || !errors.Is(err, ErrNoOffers) {
+		t.Fatalf("a backed-off publisher is ErrBackedOff (still an ErrNoOffers): %v", err)
 	}
 }

@@ -58,7 +58,16 @@ func (o *PathObserver) FileWritten(ctx context.Context, path string) {
 		delete(o.stash, id.String())
 	}
 	o.mu.Unlock()
-	if !ok || s.path == path {
+	if !ok {
+		return
+	}
+	if s.path == path {
+		// Deleted and written again at the same path: something other than a
+		// rename wrote it (a normal import of the same content, or the user).
+		// It must not inherit the pending state: the peer import ends cleanly,
+		// its hold is released and the file is an ordinary one.
+		_ = o.i.cfg.State.Delete(ctx, []string{path})
+		o.i.releaseOrphanHolds(ctx)
 		return
 	}
 	if _, err := o.i.cfg.State.MoveFile(ctx, s.path, path); err != nil {

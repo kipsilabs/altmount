@@ -5,6 +5,7 @@ import (
 	"log/slog"
 
 	"github.com/kipsilabs/altmount/internal/database"
+	"github.com/kipsilabs/altmount/internal/holes"
 )
 
 // PeerBundleGate is what the health worker needs to know about imports that
@@ -34,15 +35,34 @@ type PeerBundleGate interface {
 	FullCheckFailed(ctx context.Context, filePath string)
 }
 
+// PeerBundleDegradedGate is optionally implemented by a gate that wants to hear
+// about a degraded verdict (the file would play with a few missing segments)
+// separately from other failures. A pending peer import never ends degraded: it
+// fails at once, and an implementation that does not implement this interface
+// simply sees FullCheckFailed.
+type PeerBundleDegradedGate interface {
+	FullCheckDegraded(ctx context.Context, filePath string)
+}
+
 type peerBundleGateHolder struct{ g PeerBundleGate }
 
 // SetPeerBundleGate installs (or, with nil, removes) the gate. Safe at any time.
+//
+// A gate that also implements PeerHeaderVerifier gets the header sample of the
+// forced full check; removing the gate removes the verifier.
 func (hw *HealthWorker) SetPeerBundleGate(g PeerBundleGate) {
 	if g == nil {
 		hw.peerBundleGate.Store(nil)
+		if hw.healthChecker != nil {
+			hw.healthChecker.SetPeerHeaderVerifier(nil)
+		}
 		return
 	}
 	hw.peerBundleGate.Store(&peerBundleGateHolder{g: g})
+	if hw.healthChecker != nil {
+		v, _ := g.(PeerHeaderVerifier)
+		hw.healthChecker.SetPeerHeaderVerifier(v)
+	}
 }
 
 // pendingPeerBundles returns which paths owe a full check; nil with no gate.
@@ -83,8 +103,15 @@ func (hw *HealthWorker) notifyPeerBundleResults(ctx context.Context, pending map
 		switch {
 		case u.Type == database.UpdateTypeHealthy && ev.Type == EventTypeFileHealthy:
 			h.g.FullCheckPassed(ctx, u.FilePath)
-		case ev.Type == EventTypeFileCorrupted && u.Type != database.UpdateTypeRetry &&
+		case (ev.Type == EventTypeFileCorrupted || ev.Type == EventTypeCheckFailed) && u.Type != database.UpdateTypeRetry &&
 			u.Type != database.UpdateTypeInconclusive && u.Type != database.UpdateTypeDeferred && !u.Skip:
+			// A check that failed outright and ended as a corrupted status is
+			// a verdict like any other; a degraded one (playable with a few
+			// missing segments) is told apart so the fast path can fall back.
+			if g, ok := h.g.(PeerBundleDegradedGate); ok && ev.Classification != nil && ev.Classification.Verdict == holes.VerdictDegraded {
+				g.FullCheckDegraded(ctx, u.FilePath)
+				continue
+			}
 			h.g.FullCheckFailed(ctx, u.FilePath)
 		}
 	}
