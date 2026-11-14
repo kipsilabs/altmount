@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -51,6 +52,7 @@ type fakeStore struct {
 	lastLimit  int
 	lastNets   []string
 	lastSeason *int
+	lastFiles  []string
 }
 
 func newStore() *fakeStore {
@@ -71,6 +73,35 @@ func (s *fakeStore) AttestationsFor(_ context.Context, nw, rel, _ string, _ time
 		return nil, s.err
 	}
 	return append([]database.PeernetAttestation(nil), s.atts[nw+"|"+rel]...), nil
+}
+
+// AttestationsForFiles matches by file across every release key of the
+// network, like the real store; freshness is left to the advisor.
+func (s *fakeStore) AttestationsForFiles(_ context.Context, nw string, files []string, _ time.Time) ([]database.PeernetAttestation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls["att"]++
+	s.lastFiles = append([]string(nil), files...)
+	if s.err != nil {
+		return nil, s.err
+	}
+	want := map[string]bool{}
+	for _, f := range files {
+		want[f] = true
+	}
+	var out []database.PeernetAttestation
+	for k, list := range s.atts {
+		if len(k) < len(nw)+1 || k[:len(nw)+1] != nw+"|" {
+			continue
+		}
+		for _, a := range list {
+			if want[a.FileID] {
+				out = append(out, a)
+			}
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].PublisherNodeID < out[j].PublisherNodeID })
+	return out, nil
 }
 
 func (s *fakeStore) HealthSummaryForReleases(_ context.Context, nw string, ids []string, notBefore time.Time) (map[string]database.PeernetHealthSummary, error) {
@@ -523,6 +554,7 @@ func TestManyIdentitiesCannotRaiseTheRecheckBudget(t *testing.T) {
 	granted := 0
 	for f := 0; f < 40; f++ {
 		rel := hexID(byte(100 + f))
+		file := hexID(byte(100 + f)) // evidence is per file: forty distinct files
 		for i := 0; i < 50; i++ {
 			nw := openNet
 			if i%2 == 0 {
@@ -593,6 +625,7 @@ func TestBudgetIsSharedAcrossFiles(t *testing.T) {
 	e.minC = 1
 	for i := 0; i < 5; i++ {
 		rel := hexID(byte(10 + i))
+		file := hexID(byte(10 + i)) // evidence is per file: five distinct files
 		e.peers.first[node(i)] = e.now.Add(-7 * 24 * time.Hour)
 		e.store.add(openNet, rel, database.PeernetAttestation{
 			PublisherNodeID: node(i), FileID: file, Healthy: false, Backbones: []string{"omicron"},
@@ -601,6 +634,7 @@ func TestBudgetIsSharedAcrossFiles(t *testing.T) {
 	}
 	n := 0
 	for i := 0; i < 5; i++ {
+		file := hexID(byte(10 + i))
 		adv, _ := e.a.HealthAdvice(context.Background(), hexID(byte(10+i)), file, []string{"omicron"}, e.now)
 		if adv.Kind == AdviceRecheckSooner && e.a.SpendRecheck(hexID(byte(10+i)), file, adv.EvidenceAt, e.now) {
 			n++
@@ -610,8 +644,8 @@ func TestBudgetIsSharedAcrossFiles(t *testing.T) {
 		t.Fatalf("%d", n)
 	}
 	e.now = e.now.Add(21 * time.Minute) // 3/hour refills one token every 20 minutes
-	adv, _ := e.a.HealthAdvice(context.Background(), hexID(14), file, []string{"omicron"}, e.now)
-	if adv.Kind != AdviceRecheckSooner || !e.a.SpendRecheck(hexID(14), file, adv.EvidenceAt, e.now) {
+	adv, _ := e.a.HealthAdvice(context.Background(), hexID(14), hexID(14), []string{"omicron"}, e.now)
+	if adv.Kind != AdviceRecheckSooner || !e.a.SpendRecheck(hexID(14), hexID(14), adv.EvidenceAt, e.now) {
 		t.Fatalf("budget did not refill: %+v", adv)
 	}
 }

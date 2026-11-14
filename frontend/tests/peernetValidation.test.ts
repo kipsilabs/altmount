@@ -151,6 +151,18 @@ describe("addTag", () => {
 	});
 });
 
+describe("open network fast path switch", () => {
+	test("defaults to off and only a literal true turns it on", () => {
+		expect(normalizePeernetConfig(undefined).open_network.fast_path).toBe(false);
+		const on = normalizePeernetConfig({ open_network: { level: 1, peers: [], fast_path: true } });
+		expect(on.open_network.fast_path).toBe(true);
+		const odd = normalizePeernetConfig({
+			open_network: { level: 1, peers: [], fast_path: "yes" as unknown as boolean },
+		});
+		expect(odd.open_network.fast_path).toBe(false);
+	});
+});
+
 describe("normalizePeernetConfig / validatePeernetConfig", () => {
 	test("fills defaults and is valid", () => {
 		const cfg = normalizePeernetConfig(undefined);

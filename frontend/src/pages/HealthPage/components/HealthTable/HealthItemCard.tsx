@@ -9,6 +9,7 @@ import {
 	Wrench,
 } from "lucide-react";
 import { memo, useMemo, useState } from "react";
+import { PeerBadge } from "../../../../components/ui/PeerBadge";
 import { HealthBadge } from "../../../../components/ui/StatusBadge";
 import {
 	formatFutureTime,
@@ -146,6 +147,10 @@ export const HealthItemCard = memo(function HealthItemCard({
 
 						{/* Quick Info Pills */}
 						<div className="mt-2 flex flex-wrap gap-2">
+							<PeerBadge
+								origin={item.peer_origin}
+								fullCheckPending={item.peer_full_check_pending}
+							/>
 							<HealthBadge status={item.status} isMasked={item.is_masked} />
 							{playbackImpact && <PlaybackImpactBadge impact={playbackImpact} />}
 							{errorDetails && <PartialCheckBadge details={errorDetails} />}

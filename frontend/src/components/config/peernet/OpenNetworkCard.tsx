@@ -51,6 +51,24 @@ export function OpenNetworkCard({
 				</p>
 
 				<fieldset className="fieldset">
+					<legend className="fieldset-legend">Use offered layouts when importing</legend>
+					<label className="label cursor-pointer justify-start gap-3 whitespace-normal">
+						<input
+							type="checkbox"
+							className="checkbox"
+							aria-label="Use open-network layouts when importing an NZB"
+							checked={open.fast_path}
+							disabled={disabled}
+							onChange={(e) => onChange({ open_network: { ...open, fast_path: e.target.checked } })}
+						/>
+						<span className="label-text whitespace-normal">
+							Use layouts offered by open-network peers to skip archive analysis when you import an
+							NZB. The result is verified by sampling, not by full analysis.
+						</span>
+					</label>
+				</fieldset>
+
+				<fieldset className="fieldset">
 					<legend className="fieldset-legend">Minimum corroboration</legend>
 					<input
 						type="number"

@@ -64,15 +64,28 @@ func (o *Observer) FileWritten(ctx context.Context, virtualPath string) {
 
 // FileDeleted drops the index row of a removed or moved file.
 func (o *Observer) FileDeleted(ctx context.Context, virtualPath string) {
+	ref, had, _ := o.idx.repo.RefByPath(ctx, virtualPath)
 	if err := o.idx.repo.Delete(ctx, virtualPath); err != nil && !errors.Is(err, context.Canceled) {
 		o.logs.warn(ctx, "Peernet content index delete failed", virtualPath, err)
+		return
+	}
+	if had {
+		o.idx.noteRemoved(ref)
 	}
 }
 
 // DirectoryDeleted drops every index row beneath a removed directory.
 func (o *Observer) DirectoryDeleted(ctx context.Context, virtualPath string) {
+	refs, _ := o.idx.repo.RefsByPrefix(ctx, virtualPath, maxDirRefs)
 	if err := o.idx.repo.DeleteByPrefix(ctx, virtualPath); err != nil && !errors.Is(err, context.Canceled) {
 		o.logs.warn(ctx, "Peernet content index directory delete failed", virtualPath, err)
+		return
+	}
+	if len(refs) >= maxDirRefs {
+		o.idx.markAllDirty() // too many to track one by one
+	}
+	for _, ref := range refs {
+		o.idx.noteRemoved(ref)
 	}
 }
 

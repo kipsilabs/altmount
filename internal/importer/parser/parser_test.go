@@ -3,6 +3,8 @@ package parser
 import (
 	"context"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -15,6 +17,7 @@ import (
 	"github.com/kipsilabs/altmount/internal/testsupport/segments"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 )
 
 func testConfigGetter() config.ConfigGetter {
@@ -364,4 +367,41 @@ func TestPropagateArchiveType_KeepsDirectMediaOutsideRar(t *testing.T) {
 	assert.False(t, parsed.Files[3].IsRarArchive, "direct MKV must be imported as a regular file")
 	assert.False(t, parsed.Files[4].IsRarArchive, "a sample MP4 is still direct media")
 	assert.True(t, parsed.Files[5].IsRarArchive, "RAR magic must take priority over a misleading media extension")
+}
+
+func TestExtractNzbPasswordOrigin(t *testing.T) {
+	cases := []struct {
+		name   string
+		n      *nzbparser.Nzb
+		path   string
+		pw     string
+		origin PasswordOrigin
+	}{
+		{"meta", &nzbparser.Nzb{Meta: map[string]string{"password": " pw1 "}}, "movie.nzb", "pw1", PasswordOriginMeta},
+		{"meta, other spelling", &nzbparser.Nzb{Meta: map[string]string{"PWD": "pw2"}}, "movie.nzb", "pw2", PasswordOriginMeta},
+		{"file name braces", &nzbparser.Nzb{}, "Movie{{pw3}}.nzb", "pw3", PasswordOriginName},
+		{"subject slash form", &nzbparser.Nzb{Files: []nzbparser.NzbFile{{Subject: "x yEnc /password:pw4"}}}, "movie.nzb", "pw4", PasswordOriginSubject},
+		{"subject", &nzbparser.Nzb{Files: []nzbparser.NzbFile{{Subject: "x yEnc {{pw5}}"}}}, "movie.nzb", "pw5", PasswordOriginSubject},
+		{"none", &nzbparser.Nzb{}, "movie.nzb", "", PasswordOriginNone},
+		{"meta wins over the name", &nzbparser.Nzb{Meta: map[string]string{"password": "m"}}, "Movie{{n}}.nzb", "m", PasswordOriginMeta},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			pw, origin := extractNzbPasswordWithOrigin(c.n, c.path)
+			assert.Equal(t, c.pw, pw)
+			assert.Equal(t, c.origin, origin)
+		})
+	}
+	// The on-disk NZB can hold a meta password outside the parsed head.
+	dir := t.TempDir()
+	p := filepath.Join(dir, "x.nzb")
+	require.NoError(t, os.WriteFile(p, []byte(`<nzb><meta type="password">ondisk</meta></nzb>`), 0o600))
+	pw, origin := extractNzbPasswordWithOrigin(&nzbparser.Nzb{}, p)
+	assert.Equal(t, "ondisk", pw)
+	assert.Equal(t, PasswordOriginMeta, origin)
+
+	parsed := &ParsedNzb{}
+	assert.Equal(t, PasswordOriginNone, parsed.PasswordOrigin())
+	parsed.SetPassword("x")
+	assert.Equal(t, PasswordOriginNone, parsed.PasswordOrigin(), "an origin is only reported for a password that was extracted")
 }

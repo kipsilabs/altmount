@@ -133,13 +133,21 @@ type peernetBackfillDTO struct {
 }
 
 // peernetLibraryDTO says how many library files can be shared: those with a
-// Release ID. The others were imported before the release's NZB was kept
-// (file_id_only) or could not be identified (not_indexable).
+// Release ID, either one from the release's NZB (with_nzb_release_id) or one
+// derived from the files of the import (with_derived_release_id, for imports
+// that predate the NZB store). The others (file_id_only) could not be grouped:
+// no_source_nzb, group_too_large or pending (the background pass has not
+// reached them yet), or could not be identified at all (not_indexable).
 type peernetLibraryDTO struct {
-	Files         int `json:"files"`
-	WithReleaseID int `json:"with_release_id"`
-	FileIDOnly    int `json:"file_id_only"`
-	NotIndexable  int `json:"not_indexable"`
+	Files                int `json:"files"`
+	WithReleaseID        int `json:"with_release_id"`
+	WithNZBReleaseID     int `json:"with_nzb_release_id"`
+	WithDerivedReleaseID int `json:"with_derived_release_id"`
+	FileIDOnly           int `json:"file_id_only"`
+	NotIndexable         int `json:"not_indexable"`
+	NoSourceNZB          int `json:"no_source_nzb"`
+	GroupTooLarge        int `json:"group_too_large"`
+	Pending              int `json:"pending"`
 }
 
 type peernetStatusDTO struct {
@@ -158,6 +166,63 @@ type peernetStatusDTO struct {
 	Library          peernetLibraryDTO   `json:"library"`
 	Publish          peernetPublishDTO   `json:"publish"`
 	Advice           peernetAdviceDTO    `json:"advice"`
+	Bundles          peernetBundlesDTO   `json:"bundles"`
+}
+
+// peernetBundlesDTO counts bundle building, serving, fetching and importing
+// since start. It holds no bundle content, path, name or address.
+type peernetBundlesDTO struct {
+	Built              int64            `json:"built"`
+	CacheHits          int64            `json:"cache_hits"`
+	BuildFailures      int64            `json:"build_failures"`
+	Cached             int              `json:"cached"`
+	CachedBytes        int              `json:"cached_bytes"`
+	Announced          int              `json:"announced"`
+	NotShareable       map[string]int64 `json:"not_shareable"`
+	Served             int64            `json:"served"`
+	ServedBytes        int64            `json:"served_bytes"`
+	ServeRefused       map[string]int64 `json:"serve_refused"`
+	Fetched            int64            `json:"fetched"`
+	FetchRateLimited   int64            `json:"fetch_rate_limited"`
+	FetchFailed        map[string]int64 `json:"fetch_failed"`
+	FetchBackedOff     int              `json:"fetch_backed_off"`
+	FullCheckReports   int64            `json:"full_check_reports"`
+	FullCheckBackedOff int              `json:"full_check_backed_off"`
+	Import             peernetImportDTO `json:"import"`
+}
+
+type peernetImportDTO struct {
+	Accepted         int64            `json:"accepted"`
+	AlreadyImported  int64            `json:"already_imported"`
+	Rejected         map[string]int64 `json:"rejected"`
+	FullCheckPassed  int64            `json:"full_check_passed"`
+	FullCheckFailed  int64            `json:"full_check_failed"`
+	Announced        int64            `json:"announced"`
+	BadBundleReports int64            `json:"bad_bundle_reports"`
+	Pending          int64            `json:"pending"`
+	Stale            int64            `json:"stale"`
+}
+
+func copyCounts(m map[string]int64) map[string]int64 {
+	out := make(map[string]int64, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+func toBundlesDTO(b service.BundleStatus) peernetBundlesDTO {
+	return peernetBundlesDTO{
+		Built: b.Built, CacheHits: b.CacheHits, BuildFailures: b.BuildFailures, Cached: b.Cached, CachedBytes: b.CachedBytes,
+		Announced: b.Announced, NotShareable: copyCounts(b.NotShareable), Served: b.Served, ServedBytes: b.ServedBytes,
+		ServeRefused: copyCounts(b.ServeRefused), Fetched: b.Fetched, FetchRateLimited: b.FetchRateLimited,
+		FetchFailed: copyCounts(b.FetchFailed), FetchBackedOff: b.FetchBackedOff,
+		FullCheckReports: b.FullCheckReports, FullCheckBackedOff: b.FullCheckBackedOff,
+		Import: peernetImportDTO{Accepted: b.Import.Accepted, AlreadyImported: b.Import.AlreadyImported,
+			Rejected: copyCounts(b.Import.Rejected), FullCheckPassed: b.Import.FullCheckPassed,
+			FullCheckFailed: b.Import.FullCheckFailed, Announced: b.Import.Announced, BadBundleReports: b.Import.BadBundleReports,
+			Pending: b.Import.Pending, Stale: b.Import.Stale},
+	}
 }
 
 // peernetPublishDTO counts what the publishing pipeline did since start. It
@@ -383,9 +448,12 @@ func (s *Server) handlePeernetStatus(c *fiber.Ctx) error {
 		Backfill: peernetBackfillDTO{Running: st.Backfill.Running, Scanned: st.Backfill.Scanned,
 			Indexed: st.Backfill.Indexed, Skipped: st.Backfill.Skipped},
 		Library: peernetLibraryDTO{Files: st.Library.Files, WithReleaseID: st.Library.WithReleaseID,
-			FileIDOnly: st.Library.FileIDOnly, NotIndexable: st.Library.NotIndexable},
+			WithNZBReleaseID: st.Library.WithNZBReleaseID, WithDerivedReleaseID: st.Library.WithDerivedReleaseID,
+			FileIDOnly: st.Library.FileIDOnly, NotIndexable: st.Library.NotIndexable, NoSourceNZB: st.Library.NoSourceNZB,
+			GroupTooLarge: st.Library.GroupTooLarge, Pending: st.Library.Pending},
 		Publish: toPublishDTO(st.Publish),
 		Advice:  toAdviceDTO(st.Advice),
+		Bundles: toBundlesDTO(st.Bundles),
 	}
 	for _, n := range st.Networks {
 		out.Networks = append(out.Networks, toNetworkDTO(n))

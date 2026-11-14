@@ -97,6 +97,9 @@ type MetadataService struct {
 	// renamed or deleted. nil disables notifications. Held atomically so it
 	// can be set and cleared while the service is in use.
 	observer atomic.Pointer[observerBox]
+	// secondary is a second, independent observer (the peer-bundle state keeps
+	// its rows consistent with deletes and renames). Same rules as observer.
+	secondary atomic.Pointer[observerBox]
 }
 
 // observerBox lets an interface value live in an atomic.Pointer.
@@ -104,10 +107,49 @@ type observerBox struct{ o FileObserver }
 
 // fileObserver returns the current observer, or nil.
 func (ms *MetadataService) fileObserver() FileObserver {
-	if b := ms.observer.Load(); b != nil {
-		return b.o
+	p, q := ms.observer.Load(), ms.secondary.Load()
+	switch {
+	case p != nil && q != nil:
+		return observerPair{p.o, q.o}
+	case p != nil:
+		return p.o
+	case q != nil:
+		return q.o
 	}
 	return nil
+}
+
+// observerPair forwards every notification to both observers.
+type observerPair struct{ a, b FileObserver }
+
+func (p observerPair) FileWritten(ctx context.Context, v string) {
+	p.a.FileWritten(ctx, v)
+	p.b.FileWritten(ctx, v)
+}
+
+func (p observerPair) FileDeleted(ctx context.Context, v string) {
+	p.a.FileDeleted(ctx, v)
+	p.b.FileDeleted(ctx, v)
+}
+
+func (p observerPair) DirectoryDeleted(ctx context.Context, v string) {
+	p.a.DirectoryDeleted(ctx, v)
+	p.b.DirectoryDeleted(ctx, v)
+}
+
+func (p observerPair) DirectoryRenamed(ctx context.Context, from, to string) {
+	p.a.DirectoryRenamed(ctx, from, to)
+	p.b.DirectoryRenamed(ctx, from, to)
+}
+
+// SetSecondaryFileObserver wires in a second observer next to SetFileObserver's.
+// Passing nil removes it.
+func (ms *MetadataService) SetSecondaryFileObserver(o FileObserver) {
+	if o == nil {
+		ms.secondary.Store(nil)
+		return
+	}
+	ms.secondary.Store(&observerBox{o: o})
 }
 
 // NewMetadataService creates a new metadata service

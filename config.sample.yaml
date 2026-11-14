@@ -322,6 +322,7 @@ peernet:
   open_network:
     level: 0 # 0 off, 1 receive only, 2 share metadata, 3 share bundles
     peers: [] # Peer addresses as host:port (no scheme, userinfo or path), max 64
+    fast_path: false # Use layouts offered by open-network peers to skip archive analysis when you import an NZB; verified by sampling, not full analysis (default: false; private networks always may)
   sharing:
     excluded_categories: [] # Releases in these categories are never published
     excluded_indexers: [] # Releases from these indexers are never published

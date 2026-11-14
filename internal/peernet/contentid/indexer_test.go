@@ -174,7 +174,7 @@ func TestObserver_FailureNeverFailsTheWrite(t *testing.T) {
 	require.NoError(t, f.ms.DeleteDirectory("rel"))
 }
 
-type failingRepo struct{}
+type failingRepo struct{ Repository }
 
 var errRepo = fmt.Errorf("repo down")
 
@@ -186,6 +186,15 @@ func (failingRepo) MissingPaths(context.Context, []string) ([]string, error) { r
 func (failingRepo) Delete(context.Context, string) error                     { return errRepo }
 func (failingRepo) DeleteByPrefix(context.Context, string) error             { return errRepo }
 func (failingRepo) RenamePrefix(context.Context, string, string) error       { return errRepo }
+func (failingRepo) GetByPath(context.Context, string) (database.PeernetContentEntry, bool, error) {
+	return database.PeernetContentEntry{}, false, errRepo
+}
+func (failingRepo) RefByPath(context.Context, string) (database.PeernetContentRef, bool, error) {
+	return database.PeernetContentRef{}, false, errRepo
+}
+func (failingRepo) RefsByPrefix(context.Context, string, int) ([]database.PeernetContentRef, error) {
+	return nil, errRepo
+}
 func (failingRepo) ListPage(context.Context, string, int) ([]database.PeernetContentEntry, error) {
 	return nil, errRepo
 }

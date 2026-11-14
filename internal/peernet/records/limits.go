@@ -7,6 +7,13 @@ import (
 
 // Limits. Several are design calls the owner may tune.
 const (
+	// SchemeNZB: the Release ID is the hash of the release's NZB segment list.
+	// It is the meaning of an absent release_scheme field.
+	SchemeNZB uint8 = 1
+	// SchemeFiles: the Release ID is derived from the release's File IDs (see
+	// contentid.ReleaseIDFromFiles). It is carried as release_scheme = 2.
+	SchemeFiles uint8 = 2
+
 	// SchemaVersion is the only version this package reads and writes.
 	SchemaVersion = 1
 

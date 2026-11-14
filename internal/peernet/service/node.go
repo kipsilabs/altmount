@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/kipsilabs/altmount/internal/database"
+	"github.com/kipsilabs/altmount/internal/peernet/bundlex"
 	"github.com/kipsilabs/altmount/internal/peernet/discovery"
 	"github.com/kipsilabs/altmount/internal/peernet/identity"
 	"github.com/kipsilabs/altmount/internal/peernet/membership"
@@ -48,6 +49,9 @@ type node struct {
 	disc      *discovery.Service
 	rx        *recsync.Exchange // nil when record storage is not configured
 	pipe      *pipeline         // nil when publishing is not configured
+	builder   *bundlex.Builder  // nil without a full-metadata source
+	bsrv      *bundlex.Server   // nil unless bundles can be served
+	fetcher   *bundlex.Fetcher  // nil when record storage is not configured
 	mem       *membership.Manager
 	kick      chan struct{} // wakes the discovery loop
 	maintKick chan struct{} // wakes the membership upkeep
@@ -141,10 +145,12 @@ func startNode(parent context.Context, deps Deps, s Settings) (*node, error) {
 		n.abort()
 		return nil, fmt.Errorf("start record exchange: %w", err)
 	}
+	n.startBuilder()
 	if err := n.startPublishing(); err != nil {
 		n.abort()
 		return nil, fmt.Errorf("start publishing: %w", err)
 	}
+	n.startBundleServe()
 	n.reconcileFn = n.disc.Reconcile
 	n.disc.AddSource(hostSource{mem: n.mem})
 	if s.AcceptIncoming {
@@ -253,6 +259,11 @@ func (n *node) registerRoutes(srv *transport.Server) error {
 	}
 	if n.rx != nil {
 		if err := n.rx.RegisterRoutes(srv); err != nil {
+			return err
+		}
+	}
+	if n.bsrv != nil {
+		if err := n.bsrv.RegisterRoutes(srv); err != nil {
 			return err
 		}
 	}

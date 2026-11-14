@@ -65,6 +65,7 @@ func (s *Service) Peers(ctx context.Context, network netid.NetworkID) ([]PeerSta
 			NodeID: p.NodeID, Address: p.Address, Source: statusSource(p.Source), Verified: p.Verified,
 			FirstSeen: p.FirstSeen, LastSuccess: p.LastSuccess, Failures: p.Failures,
 			NodeIDChanged: p.ChangedNodeID != "", ChangedNodeID: p.ChangedNodeID,
+			LastError: s.lastContactError(p.NetworkID, p.NodeID),
 		})
 	}
 	s.mu.Lock()
@@ -124,4 +125,13 @@ func (s *Service) Counts(ctx context.Context, network netid.NetworkID) (Counts, 
 	}
 	s.mu.Unlock()
 	return c, nil
+}
+
+// lastContactError is the text of the peer's last failed contact ("" after a
+// success or when it never failed since start).
+func (s *Service) lastContactError(network, node string) string {
+	if v, ok := s.contactErrs.Load(network + "|" + node); ok {
+		return v.(string)
+	}
+	return ""
 }

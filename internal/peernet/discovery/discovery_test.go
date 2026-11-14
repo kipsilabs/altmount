@@ -563,3 +563,48 @@ func TestExtraSourceCandidatesAreValidatedAndCapped(t *testing.T) {
 }
 
 var _ = transport.ErrInvalidAddress
+
+// A verified contact records the IP the node really connected to; that, and
+// not the stored address string, is what corroboration keys on.
+func TestContactRecordsTheConnectedIP(t *testing.T) {
+	a, b := newNode(t, nodeOpts{}), newNode(t, nodeOpts{})
+	a.seed(b.id, b.addr, database.PeernetSourceExchange, false)
+	if r := tick(a); r.Succeeded != 1 {
+		t.Fatalf("contact: %+v", r)
+	}
+	ip, err := a.store.ConnectedIP(context.Background(), testNet.String(), b.id.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ip != "127.0.0.1" {
+		t.Fatalf("connected ip %q, want the loopback address the test server listens on", ip)
+	}
+}
+
+// A peer that cannot be contacted shows why in the status, instead of an empty
+// last error while it backs off.
+func TestFailedContactSurfacesTheLastErrorInThePeerStatus(t *testing.T) {
+	a := newNode(t, nodeOpts{})
+	ghost := randID(t)
+	a.seed(ghost, "127.0.0.1:1", database.PeernetSourceExchange, false) // nothing listens there
+	tick(a)
+	peers, err := a.svc.Peers(context.Background(), testNet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got *PeerStatus
+	for i := range peers {
+		if peers[i].NodeID == ghost.String() {
+			got = &peers[i]
+		}
+	}
+	if got == nil || got.Failures == 0 {
+		t.Fatalf("the contact should have failed: %+v", peers)
+	}
+	if got.LastError == "" {
+		t.Fatal("the status must say why the peer is not connecting")
+	}
+	if len(got.LastError) > 200 {
+		t.Fatalf("error text is bounded: %d", len(got.LastError))
+	}
+}

@@ -287,6 +287,7 @@ func (i *Ingester) verifiedRow(nw netid.NetworkID, raw []byte, env records.Envel
 		NetworkID: nw.String(), ContentHash: hex.EncodeToString(env.ContentHash[:]),
 		ReleaseID: hex.EncodeToString(env.ReleaseID[:]), PublisherNodeID: env.PublisherID.String(),
 		CreatedAt: env.CreatedAt, ExpiresAt: env.ExpiresAt, Source: source, Payload: raw,
+		ReleaseScheme: int(env.ReleaseScheme),
 	}
 	switch env.Kind {
 	case records.KindRelease:
@@ -298,6 +299,9 @@ func (i *Ingester) verifiedRow(nw netid.NetworkID, raw []byte, env records.Envel
 			return row, err
 		}
 		row.Kind = database.PeernetRecordKindRelease
+		if r.BundleID != (records.BundleID{}) {
+			row.BundleID = hex.EncodeToString(r.BundleID[:])
+		}
 		row.Title, row.TotalSize, row.IMDbID = r.Title, r.TotalSize, r.Media.IMDb
 		row.Season, row.Episode = intPtr(r.Media.Season), intPtr(r.Media.Episode)
 	case records.KindAttestation:

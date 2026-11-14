@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/javi11/nntppool/v5"
@@ -54,8 +55,12 @@ type Processor struct {
 	log               *slog.Logger
 	broadcaster       *progress.ProgressBroadcaster // WebSocket progress broadcaster
 	recorder          HistoryRecorder
-	par2Repair        RepairEnqueuer        // optional; queues PAR2 repairs at import time
-	patchIndex        validation.PatchIndex // optional; locally repaired articles count as available
+	par2Repair        RepairEnqueuer                     // optional; queues PAR2 repairs at import time
+	patchIndex        validation.PatchIndex              // optional; locally repaired articles count as available
+	peerFastPath      atomic.Pointer[peerFastPathHolder] // optional; nil unless the peer network is on
+	pwRecorder        atomic.Pointer[nzbPasswordHolder]  // optional; nil unless the peer network is on
+	peerItems         sync.Map                           // queue id -> peerItemInfo
+	peerSkipOnce      sync.Map                           // queue id -> {}: skip the peer fast path once
 
 	// Pre-compiled regex patterns for RAR file sorting
 	rarPartPattern  *regexp.Regexp // pattern.part###.rar
@@ -1010,6 +1015,25 @@ func (proc *Processor) ProcessNzbFile(ctx context.Context, filePath, relativePat
 		if len(n.Files) == 0 {
 			return "", nil, NewNonRetryableError("NZB file contains no files", nil)
 		}
+		// Peer-bundle fast path (nil unless the peer network is on): with the
+		// NZB parsed and nothing else done, a verified bundle of this exact
+		// release can replace the probe, warm-up and archive analysis below.
+		// Any problem falls through to the normal import.
+		var prebuilt *prebuiltStore
+		if proc.peerFastPath.Load() != nil {
+			vd := ""
+			if virtualDirOverride != nil {
+				vd = *virtualDirOverride
+			} else {
+				vd = filesystem.CalculateVirtualDirectory(filePath, relativePath)
+			}
+			var result string
+			var written []string
+			var taken bool
+			if result, written, taken, prebuilt = proc.tryPeerBundle(ctx, n, filePath, queueID, vd, category, metadata, downloadID); taken {
+				return result, written, nil
+			}
+		}
 		// Resolution atomically replaces this path; release the original handle
 		// first so the replacement works on Windows as well.
 		if err := file.Close(); err != nil {
@@ -1028,7 +1052,8 @@ func (proc *Processor) ProcessNzbFile(ctx context.Context, filePath, relativePat
 			// bytes keep their offsets and the gaps are served as holes. Done
 			// before the fast-fail sweep so those known misses count without a
 			// STAT and before the store is built so they hold a store index.
-			if gaps := parser.InsertSegmentGapPlaceholders(n); gaps > 0 && proc.log != nil {
+			gaps := parser.InsertSegmentGapPlaceholders(n)
+			if gaps > 0 && proc.log != nil {
 				proc.log.InfoContext(ctx, "NZB omits articles; inserted gap placeholders",
 					"placeholders", gaps, "file_path", filePath)
 			}
@@ -1054,7 +1079,9 @@ func (proc *Processor) ProcessNzbFile(ctx context.Context, filePath, relativePat
 			// Trimmed here, not in the check: the warm-up reads n.Files until
 			// warmDone closes.
 			var pastEnd *articlesPastEndError
+			trimmed := false
 			if errors.As(fastFailErr, &pastEnd) {
+				trimmed = true
 				proc.parser.TrimArticles(ctx, n.Files, pastEnd.keep)
 				brokenIdx, missingIDs, degradedFiles, fastFailErr = proc.preParseFastFail(ctx, n, cfg, queueID, category, downloadID)
 			}
@@ -1074,10 +1101,18 @@ func (proc *Processor) ProcessNzbFile(ctx context.Context, filePath, relativePat
 			}
 
 			parseTracker := progress.NewTracker(proc.broadcaster, queueID, 2, 10)
-			parsed, err = proc.parser.ParseNzb(ctx, n, filePath, parseTracker, parser.ParseOptions{
+			parseOpts := parser.ParseOptions{
 				BrokenFileIndexes:      brokenIdx,
 				KnownMissingSegmentIDs: missingIDs,
-			})
+			}
+			// The store built for the peer lookup describes this NZB exactly
+			// unless gap placeholders were inserted into it (a nested NZB, parsed
+			// afresh below, never reuses it).
+			if prebuiltStillDescribes(prebuilt, gaps, trimmed) {
+				parseOpts.PrebuiltStore, parseOpts.PrebuiltIndex = prebuilt.store, prebuilt.index
+			}
+			prebuilt = nil
+			parsed, err = proc.parser.ParseNzb(ctx, n, filePath, parseTracker, parseOpts)
 			if err != nil {
 				return "", nil, NewNonRetryableError("failed to parse NZB file", err)
 			}
@@ -1343,6 +1378,7 @@ func (proc *Processor) ProcessNzbFile(ctx context.Context, filePath, relativePat
 		// release's recovery volumes are most likely still retrievable.
 		proc.persistKnownHoles(ctx, writtenPaths, degradedFiles, missingIDs, cfg.ProviderFingerprint())
 		proc.queueImportRepairs(ctx, repairOnImport(cfg, category, downloadID), writtenPaths, degradedFiles)
+		proc.recordNZBPassword(ctx, parsed, metadata, writtenPaths)
 		proc.updateProgress(queueID, 100)
 	} else if repairEnabled, hasPar2 := repairOnImport(cfg, category, downloadID), len(par2Files) > 0; shouldDeferCorruptArchive(err, repairEnabled, hasPar2) || shouldDeferMissingArchive(err, repairEnabled, hasPar2) {
 		// Corrupt-but-present articles, or an article the fast-fail probe's

@@ -124,7 +124,7 @@ func (f *pubFixture) seedFile(t *testing.T, mods ...func(*seed)) {
 	}
 	ctx := context.Background()
 	if s.release != "" || s.file != "" {
-		if err := f.content.Upsert(ctx, database.PeernetContentEntry{FilePath: s.path, FileID: s.file, ReleaseID: s.release}); err != nil {
+		if err := f.content.Upsert(ctx, database.PeernetContentEntry{FilePath: s.path, FileID: s.file, ReleaseID: s.release, ReleaseScheme: s.scheme}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -147,6 +147,8 @@ type seed struct {
 	sourceNzb, password                                                   string
 	size                                                                  int64
 	postDate                                                              time.Time
+	// scheme is the stored release scheme (0 means nzb when a release is set).
+	scheme int
 }
 
 func nullIfEmpty(s string) any {

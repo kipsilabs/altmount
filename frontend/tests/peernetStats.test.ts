@@ -1,14 +1,22 @@
 import { describe, expect, test } from "bun:test";
 import {
 	backboneHint,
+	bundleHasActivity,
 	describeBreakdown,
+	fetchFailLabel,
 	formatRelativeTime,
 	hasAnyPublishingLevel,
-	isLevelAvailable,
+	importRejectLabel,
+	levelNeedsConfirmation,
 	libraryShareLine,
+	notShareableLabel,
+	peerBadge,
 	publishedTotal,
 	rejectionLabel,
+	serveRefusedLabel,
 	showAdviceBlock,
+	showBundleServing,
+	showBundlesBlock,
 	showPublishingDetails,
 	showSharedData,
 	skipLabel,
@@ -17,6 +25,7 @@ import {
 	EXPOSURE_LEVELS,
 	levelPrivacyNotice,
 } from "../src/components/config/peernet/peernetValidation";
+import type { PeernetLibraryStatus } from "../src/types/peernet";
 
 // Every key the backend can emit (internal/peernet/recsync/reasons.go,
 // internal/peernet/publish and internal/peernet/service/publishing.go).
@@ -57,7 +66,146 @@ const BACKEND_SKIP_KEYS = [
 	"not_healthy",
 	"reduced_by_peer_advice",
 	"patch_status_unknown",
+	"peer_status_unknown",
+	"bundle_unavailable",
 ];
+
+// internal/peernet/bundle/build.go (ShareReason) and bundlex/builder.go.
+const BACKEND_NOT_SHAREABLE_KEYS = [
+	"rclone_encrypted",
+	"unsupported_encryption",
+	"password_not_from_nzb",
+	"healed_by_local_patch",
+	"known_holes",
+	"patch_status_unknown",
+	"no_nzb_segment_list",
+	"release_id_mismatch",
+	"invalid_metadata",
+	"too_large",
+	"no_post_date",
+	"no_files",
+	"self_check_failed",
+	"other",
+];
+// internal/peernet/bundlex/serve.go
+const BACKEND_SERVE_REFUSED_KEYS = [
+	"unauthenticated",
+	"level",
+	"denied",
+	"backed_off",
+	"rate_limited",
+	"busy",
+	"error",
+	"unknown_bundle",
+	"excluded",
+	"unavailable",
+	"byte_budget",
+	"aborted",
+];
+// internal/peernet/bundlex/fetch.go
+const BACKEND_FETCH_FAILED_KEYS = [
+	"refused",
+	"bad_status",
+	"transport",
+	"truncated",
+	"too_large",
+	"verification_failed",
+	"scheme_mismatch",
+	"membership",
+];
+// internal/peernet/bundleimport (Reason)
+const BACKEND_IMPORT_REJECT_KEYS = [
+	"invalid",
+	"bad_name",
+	"too_large",
+	"too_many_files",
+	"health_disabled",
+	"bad_target",
+	"nzb_mismatch",
+	"collision",
+	"probe_missing",
+	"probe_inconclusive",
+	"no_media_file",
+	"media_invalid",
+	"media_missing",
+	"media_inconclusive",
+	"staging_failed",
+	"write_failed",
+	"unavailable",
+	"no_network",
+	"forbidden_file",
+	"sidecar_too_large",
+	"size_implausible",
+	"yenc_mismatch",
+	"structure_invalid",
+	"layout_not_allowed_open",
+	"container_not_verifiable",
+	"too_many_tables",
+];
+
+describe("bundle reason coverage", () => {
+	test("every backend key has a label of its own", () => {
+		const groups: [readonly string[], (k: string) => string][] = [
+			[BACKEND_NOT_SHAREABLE_KEYS, notShareableLabel],
+			[BACKEND_SERVE_REFUSED_KEYS, serveRefusedLabel],
+			[BACKEND_FETCH_FAILED_KEYS, fetchFailLabel],
+			[BACKEND_IMPORT_REJECT_KEYS, importRejectLabel],
+		];
+		for (const [keys, label] of groups) {
+			for (const key of keys) expect(label(key)).not.toBe(key);
+		}
+	});
+	test("unknown and hostile keys are shown as text without touching prototypes", () => {
+		expect(notShareableLabel("brand_new")).toBe("brand_new");
+		for (const k of ["__proto__", "constructor", "toString"]) {
+			expect(serveRefusedLabel(k)).toBe(k);
+			expect(importRejectLabel(k)).toBe(k);
+		}
+	});
+});
+
+describe("bundle block visibility", () => {
+	test("block needs a receiving network; serving needs level 3", () => {
+		expect(showBundlesBlock([{ level: 0 }])).toBe(false);
+		expect(showBundlesBlock([{ level: 1 }])).toBe(true);
+		expect(showBundleServing([{ level: 2 }])).toBe(false);
+		expect(showBundleServing([{ level: 1 }, { level: 3 }])).toBe(true);
+		// Serving numbers the API reports are never hidden by the level check.
+		expect(showBundleServing([{ level: 1 }], { announced: 8 })).toBe(true);
+		expect(showBundleServing([{ level: 2 }], { serve_refused: { busy: 2 } })).toBe(true);
+		expect(showBundleServing([{ level: 2 }], { announced: 0, fetched: 4 })).toBe(false);
+	});
+	test("activity detection ignores junk", () => {
+		expect(bundleHasActivity(undefined)).toBe(false);
+		expect(bundleHasActivity({ fetched: Number.NaN })).toBe(false);
+		expect(bundleHasActivity({ served: 1 })).toBe(true);
+		expect(bundleHasActivity({ import: { rejected: { invalid: 2 } } })).toBe(true);
+	});
+});
+
+describe("level confirmation", () => {
+	test("only raising to level 3 needs confirmation", () => {
+		expect(levelNeedsConfirmation(2, 3)).toBe(true);
+		expect(levelNeedsConfirmation(0, 3)).toBe(true);
+		expect(levelNeedsConfirmation(3, 3)).toBe(false);
+		expect(levelNeedsConfirmation(3, 2)).toBe(false);
+		expect(levelNeedsConfirmation(0, 2)).toBe(false);
+	});
+});
+
+describe("peer badge", () => {
+	test("no badge without the flag", () => {
+		expect(peerBadge(false, false)).toBeNull();
+		expect(peerBadge(undefined, true)).toBeNull();
+		expect(peerBadge(undefined, undefined)).toBeNull();
+	});
+	test("plain and verifying badges", () => {
+		expect(peerBadge(true, false)?.label).toBe("Peer network");
+		const v = peerBadge(true, true);
+		expect(v?.label).toBe("Peer network \u00b7 verifying");
+		expect(v?.title).toContain("announced to your ARRs and shared only after that check passes");
+	});
+});
 
 describe("backend reason coverage", () => {
 	test("every rejection reason has a label of its own", () => {
@@ -160,40 +308,109 @@ describe("publishedTotal", () => {
 });
 
 describe("level honesty", () => {
-	test("level 3 is not available, 0-2 are", () => {
-		expect(EXPOSURE_LEVELS.map((l) => isLevelAvailable(l.level))).toEqual([
-			true,
-			true,
-			true,
-			false,
-		]);
-		expect(EXPOSURE_LEVELS[3]?.description).toContain("Not available yet");
+	test("level 3 is described plainly with the privacy consequence", () => {
+		const d = EXPOSURE_LEVELS[3]?.description ?? "";
+		expect(d).not.toContain("Not available");
+		expect(d).not.toContain("behaves exactly like level 2");
+		expect(d).toContain("article IDs");
+		expect(d).toContain("node ID and IP address");
 	});
-	test("level 2 text states the privacy consequence; no bundle claim", () => {
+	test("level 3 notice states that article IDs leave the node", () => {
 		expect(levelPrivacyNotice(2)).toContain("node ID and IP address");
-		expect(levelPrivacyNotice(3)).not.toContain("served");
+		expect(levelPrivacyNotice(2)).not.toContain("article IDs leave");
+		expect(levelPrivacyNotice(3)).toContain("article IDs");
+		expect(levelPrivacyNotice(3)).toContain("rclone");
 	});
-	test("level 1 states what it reveals", () => {
+	test("level 1 states what it reveals and that bundles can be requested", () => {
 		expect(EXPOSURE_LEVELS[1]?.description).toContain("node ID and IP address");
+		expect(EXPOSURE_LEVELS[1]?.description).toContain("bundle");
 	});
 });
 
 describe("library sharing line", () => {
-	test("says how many files can be shared when some cannot", () => {
+	const lib = (over: Partial<PeernetLibraryStatus>): PeernetLibraryStatus => ({
+		files: 0,
+		with_release_id: 0,
+		with_nzb_release_id: 0,
+		with_derived_release_id: 0,
+		file_id_only: 0,
+		not_indexable: 0,
+		no_source_nzb: 0,
+		group_too_large: 0,
+		pending: 0,
+		...over,
+	});
+
+	test("says how many files can be shared and why the rest cannot", () => {
 		expect(
-			libraryShareLine({ files: 2358, with_release_id: 41, file_id_only: 2317, not_indexable: 0 }),
+			libraryShareLine(
+				lib({
+					files: 2358,
+					with_release_id: 2000,
+					with_nzb_release_id: 41,
+					with_derived_release_id: 1959,
+					file_id_only: 358,
+					no_source_nzb: 300,
+					group_too_large: 50,
+					pending: 8,
+				}),
+			),
 		).toBe(
-			"41 of 2358 library files can be shared; the rest were imported before sharing data was kept.",
+			"2000 of 2358 library files can be shared (1959 of them are older imports, identified by the files they contain). " +
+				"The other 358 cannot be: 300 have no record of the import they came from, 50 are in imports with too many files, 8 are still being worked out.",
 		);
+	});
+	test("explains older imports without listing reasons when only those are shared", () => {
+		expect(
+			libraryShareLine(
+				lib({
+					files: 12,
+					with_release_id: 10,
+					with_nzb_release_id: 4,
+					with_derived_release_id: 6,
+					file_id_only: 1,
+					no_source_nzb: 1,
+					not_indexable: 1,
+				}),
+			),
+		).toBe(
+			"10 of 12 library files can be shared (6 of them are older imports, identified by the files they contain). " +
+				"The other 2 cannot be: 1 has no record of the import it came from, 1 could not be read.",
+		);
+	});
+	test("keeps singular wording", () => {
+		expect(
+			libraryShareLine(
+				lib({
+					files: 2,
+					with_release_id: 1,
+					with_nzb_release_id: 1,
+					file_id_only: 1,
+					group_too_large: 1,
+				}),
+			),
+		).toBe(
+			"1 of 2 library files can be shared. The other 1 cannot be: 1 is in an import with too many files.",
+		);
+	});
+	test("still reports a shortfall whose reason the server did not give", () => {
+		expect(
+			libraryShareLine(
+				lib({ files: 5, with_release_id: 4, with_nzb_release_id: 4, file_id_only: 1 }),
+			),
+		).toBe("4 of 5 library files can be shared. The other 1 cannot be.");
 	});
 	test("is silent when everything is shareable or nothing is known", () => {
 		expect(
-			libraryShareLine({ files: 5, with_release_id: 5, file_id_only: 0, not_indexable: 0 }),
+			libraryShareLine(lib({ files: 5, with_release_id: 5, with_nzb_release_id: 5 })),
 		).toBeNull();
-		expect(
-			libraryShareLine({ files: 0, with_release_id: 0, file_id_only: 0, not_indexable: 0 }),
-		).toBeNull();
+		expect(libraryShareLine(lib({}))).toBeNull();
 		expect(libraryShareLine(undefined)).toBeNull();
+	});
+	test("ignores nonsense numbers", () => {
+		expect(libraryShareLine(lib({ files: Number.NaN, with_release_id: 1 }))).toBeNull();
+		expect(libraryShareLine(lib({ files: 3, with_release_id: -1 }))).toBeNull();
+		expect(libraryShareLine(lib({ files: 3, with_release_id: 9 }))).toBeNull();
 	});
 });
 

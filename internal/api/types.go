@@ -672,6 +672,10 @@ type QueueItemResponse struct {
 	Percentage     *int                   `json:"percentage,omitempty"`   // Progress percentage (0-100), only for items being processed
 	Stage          string                 `json:"stage,omitempty"`        // Progress stage (e.g. "Validating segments")
 	StoragePath    *string                `json:"storage_path,omitempty"` // Internal FUSE mount path (populated after completion)
+	// PeerOrigin: the import came from a peer-network bundle. PeerFullCheckPending:
+	// its full check has not passed yet (it is not announced to the ARRs).
+	PeerOrigin           bool `json:"peer_origin"`
+	PeerFullCheckPending bool `json:"peer_full_check_pending"`
 }
 
 // QueueStatsResponse represents queue statistics in API responses
@@ -727,25 +731,27 @@ type QueueHistoricalStatsResponse struct {
 
 // HealthItemResponse represents a health record in API responses
 type HealthItemResponse struct {
-	CheckProgress    *health.CheckProgress   `json:"check_progress,omitempty"`
-	ID               int64                   `json:"id"`
-	FilePath         string                  `json:"file_path"`
-	LibraryPath      *string                 `json:"library_path,omitempty"`
-	Status           database.HealthStatus   `json:"status"`
-	LastChecked      *time.Time              `json:"last_checked"`
-	LastError        *string                 `json:"last_error"`
-	RetryCount       int                     `json:"retry_count"`
-	MaxRetries       int                     `json:"max_retries"`
-	SourceNzbPath    *string                 `json:"source_nzb_path"`
-	ErrorDetails     *string                 `json:"error_details"`
-	RepairRetryCount int                     `json:"repair_retry_count"`
-	MaxRepairRetries int                     `json:"max_repair_retries"`
-	Indexer          *string                 `json:"indexer,omitempty"` // Added indexer
-	Metadata         *string                 `json:"metadata,omitempty"`
-	CreatedAt        time.Time               `json:"created_at"`
-	UpdatedAt        time.Time               `json:"updated_at"`
-	ScheduledCheckAt *time.Time              `json:"scheduled_check_at,omitempty"`
-	Priority         database.HealthPriority `json:"priority"`
+	PeerOrigin           bool                    `json:"peer_origin"`
+	PeerFullCheckPending bool                    `json:"peer_full_check_pending"`
+	CheckProgress        *health.CheckProgress   `json:"check_progress,omitempty"`
+	ID                   int64                   `json:"id"`
+	FilePath             string                  `json:"file_path"`
+	LibraryPath          *string                 `json:"library_path,omitempty"`
+	Status               database.HealthStatus   `json:"status"`
+	LastChecked          *time.Time              `json:"last_checked"`
+	LastError            *string                 `json:"last_error"`
+	RetryCount           int                     `json:"retry_count"`
+	MaxRetries           int                     `json:"max_retries"`
+	SourceNzbPath        *string                 `json:"source_nzb_path"`
+	ErrorDetails         *string                 `json:"error_details"`
+	RepairRetryCount     int                     `json:"repair_retry_count"`
+	MaxRepairRetries     int                     `json:"max_repair_retries"`
+	Indexer              *string                 `json:"indexer,omitempty"` // Added indexer
+	Metadata             *string                 `json:"metadata,omitempty"`
+	CreatedAt            time.Time               `json:"created_at"`
+	UpdatedAt            time.Time               `json:"updated_at"`
+	ScheduledCheckAt     *time.Time              `json:"scheduled_check_at,omitempty"`
+	Priority             database.HealthPriority `json:"priority"`
 	// Failure masking fields
 	StreamingFailureCount int  `json:"streaming_failure_count"`
 	IsMasked              bool `json:"is_masked"`

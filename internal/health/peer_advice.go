@@ -146,6 +146,10 @@ func (hc *HealthChecker) peerEligible(ctx context.Context, prep *preparedCheck, 
 		return PeerFileInfo{}, false
 	}
 	o := opts[0]
+	if owesFullCheck(o, prep.filePath) {
+		// A peer-bundle import owes a full check: advice never applies.
+		return PeerFileInfo{}, false
+	}
 	info, ok := o.PeerFiles[prep.filePath]
 	switch {
 	case !ok, info.Status != database.HealthStatusHealthy:

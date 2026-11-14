@@ -467,3 +467,30 @@ func TestIngestRateIsFairAcrossRelayers(t *testing.T) {
 		t.Fatalf("an honest relayer ingested %d of 2 records after another relayer flooded", n)
 	}
 }
+
+func TestIngestStoresTheAnnouncedBundleIDFromTheSignedRecord(t *testing.T) {
+	pub, self := mustKey(t), mustKey(t)
+	nw := netOf(1)
+	st := &fakeStore{}
+	ing := newTestIngester(t, self.NodeID(), st)
+	in := relInput(9)
+	in.BundleID = records.BundleID{1, 2, 3}
+	_, raw, err := records.BuildReleaseRecord(pub, nw, in, testNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ing.Ingest(context.Background(), nw, raw, OriginPeer); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := st.rows[0].BundleID, hexOf(in.BundleID); got != want {
+		t.Fatalf("stored bundle id = %q, want %q", got, want)
+	}
+	// A record without one stores none.
+	raw = buildRelease(t, pub, nw, testNow)
+	if _, err := ing.Ingest(context.Background(), nw, raw, OriginPeer); err != nil {
+		t.Fatal(err)
+	}
+	if got := st.rows[1].BundleID; got != "" {
+		t.Fatalf("bundle id of a record without one = %q", got)
+	}
+}

@@ -70,6 +70,14 @@ func TestPullStoresRecordsAndAdvancesCursor(t *testing.T) {
 	if b.x.Status(ctx, nw).LastPull.IsZero() {
 		t.Fatal("last successful pull not recorded")
 	}
+	// After a restart the in-memory time is gone; the persisted cursors still
+	// say when records were pulled.
+	b.x.mu.Lock()
+	b.x.lastPull = map[string]time.Time{}
+	b.x.mu.Unlock()
+	if b.x.Status(ctx, nw).LastPull.IsZero() {
+		t.Fatal("the last pull must survive a restart")
+	}
 }
 
 func TestPullFollowsMoreFlagAcrossPages(t *testing.T) {

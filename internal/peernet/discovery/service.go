@@ -88,12 +88,14 @@ type Service struct {
 	auth   Authorizer
 	now    func() time.Time
 
-	mu       sync.Mutex
-	nets     map[string]*netState
-	sources  []Source
-	helloLim *helloLimiter
-	dials    *dialBackBudget
-	acks     *lru[helloAck] // advertised addresses a peer acknowledged, per (network, node)
+	mu          sync.Mutex
+	nets        map[string]*netState
+	sources     []Source
+	helloLim    *helloLimiter
+	dials       *dialBackBudget
+	acks        *lru[helloAck] // advertised addresses a peer acknowledged, per (network, node)
+	connIPs     sync.Map       // node id -> remote IP of its latest successful call
+	contactErrs sync.Map       // network|node -> text of its last failed contact
 
 	logMu      sync.Mutex
 	lastLogged map[string]string

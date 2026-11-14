@@ -27,6 +27,7 @@ import (
 	"github.com/kipsilabs/altmount/internal/nzbfilesystem"
 	"github.com/kipsilabs/altmount/internal/nzbfilesystem/segcache"
 	"github.com/kipsilabs/altmount/internal/par2repair"
+	"github.com/kipsilabs/altmount/internal/peernet/bundlex"
 	"github.com/kipsilabs/altmount/internal/peernet/service"
 	"github.com/kipsilabs/altmount/internal/pool"
 	"github.com/kipsilabs/altmount/internal/progress"
@@ -468,8 +469,13 @@ func startPeernetService(
 	metadataService *metadata.MetadataService,
 	healthRepo *database.HealthRepository,
 	configManager *config.Manager,
+	opts ...func(*service.Deps),
 ) *service.Service {
-	svc := service.New(peernetDeps(ctx, cfg, db, metadataService, healthRepo, configManager))
+	deps := peernetDeps(ctx, cfg, db, metadataService, healthRepo, configManager)
+	for _, opt := range opts {
+		opt(&deps)
+	}
+	svc := service.New(deps)
 	svc.Start(ctx)
 	configManager.OnConfigChange(svc.OnConfigChange)
 	return svc
@@ -499,12 +505,18 @@ func peernetDeps(
 		// Record exchange: stored records and the per-peer sync positions.
 		Records: database.NewPeernetRecordRepository(conn, d),
 		Cursors: database.NewPeernetSyncCursorRepository(conn, d),
+		// Negative cache of Bundle IDs that failed local verification.
+		BundleState: database.NewPeernetBundleImportRepository(conn, d),
 		// Publishing of this node's own healthy releases (levels 2 and 3).
 		PublishState: database.NewPeernetPublishStateRepository(conn, d),
 		Origins:      database.NewPeernetOriginRepository(conn, d),
 		Exclusions:   peernetExclusions(configManager.GetConfigGetter()),
 		Backbones:    newPeernetBackboneSource(configManager.GetConfigGetter(), providerbackbone.Default, nil),
 		Metadata:     service.NewMetadataHost(metadataService),
+		// Level 3 reads full file metadata through this source only; whether a
+		// keyed file's password came with its NZB is answered from the origin
+		// the importer recorded.
+		BundleSource: bundlex.NewMetadataSource(metadataService, database.NewPeernetPasswordOriginRepository(conn, d)),
 		Health:       service.NewLocalHealth(healthRepo),
 		Settings:     service.SettingsFromConfig(cfg),
 	}
