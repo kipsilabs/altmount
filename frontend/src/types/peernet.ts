@@ -8,6 +8,8 @@ export type PeernetLevel = 0 | 1 | 2 | 3;
 export interface PeernetOpenNetworkConfig {
 	level: PeernetLevel;
 	peers: string[];
+	/** Use open-network layouts to skip archive analysis on NZB imports (default false). */
+	fast_path: boolean;
 }
 
 export interface PeernetSharingConfig {
@@ -101,12 +103,57 @@ export interface PeernetBackfillStatus {
 	skipped: number;
 }
 
-/** How many library files can be shared (those with a Release ID). */
+/**
+ * How many library files can be shared (those with a Release ID): either one
+ * from the release's NZB, or one derived from the files of an older import.
+ * The rest (file_id_only) could not be grouped: no_source_nzb, group_too_large
+ * or pending; not_indexable files could not be identified at all.
+ */
 export interface PeernetLibraryStatus {
 	files: number;
 	with_release_id: number;
+	with_nzb_release_id: number;
+	with_derived_release_id: number;
 	file_id_only: number;
 	not_indexable: number;
+	no_source_nzb: number;
+	group_too_large: number;
+	pending: number;
+}
+
+/** Bundle building, serving, fetching and importing since start. Every field is optional for an older backend; map keys are machine names. */
+export interface PeernetBundleImportStatus {
+	accepted?: number;
+	already_imported?: number;
+	rejected?: Record<string, number>;
+	full_check_passed?: number;
+	full_check_failed?: number;
+	announced?: number;
+	bad_bundle_reports?: number;
+	/** Files that still owe their full check. */
+	pending?: number;
+	/** Pending past the maximum age: failed, never announced. */
+	stale?: number;
+}
+
+export interface PeernetBundlesStatus {
+	built?: number;
+	cache_hits?: number;
+	build_failures?: number;
+	cached?: number;
+	cached_bytes?: number;
+	announced?: number;
+	not_shareable?: Record<string, number>;
+	served?: number;
+	served_bytes?: number;
+	serve_refused?: Record<string, number>;
+	fetched?: number;
+	fetch_rate_limited?: number;
+	fetch_failed?: Record<string, number>;
+	fetch_backed_off?: number;
+	full_check_reports?: number;
+	full_check_backed_off?: number;
+	import?: PeernetBundleImportStatus;
 }
 
 export interface PeernetStatus {
@@ -124,6 +171,7 @@ export interface PeernetStatus {
 	library?: PeernetLibraryStatus;
 	publish?: PeernetPublishStatus;
 	advice?: PeernetAdviceStatus;
+	bundles?: PeernetBundlesStatus;
 }
 
 export type PeernetPeerSource = "user" | "exchange" | "inbound";

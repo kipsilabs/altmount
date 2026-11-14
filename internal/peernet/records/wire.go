@@ -42,14 +42,18 @@ type (
 
 // Field numbers (see the package documentation).
 const (
-	fVersion   protowire.Number = 1
-	fKind      protowire.Number = 2
-	fNetwork   protowire.Number = 3
-	fRelease   protowire.Number = 4
-	fNodeID    protowire.Number = 5
-	fPubKey    protowire.Number = 6
-	fCreated   protowire.Number = 7
-	fExpires   protowire.Number = 8
+	fVersion protowire.Number = 1
+	fKind    protowire.Number = 2
+	fNetwork protowire.Number = 3
+	fRelease protowire.Number = 4
+	fNodeID  protowire.Number = 5
+	fPubKey  protowire.Number = 6
+	fCreated protowire.Number = 7
+	fExpires protowire.Number = 8
+	// fScheme is the optional release_scheme header field. It sits between the
+	// common header (1-8) and the type-specific fields (10+), so a record
+	// without it is byte-identical to the encoding that predates it.
+	fScheme    protowire.Number = 9
 	fSignature protowire.Number = 30
 
 	fBundle   protowire.Number = 10
@@ -77,9 +81,12 @@ type Header struct {
 	ReleaseID    ReleaseID
 	PublisherID  identity.NodeID
 	PublisherKey ed25519.PublicKey
-	CreatedAt    time.Time
-	ExpiresAt    time.Time
-	Signature    []byte
+	// ReleaseScheme says how ReleaseID was derived: 0 or SchemeNZB (absent from
+	// the encoding) or SchemeFiles. See Scheme.
+	ReleaseScheme uint8
+	CreatedAt     time.Time
+	ExpiresAt     time.Time
+	Signature     []byte
 }
 
 // field is one parsed wire field.
@@ -145,7 +152,7 @@ func validTime(t time.Time) bool {
 	return u >= 1 && u <= maxUnixSeconds
 }
 
-// appendHeader writes fields 1-8.
+// appendHeader writes fields 1-8, and 9 only for a non-default scheme.
 func appendHeader(b []byte, k Kind, h *Header) []byte {
 	b = appendVarint(b, fVersion, SchemaVersion)
 	b = appendVarint(b, fKind, uint64(k))
@@ -154,7 +161,11 @@ func appendHeader(b []byte, k Kind, h *Header) []byte {
 	b = appendBytes(b, fNodeID, h.PublisherID[:])
 	b = appendBytes(b, fPubKey, h.PublisherKey)
 	b = appendVarint(b, fCreated, unixOf(h.CreatedAt))
-	return appendVarint(b, fExpires, unixOf(h.ExpiresAt))
+	b = appendVarint(b, fExpires, unixOf(h.ExpiresAt))
+	if h.ReleaseScheme == SchemeFiles {
+		b = appendVarint(b, fScheme, uint64(SchemeFiles))
+	}
+	return b
 }
 
 func appendSignature(b, sig []byte) []byte { return appendBytes(b, fSignature, sig) }
@@ -224,6 +235,14 @@ func readHeaderField(f field, want Kind, h *Header) (bool, error) {
 		h.CreatedAt, err = readTime(f, "created_at")
 	case fExpires:
 		h.ExpiresAt, err = readTime(f, "expires_at")
+	case fScheme:
+		// Present means exactly SchemeFiles: the default is expressed by
+		// leaving the field out, so any other value is non-canonical.
+		var v uint64
+		if v, err = readVarint(f, ^uint64(0), "release_scheme"); err == nil && v != uint64(SchemeFiles) {
+			err = fmt.Errorf("%w: release_scheme %d", ErrInvalidField, v)
+		}
+		h.ReleaseScheme = SchemeFiles
 	case fSignature:
 		h.Signature = make([]byte, signatureSize)
 		err = readFixed(f, h.Signature, "signature")
@@ -240,6 +259,8 @@ func (h *Header) validate(maxLife time.Duration) error {
 		return fmt.Errorf("%w: zero network id", ErrInvalidField)
 	case h.ReleaseID == ReleaseID{}:
 		return fmt.Errorf("%w: zero release id", ErrInvalidField)
+	case h.ReleaseScheme > SchemeFiles:
+		return fmt.Errorf("%w: release scheme", ErrInvalidField)
 	case h.PublisherID.IsZero():
 		return fmt.Errorf("%w: zero publisher id", ErrInvalidField)
 	case len(h.PublisherKey) != publicKeySize:
@@ -299,8 +320,13 @@ func sign(key *identity.Key, tag string, nw netid.NetworkID, body []byte) ([]byt
 // ContentHash is the SHA-256 of an encoded record.
 func ContentHash(encoded []byte) [32]byte { return sha256.Sum256(encoded) }
 
-// newHeader fills the publisher and time fields for a builder.
-func newHeader(key *identity.Key, nw netid.NetworkID, rid ReleaseID, now time.Time, life time.Duration) (Header, error) {
+// newHeader fills the publisher and time fields for a builder. The scheme is
+// stored in canonical form: the default (nzb) is zero, which is what a decoder
+// produces when the field is absent.
+func newHeader(key *identity.Key, nw netid.NetworkID, rid ReleaseID, scheme uint8, now time.Time, life time.Duration) (Header, error) {
+	if scheme == SchemeNZB {
+		scheme = 0
+	}
 	if key == nil {
 		return Header{}, fmt.Errorf("%w: nil key", ErrInvalidField)
 	}
@@ -312,5 +338,16 @@ func newHeader(key *identity.Key, nw netid.NetworkID, rid ReleaseID, now time.Ti
 		PublisherKey: key.PublicKey(),
 		CreatedAt:    created,
 		ExpiresAt:    created.Add(life),
+
+		ReleaseScheme: scheme,
 	}, nil
+}
+
+// Scheme returns how the Release ID was derived: SchemeNZB when the field is
+// absent, SchemeFiles when it is 2.
+func (h *Header) Scheme() uint8 {
+	if h.ReleaseScheme == SchemeFiles {
+		return SchemeFiles
+	}
+	return SchemeNZB
 }

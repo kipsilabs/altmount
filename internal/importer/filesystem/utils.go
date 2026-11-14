@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/kipsilabs/altmount/internal/importer/parser"
 	"github.com/kipsilabs/altmount/internal/importer/utils/nzbtrim"
@@ -120,6 +122,18 @@ func EnsureDirectoryExists(virtualDir string, metadataService *metadata.Metadata
 
 // CreateNzbFolder creates a folder named after the NZB file
 func CreateNzbFolder(virtualDir, nzbFilename string, metadataService *metadata.MetadataService) (string, error) {
+	nzbVirtualDir := NzbFolderPath(virtualDir, nzbFilename)
+
+	if err := EnsureDirectoryExists(nzbVirtualDir, metadataService); err != nil {
+		return "", err
+	}
+
+	return nzbVirtualDir, nil
+}
+
+// NzbFolderPath is the virtual folder CreateNzbFolder would create, without
+// creating anything.
+func NzbFolderPath(virtualDir, nzbFilename string) string {
 	nzbBaseName := nzbtrim.TrimNzbExtension(nzbFilename)
 	// Now, also strip the media file extension if it exists
 	// Common media extensions: .mkv, .mp4, .avi, .flv, .wmv, .mov, .webm
@@ -134,13 +148,7 @@ func CreateNzbFolder(virtualDir, nzbFilename string, metadataService *metadata.M
 	}
 
 	nzbVirtualDir := filepath.Join(virtualDir, nzbBaseName)
-	nzbVirtualDir = strings.ReplaceAll(nzbVirtualDir, string(filepath.Separator), "/")
-
-	if err := EnsureDirectoryExists(nzbVirtualDir, metadataService); err != nil {
-		return "", err
-	}
-
-	return nzbVirtualDir, nil
+	return strings.ReplaceAll(nzbVirtualDir, string(filepath.Separator), "/")
 }
 
 // CreateDirectoriesForFiles analyzes files and creates their parent directories
@@ -311,4 +319,59 @@ func (r *PathReserver) Release(path string) {
 	r.mu.Lock()
 	delete(r.claimed, path)
 	r.mu.Unlock()
+}
+
+// ReservedFolderNames are folder names the application uses for its own
+// bookkeeping inside the library; no peer-supplied title may become one.
+var ReservedFolderNames = []string{".nzbs", "corrupted_metadata", "patches", "_migrated", ".peernet-staging"}
+
+// maxSafeFolderNameLen caps a peer-derived folder name in bytes.
+const maxSafeFolderNameLen = 200
+
+// SafeFolderName turns an untrusted title into one plain folder name. The media
+// extension is stripped first (as NzbFolderPath does later), then control and
+// path characters are replaced, leading and trailing dots and spaces removed
+// and the length capped. A name that ends up empty, starts with a dot, or
+// equals (ignoring case) a reserved internal name or one of extraReserved (for
+// example the category folders) is refused. Unlike NzbFolderPath it can never
+// yield "." or "..".
+func SafeFolderName(title string, extraReserved ...string) (string, bool) {
+	name := strings.ToValidUTF8(title, "")
+	if i := strings.LastIndexAny(name, `/\`); i >= 0 {
+		name = name[i+1:]
+	}
+	if nzbtrim.HasNzbExtension(name) {
+		name = nzbtrim.TrimNzbExtension(name)
+	}
+	lower := strings.ToLower(name)
+	for _, ext := range []string{".mkv", ".mp4", ".avi", ".flv", ".wmv", ".mov", ".webm", ".ts", ".iso"} {
+		if strings.HasSuffix(lower, ext) {
+			name = name[:len(name)-len(ext)]
+			break
+		}
+	}
+	name = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) || strings.ContainsRune(`<>:"|?*`, r) {
+			return ' '
+		}
+		return r
+	}, name)
+	name = strings.Join(strings.Fields(name), " ")
+	if strings.HasPrefix(name, ".") {
+		return "", false
+	}
+	for len(name) > maxSafeFolderNameLen {
+		_, size := utf8.DecodeLastRuneInString(name)
+		name = name[:len(name)-size]
+	}
+	name = strings.TrimRight(name, ". ")
+	if name == "" || strings.HasPrefix(name, ".") {
+		return "", false
+	}
+	for _, r := range append(append([]string{}, ReservedFolderNames...), extraReserved...) {
+		if r != "" && strings.EqualFold(name, r) {
+			return "", false
+		}
+	}
+	return name, true
 }

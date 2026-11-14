@@ -38,6 +38,33 @@
 // hashed exactly as if the shared source's segments had been inlined, so the
 // ID does not depend on how the metadata happens to be stored.
 //
+// # Library-derived Release ID ("files" scheme)
+//
+// A file imported before the NZB store existed (segments kept inline per file)
+// has a File ID but no NZB segment list, so no Release ID of the form above.
+// Such a release is identified by its files instead:
+//
+//	files release ID = SHA-256( domain("altmount-peernet/release-files/v1")
+//
+//	|| fileID(1) || fileID(2) || ... || fileID(n) )
+//
+// where domain() is the same u32-length-prefixed label as above, the file IDs
+// are the 32-byte File IDs of the release's files sorted ascending by plain
+// bytewise comparison with duplicates removed (a file kept under two folders is
+// one file), and there is no count and no separator (every item has a fixed
+// width). n, the number of distinct File IDs, is at least 1 and at most
+// 10,000 (a node only derives
+// IDs for groups up to MaxDerivedReleaseFiles, 2000). Records that carry such an ID say so in
+// their release_scheme field (2); the two ID spaces are domain-separated, so
+// an "nzb" ID and a "files" ID never collide.
+//
+// Which files make up "the release" is a local decision (see the Indexer): the
+// indexed files that came from one import, found through the stored source
+// NZB path of their metadata. Two nodes that imported the same NZB and kept
+// the same file set derive the same ID; different kept subsets give different
+// IDs. File IDs match across both schemes, so health evidence is shared per
+// file.
+//
 // Every variable-length item is length-prefixed and every list is
 // count-prefixed, and the domain label differs per ID kind, so two different
 // structures cannot produce the same input stream. Future layouts must use a

@@ -240,6 +240,10 @@ func (s *Server) handleStremioAddonStream(c *fiber.Ctx) error {
 		}
 	}
 	libraryStreams = s.labelNetworkHealthy(ctx, libraryStreams)
+	// Releases other nodes announced for this content with a bundle this node
+	// can fetch (nil with the peer network off: nothing is added or asked).
+	// They are looked up while the indexer search runs, never before it.
+	waitPeerStreams := s.startPeerCandidates(ctx, cfg, streamType, imdbID, baseURL, key, season, episode)
 
 	// Map Stremio type to Prowlarr search type
 	prowlarrType := "search"
@@ -254,7 +258,8 @@ func (s *Server) handleStremioAddonStream(c *fiber.Ctx) error {
 		"type", streamType, "id", rawID, "imdb_id", imdbID, "library_matches", len(libraryStreams))
 
 	results, cachedItems, err := s.searchStremioReleases(ctx, cfg, streamType, prowlarrType, imdbID, season, episode)
-	if err != nil && len(libraryStreams) == 0 {
+	peerStreams := waitPeerStreams()
+	if err != nil && len(libraryStreams) == 0 && len(peerStreams) == 0 {
 		return emptyStreamsResponse(c)
 	}
 
@@ -262,17 +267,7 @@ func (s *Server) handleStremioAddonStream(c *fiber.Ctx) error {
 		baseURL, key, streamType, season, episode, imdbID,
 		resolveStreamDisplay(cfg.Stremio), s.storeStremioReleaseRef)
 
-	streams := make([]fiber.Map, 0, len(libraryStreams)+len(entries))
-	streams = append(streams, libraryStreams...)
-
-	for _, e := range entries {
-		streams = append(streams, fiber.Map{
-			"name":          e.Name,
-			"title":         e.Title,
-			"url":           e.URL,
-			"behaviorHints": e.BehaviorHints,
-		})
-	}
+	streams := assembleStremioStreams(libraryStreams, peerStreams, entries)
 
 	if len(streams) == 0 {
 		return emptyStreamsResponse(c)

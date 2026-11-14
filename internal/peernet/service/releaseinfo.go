@@ -12,6 +12,7 @@ import (
 
 	"github.com/kipsilabs/altmount/internal/database"
 	"github.com/kipsilabs/altmount/internal/nzbname"
+	"github.com/kipsilabs/altmount/internal/peernet/contentid"
 	"github.com/kipsilabs/altmount/internal/peernet/publish"
 	"github.com/kipsilabs/altmount/internal/peernet/records"
 )
@@ -21,14 +22,25 @@ const (
 	infoCacheMax = 256
 	// maxReleaseFiles bounds how many metadata files are read for one release.
 	// A release with more indexed files than this is not described (it would
-	// otherwise cost an unbounded number of reads for one record).
-	maxReleaseFiles = 500
+	// otherwise cost an unbounded number of reads for one record). The result
+	// is cached, so a large release is read once per infoTTL. It is the same
+	// limit as a derived release ID, so every release that has an ID can be
+	// described.
+	maxReleaseFiles = contentid.MaxDerivedReleaseFiles
 	// originProbeFiles is how many files of a release are tried when the
 	// first has no import bookkeeping.
 	originProbeFiles = 5
 	// maxMediaMetadataBytes caps the import metadata JSON that is parsed.
 	maxMediaMetadataBytes = 64 << 10
 )
+
+// releaseScheme maps a stored scheme to the one a record carries.
+func releaseScheme(stored int) uint8 {
+	if stored == database.PeernetSchemeFiles {
+		return records.SchemeFiles
+	}
+	return records.SchemeNZB
+}
 
 var errNoReleaseInfo = errors.New("no release information available")
 
@@ -76,10 +88,17 @@ func (s *infoSource) forRelease(ctx context.Context, releaseHex, hintPath string
 	}
 
 	var info publish.ReleaseInfo
+	info.ReleaseScheme = releaseScheme(entries[0].ReleaseScheme)
 	var nzbName, namePassword string
 	secrets := map[string]struct{}{}
 	paths := make([]string, 0, len(entries))
+	seenFiles := make(map[string]struct{}, len(entries))
 	for _, e := range entries {
+		// The same file kept under two folders is one file of the release.
+		if _, dup := seenFiles[e.FileID]; dup {
+			continue
+		}
+		seenFiles[e.FileID] = struct{}{}
 		fm, err := s.meta.ReadReleaseFile(e.FilePath)
 		if err != nil || fm == nil {
 			// All or nothing: a partial listing would publish an understated

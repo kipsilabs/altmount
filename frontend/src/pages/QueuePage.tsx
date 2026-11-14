@@ -35,6 +35,7 @@ import { ErrorAlert } from "../components/ui/ErrorAlert";
 import { LoadingSpinner, LoadingTable } from "../components/ui/LoadingSpinner";
 import { Pagination } from "../components/ui/Pagination";
 import { PathDisplay } from "../components/ui/PathDisplay";
+import { PeerBadge } from "../components/ui/PeerBadge";
 import { StatusBadge } from "../components/ui/StatusBadge";
 import { useConfirm } from "../contexts/ModalContext";
 import { useToast } from "../contexts/ToastContext";
@@ -885,6 +886,14 @@ export function QueuePage() {
 																				/>
 																			</div>
 																		</div>
+																		{item.peer_origin && (
+																			<div className="mt-1 pl-5.5">
+																				<PeerBadge
+																					origin={item.peer_origin}
+																					fullCheckPending={item.peer_full_check_pending}
+																				/>
+																			</div>
+																		)}
 																		{item.indexer && (
 																			<div className="mt-1 flex min-w-0 items-center gap-1 pl-5.5 text-base-content/50 text-xs">
 																				<Globe className="h-3 w-3 shrink-0" />

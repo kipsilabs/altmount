@@ -23,6 +23,9 @@ type fakeAdvisor struct {
 	gotBB   []string
 	spends  int
 	denied  bool // SpendRecheck refuses (budget gone)
+	// gotRel and gotReleases are what the last advice / label call was asked.
+	gotRel      string
+	gotReleases map[string][]string
 }
 
 func (f *fakeAdvisor) SpendRecheck(_, _ string, _, _ time.Time) bool {
@@ -37,7 +40,7 @@ func (f *fakeAdvisor) spendCount() int { f.mu.Lock(); defer f.mu.Unlock(); retur
 func (f *fakeAdvisor) HealthAdvice(ctx context.Context, rel, file string, bb []string, _ time.Time) (hints.Advice, error) {
 	f.mu.Lock()
 	f.calls++
-	f.gotBB = bb
+	f.gotBB, f.gotRel = bb, rel
 	d, a, err := f.delay, f.advice, f.err
 	f.mu.Unlock()
 	if d > 0 {
@@ -60,6 +63,21 @@ func (f *fakeAdvisor) NetworkHealthy(_ context.Context, ids ...string) (map[stri
 	out := map[string]hints.NetworkHealth{}
 	for _, id := range ids {
 		out[id] = f.healthy[id]
+	}
+	return out, nil
+}
+
+func (f *fakeAdvisor) NetworkHealthyFiles(_ context.Context, releases map[string][]string) (map[string]hints.NetworkHealth, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.nhCalls++
+	f.gotReleases = releases
+	if f.err != nil {
+		return nil, f.err
+	}
+	out := map[string]hints.NetworkHealth{}
+	for rel := range releases {
+		out[rel] = f.healthy[rel]
 	}
 	return out, nil
 }
@@ -403,5 +421,75 @@ func TestStatusReportsBudget(t *testing.T) {
 	f := hubFixture(t, &fakeAdvisor{}, nil, hints.NewBudget(7))
 	if got := f.status(t).Advice.BudgetRemaining; got != 7 {
 		t.Fatalf("budget remaining = %d", got)
+	}
+}
+
+// A file with no Release ID of any kind (its import could not be grouped) still
+// has a File ID, and evidence is found by file: it gets advice.
+func TestHealthAdviceForFileWithoutReleaseID(t *testing.T) {
+	ctx := context.Background()
+	adv := &fakeAdvisor{advice: hints.Advice{Kind: hints.AdviceReduceSampleToFloor}}
+	f := hubFixture(t, adv, nil, hints.NewBudget(10))
+	const bare = "movies/Bare/bare.mkv"
+	if err := f.content.Upsert(ctx, database.PeernetContentEntry{FilePath: bare, FileID: strings.Repeat("7", 64)}); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.svc.HealthAdvice(ctx, bare); got.Kind != hints.AdviceReduceSampleToFloor {
+		t.Fatalf("advice for a file with only a file ID = %v", got.Kind)
+	}
+	if adv.gotRel != "" {
+		t.Fatalf("release passed for a file without one: %q", adv.gotRel)
+	}
+}
+
+// Evidence is about the file: an attestation published under another release
+// ID (an NZB-based one, for a file this node knows by its file set) still moves
+// this node's check forward.
+func TestRecheckPassFindsEvidenceUnderAnotherReleaseID(t *testing.T) {
+	ctx := context.Background()
+	adv := &fakeAdvisor{advice: hints.Advice{Kind: hints.AdviceRecheckSooner}}
+	sch := &fakeScheduler{}
+	f := hubFixture(t, adv, sch, hints.NewBudget(10))
+	insertUnhealthy(t, f, strings.Repeat("e", 64), pubFile, 1) // same file, other release ID
+	f.node(t).maintainHints(ctx)
+	if got := sch.got(); len(got) != 1 || got[0] != pubPath {
+		t.Fatalf("scheduled: %v", got)
+	}
+}
+
+// The release label asks about the release's video files only, in one batch for
+// every release on the page.
+func TestNetworkHealthyPathsAsksFileLevelInOneBatch(t *testing.T) {
+	ctx := context.Background()
+	adv := &fakeAdvisor{healthy: map[string]hints.NetworkHealth{pubRelease: {Healthy: true}}}
+	f := hubFixture(t, adv, nil, hints.NewBudget(10))
+	hx := func(c string) string { return strings.Repeat(c, 64) }
+	rows := []database.PeernetContentEntry{
+		{FilePath: "movies/Some.Movie.2020/movie.nfo", FileID: hx("1"), ReleaseID: pubRelease},
+		{FilePath: "movies/Some.Movie.2020/extra.MP4", FileID: hx("2"), ReleaseID: pubRelease},
+		{FilePath: "movies/Docs/a.pdf", FileID: hx("3"), ReleaseID: hx("8")}, // a release with no video
+		{FilePath: "movies/Other/o.mkv", FileID: hx("4"), ReleaseID: hx("9"), ReleaseScheme: database.PeernetSchemeFiles},
+	}
+	for _, r := range rows {
+		if err := f.content.Upsert(ctx, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := f.svc.NetworkHealthyPaths(ctx, []string{pubPath, "movies/Docs/a.pdf", "movies/Other/o.mkv"})
+	if len(got) != 1 || !got[pubPath] {
+		t.Fatalf("labels: %v", got)
+	}
+	if adv.nhCalls != 1 {
+		t.Fatalf("%d advisor calls for one page, want 1", adv.nhCalls)
+	}
+	files := adv.gotReleases[pubRelease]
+	if len(files) != 2 || files[0] != pubFile && files[1] != pubFile {
+		t.Fatalf("files asked for the release: %v (want its two video files)", files)
+	}
+	if _, asked := adv.gotReleases[hx("8")]; asked && len(adv.gotReleases[hx("8")]) != 0 {
+		t.Fatalf("a release with no video file was asked about: %v", adv.gotReleases[hx("8")])
+	}
+	if len(adv.gotReleases[hx("9")]) != 1 {
+		t.Fatalf("derived release not asked about its file: %v", adv.gotReleases[hx("9")])
 	}
 }

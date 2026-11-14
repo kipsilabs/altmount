@@ -1,4 +1,4 @@
-import type { PeernetLevel, PeernetLibraryStatus } from "../../../types/peernet";
+import type { PeernetLibraryStatus } from "../../../types/peernet";
 
 // Plain-language labels for the machine keys the status endpoint reports. The
 // lookups use Maps so a key such as "__proto__" can never reach a prototype;
@@ -42,7 +42,91 @@ const SKIP_LABELS: ReadonlyMap<string, string> = new Map([
 	["not_healthy", "Not healthy locally"],
 	["reduced_by_peer_advice", "Check was shortened by network evidence"],
 	["patch_status_unknown", "Repair status of the file was not known"],
+	["peer_status_unknown", "Could not tell whether the file came from a peer bundle"],
+	["bundle_unavailable", "Bundle could not be built for this file"],
 ]);
+
+const NOT_SHAREABLE_LABELS: ReadonlyMap<string, string> = new Map([
+	["rclone_encrypted", "Encrypted with rclone"],
+	["unsupported_encryption", "Uses an encryption type that cannot be shared"],
+	["password_not_from_nzb", "Password did not come inside the NZB"],
+	["healed_by_local_patch", "Repaired with local PAR2 patches"],
+	["known_holes", "Has known missing parts"],
+	["patch_status_unknown", "Repair status was not known"],
+	["no_nzb_segment_list", "No stored NZB segment list"],
+	["release_id_mismatch", "Release identity did not match"],
+	["invalid_metadata", "Stored file details are inconsistent"],
+	["too_large", "Too large to bundle"],
+	["no_post_date", "No post date known"],
+	["no_files", "No files in the release"],
+	["self_check_failed", "The built bundle failed its own check"],
+	["other", "Other reasons"],
+]);
+
+const SERVE_REFUSED_LABELS: ReadonlyMap<string, string> = new Map([
+	["unauthenticated", "Caller not authenticated"],
+	["level", "Network level does not serve bundles"],
+	["denied", "Caller not allowed"],
+	["backed_off", "Caller temporarily blocked"],
+	["rate_limited", "Caller over its request rate"],
+	["busy", "Too many requests at once"],
+	["error", "Internal error"],
+	["unknown_bundle", "Bundle not known"],
+	["excluded", "Release is excluded from sharing"],
+	["unavailable", "Bundle could not be built"],
+	["byte_budget", "Node-wide data limit reached"],
+	["aborted", "Transfer was cut off"],
+]);
+
+const FETCH_FAILED_LABELS: ReadonlyMap<string, string> = new Map([
+	["refused", "Peer refused the request"],
+	["bad_status", "Peer answered with an error"],
+	["transport", "Connection problem"],
+	["truncated", "Download was cut short"],
+	["too_large", "Bundle larger than allowed"],
+	["verification_failed", "Bundle did not match its signed record"],
+	["scheme_mismatch", "Bundle format did not match"],
+	["membership", "Peer not a verified member"],
+]);
+
+const IMPORT_REJECT_LABELS: ReadonlyMap<string, string> = new Map([
+	["invalid", "Failed validation"],
+	["bad_name", "Unsafe file name"],
+	["too_large", "Over the local size limit"],
+	["too_many_files", "Over the local file limit"],
+	["health_disabled", "Health checks are turned off"],
+	["bad_target", "Target folder unusable"],
+	["nzb_mismatch", "Did not match your NZB"],
+	["collision", "A different file is already there"],
+	["probe_missing", "Articles missing on your providers"],
+	["probe_inconclusive", "Article check could not finish"],
+	["no_media_file", "No media file to verify"],
+	["media_invalid", "Start of the media file was not valid"],
+	["media_missing", "Start of the media file is missing"],
+	["media_inconclusive", "Media check could not finish"],
+	["staging_failed", "Could not prepare files"],
+	["write_failed", "Could not write files"],
+	["unavailable", "No bundle could be fetched"],
+	["no_network", "Peer network not available"],
+	["forbidden_file", "Contains a file type that is never accepted"],
+	["sidecar_too_large", "A subtitle or info file was too large"],
+	["size_implausible", "Declared file sizes do not fit your NZB"],
+	["yenc_mismatch", "Sampled articles contradict the bundle"],
+	["structure_invalid", "Media file structure is broken"],
+]);
+
+export function notShareableLabel(key: string): string {
+	return NOT_SHAREABLE_LABELS.get(key) ?? key;
+}
+export function serveRefusedLabel(key: string): string {
+	return SERVE_REFUSED_LABELS.get(key) ?? key;
+}
+export function fetchFailLabel(key: string): string {
+	return FETCH_FAILED_LABELS.get(key) ?? key;
+}
+export function importRejectLabel(key: string): string {
+	return IMPORT_REJECT_LABELS.get(key) ?? key;
+}
 
 export function rejectionLabel(key: string): string {
 	return REJECTION_LABELS.get(key) ?? key;
@@ -125,21 +209,106 @@ export function showAdviceBlock(networks: readonly HasLevel[]): boolean {
 	return networks.some((n) => n.level >= 1);
 }
 
-/** Level 3 (bundles) is not implemented; it behaves like level 2 for records. */
-export function isLevelAvailable(level: PeernetLevel): boolean {
-	return level !== 3;
+/** The bundles block needs a network that receives. */
+export function showBundlesBlock(networks: readonly HasLevel[]): boolean {
+	return networks.some((n) => n.level >= 1);
+}
+
+/** Only level 3 serves bundles. */
+export function showBundleServing(networks: readonly HasLevel[]): boolean {
+	return networks.some((n) => n.level >= 3);
+}
+
+function positive(n: unknown): boolean {
+	return typeof n === "number" && Number.isFinite(n) && n > 0;
+}
+
+function anyPositive(value: unknown): boolean {
+	if (positive(value)) return true;
+	if (value && typeof value === "object") return Object.values(value).some(anyPositive);
+	return false;
+}
+
+/** True when any counter in the bundles object is non-zero. */
+export function bundleHasActivity(bundles: unknown): boolean {
+	return anyPositive(bundles);
+}
+
+/** Raising a network to level 3 (bundle serving) needs an explicit confirmation. */
+export function levelNeedsConfirmation(from: number, to: number): boolean {
+	return to === 3 && from !== 3;
+}
+
+export const PEER_BADGE_LABEL = "Peer network";
+export const PEER_BADGE_VERIFYING_LABEL = "Peer network \u00b7 verifying";
+export const PEER_BADGE_VERIFYING_TITLE =
+	"Imported from a peer bundle. It is playable now; a full check of every segment is running. It is announced to your ARRs and shared only after that check passes.";
+const PEER_BADGE_TITLE = "Imported from a peer bundle.";
+
+export interface PeerBadgeInfo {
+	label: string;
+	title: string;
+}
+
+/** Badge text for an item imported from a peer bundle, or null for any other item. */
+export function peerBadge(
+	origin: boolean | undefined,
+	fullCheckPending: boolean | undefined,
+): PeerBadgeInfo | null {
+	if (origin !== true) return null;
+	return fullCheckPending === true
+		? { label: PEER_BADGE_VERIFYING_LABEL, title: PEER_BADGE_VERIFYING_TITLE }
+		: { label: PEER_BADGE_LABEL, title: PEER_BADGE_TITLE };
+}
+
+function count(n: unknown): number {
+	return typeof n === "number" && Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+function countedPhrase(n: number, singular: string, plural: string): string | null {
+	return n > 0 ? `${n} ${n === 1 ? singular : plural}` : null;
 }
 
 /**
  * One plain-language line on how much of the library can be shared, or null
  * when there is nothing to say (no files known yet, or all can be shared).
+ * Older imports (no stored NZB) are identified by the files they contain, so
+ * they count as shareable; the line names why the remaining files are not.
  */
 export function libraryShareLine(library: PeernetLibraryStatus | undefined): string | null {
 	if (!library) return null;
 	const { files, with_release_id: shareable } = library;
 	if (![files, shareable].every((n) => Number.isFinite(n) && n >= 0) || files <= 0) return null;
 	if (shareable >= files) return null;
-	return `${shareable} of ${files} library files can be shared; the rest were imported before sharing data was kept.`;
+
+	const older = count(library.with_derived_release_id);
+	const shared =
+		older > 0
+			? `${shareable} of ${files} library files can be shared (${older} of them ${older === 1 ? "is an older import" : "are older imports"}, identified by the files they contain).`
+			: `${shareable} of ${files} library files can be shared.`;
+
+	const reasons = [
+		countedPhrase(
+			count(library.no_source_nzb),
+			"has no record of the import it came from",
+			"have no record of the import they came from",
+		),
+		countedPhrase(
+			count(library.group_too_large),
+			"is in an import with too many files",
+			"are in imports with too many files",
+		),
+		countedPhrase(
+			count(library.pending),
+			"is still being worked out",
+			"are still being worked out",
+		),
+		countedPhrase(count(library.not_indexable), "could not be read", "could not be read"),
+	].filter((r): r is string => r !== null);
+	const rest = files - shareable;
+	return reasons.length > 0
+		? `${shared} The other ${rest} cannot be: ${reasons.join(", ")}.`
+		: `${shared} The other ${rest} cannot be.`;
 }
 
 /** The skip key that means no provider backbone could be recognised. */

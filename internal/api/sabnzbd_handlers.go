@@ -634,7 +634,7 @@ func (s *Server) handleSABnzbdQueue(c *fiber.Ctx) error {
 	}
 
 	// Get pending and processing items
-	items, err := s.queueRepo.ListActiveQueueItems(c.Context(), "", categoryFilter, limit, start, "updated_at", "desc")
+	items, err := s.queueRepo.ListActiveQueueItemsWithHeld(c.Context(), "", categoryFilter, limit, start, "updated_at", "desc")
 	if err != nil {
 		return s.writeSABnzbdErrorFiber(c, "Failed to get queue")
 	}
@@ -642,7 +642,7 @@ func (s *Server) handleSABnzbdQueue(c *fiber.Ctx) error {
 	// Get total count for pagination info
 
 	// Let's just use a simple approach for now:
-	totalCount, err := s.queueRepo.CountActiveQueueItems(c.Context(), "", categoryFilter)
+	totalCount, err := s.queueRepo.CountActiveQueueItemsWithHeld(c.Context(), "", categoryFilter)
 	if err != nil {
 		totalCount = len(items) // Fallback
 	}
@@ -657,7 +657,12 @@ func (s *Server) handleSABnzbdQueue(c *fiber.Ctx) error {
 			continue
 		}
 
-		slot := ToSABnzbdQueueSlot(item, start+i, s.progressBroadcaster)
+		var slot SABnzbdQueueSlot
+		if item.PeerHold {
+			slot = toSABnzbdHeldPeerSlot(item, start+i, s.progressBroadcaster)
+		} else {
+			slot = ToSABnzbdQueueSlot(item, start+i, s.progressBroadcaster)
+		}
 		slots = append(slots, slot)
 
 		if mb, err := strconv.ParseFloat(slot.Mb, 64); err == nil {
@@ -953,7 +958,7 @@ func (s *Server) respondSABnzbdHistoryByIDs(
 		// 1. Numeric id → queue first, then history.nzb_id.
 		if numericID, err := strconv.ParseInt(id, 10, 64); err == nil {
 			if item, err := s.queueRepo.GetQueueItem(ctx, numericID); err == nil && item != nil {
-				if !item.SkipArrNotification && categoryMatches(item.Category) && !seen[item.ID] {
+				if !item.SkipArrNotification && !item.PeerHold && categoryMatches(item.Category) && !seen[item.ID] {
 					finalItems = append(finalItems, item)
 					if item.Status == database.QueueStatusCompleted {
 						liveCompleted[item] = true
@@ -973,7 +978,7 @@ func (s *Server) respondSABnzbdHistoryByIDs(
 
 		// 2. String id → queue.download_id, then history.download_id.
 		if item, err := s.queueRepo.GetQueueItemByDownloadID(ctx, id); err == nil && item != nil {
-			if !item.SkipArrNotification && categoryMatches(item.Category) && !seen[item.ID] {
+			if !item.SkipArrNotification && !item.PeerHold && categoryMatches(item.Category) && !seen[item.ID] {
 				finalItems = append(finalItems, item)
 				if item.Status == database.QueueStatusCompleted {
 					liveCompleted[item] = true

@@ -22,6 +22,45 @@ type PeernetContentEntry struct {
 	FilePath  string
 	FileID    string
 	ReleaseID string
+	// ReleaseScheme says how ReleaseID was derived: PeernetSchemeNone (no
+	// release ID), PeernetSchemeNZB or PeernetSchemeFiles. A ReleaseID given
+	// with no scheme is stored as PeernetSchemeNZB.
+	ReleaseScheme int
+	// GroupKey is a local-only 64-hex key shared by the files of one import
+	// (empty when the metadata names no source). It never leaves the node.
+	GroupKey string
+}
+
+// Release ID schemes stored in peernet_content_index.release_scheme and in
+// peernet_records.release_scheme.
+const (
+	PeernetSchemeNone  = 0
+	PeernetSchemeNZB   = 1
+	PeernetSchemeFiles = 2
+)
+
+// PeernetGroupSummary is one import group and how many of its files still
+// need a derived release ID decision (files that are not nzb-scheme).
+type PeernetGroupSummary struct {
+	Key   string
+	Files int
+}
+
+// PeernetDerivedUpdate sets (or, with an empty ReleaseID, clears) the derived
+// release ID of one row. FileID and GroupKey guard against a row that changed
+// since the group was read.
+type PeernetDerivedUpdate struct {
+	FilePath  string
+	FileID    string
+	GroupKey  string
+	ReleaseID string
+}
+
+// PeernetContentRef is the group and release identity of one row.
+type PeernetContentRef struct {
+	GroupKey      string
+	ReleaseID     string
+	ReleaseScheme int
 }
 
 // PeernetContentRepository stores the local index from virtual file path to
@@ -39,13 +78,24 @@ func NewPeernetContentRepository(conn *sql.DB, d Dialect) *PeernetContentReposit
 	}
 }
 
+// peernetContentCols is the column list every row read uses; scanContent reads it.
+const peernetContentCols = `file_path, file_id, release_id, release_scheme, group_key`
+
 const peernetUpsertSQL = `
-	INSERT INTO peernet_content_index (file_path, file_id, release_id, indexed_at)
-	VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+	INSERT INTO peernet_content_index (file_path, file_id, release_id, release_scheme, group_key, indexed_at)
+	VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 	ON CONFLICT (file_path) DO UPDATE SET
 		file_id = excluded.file_id,
 		release_id = excluded.release_id,
+		release_scheme = excluded.release_scheme,
+		group_key = excluded.group_key,
 		indexed_at = CURRENT_TIMESTAMP`
+
+func scanContent(r rowScanner) (PeernetContentEntry, error) {
+	var e PeernetContentEntry
+	err := r.Scan(&e.FilePath, &e.FileID, &e.ReleaseID, &e.ReleaseScheme, &e.GroupKey)
+	return e, err
+}
 
 // normalizePeernetPath folds a virtual path to the form used as the row key:
 // forward slashes, cleaned, no leading slash.
@@ -74,8 +124,20 @@ func (e PeernetContentEntry) prepare() (PeernetContentEntry, error) {
 	if e.ReleaseID != "" && !isHexID(e.ReleaseID) {
 		return e, fmt.Errorf("peernet content: invalid release id for %q", e.FilePath)
 	}
+	if e.ReleaseID != "" && e.ReleaseScheme == PeernetSchemeNone {
+		e.ReleaseScheme = PeernetSchemeNZB // a release ID with no scheme is the original kind
+	}
+	switch {
+	case e.ReleaseScheme < PeernetSchemeNone || e.ReleaseScheme > PeernetSchemeFiles:
+		return e, fmt.Errorf("peernet content: invalid release scheme for %q", e.FilePath)
+	case (e.ReleaseID == "") != (e.ReleaseScheme == PeernetSchemeNone):
+		return e, fmt.Errorf("peernet content: release id and scheme disagree for %q", e.FilePath)
+	case e.GroupKey != "" && !isHexID(e.GroupKey):
+		return e, fmt.Errorf("peernet content: invalid group key for %q", e.FilePath)
+	}
 	e.FileID = strings.ToLower(e.FileID)
 	e.ReleaseID = strings.ToLower(e.ReleaseID)
+	e.GroupKey = strings.ToLower(e.GroupKey)
 	return e, nil
 }
 
@@ -85,7 +147,7 @@ func (r *PeernetContentRepository) Upsert(ctx context.Context, e PeernetContentE
 	if err != nil {
 		return err
 	}
-	if _, err := r.db.ExecContext(ctx, peernetUpsertSQL, e.FilePath, e.FileID, e.ReleaseID); err != nil {
+	if _, err := r.db.ExecContext(ctx, peernetUpsertSQL, e.FilePath, e.FileID, e.ReleaseID, e.ReleaseScheme, e.GroupKey); err != nil {
 		return fmt.Errorf("upsert peernet content %q: %w", e.FilePath, err)
 	}
 	return nil
@@ -118,7 +180,7 @@ func (r *PeernetContentRepository) UpsertBatch(ctx context.Context, entries []Pe
 	}
 	defer stmt.Close()
 	for _, e := range prepared {
-		if _, err := stmt.ExecContext(ctx, e.FilePath, e.FileID, e.ReleaseID); err != nil {
+		if _, err := stmt.ExecContext(ctx, e.FilePath, e.FileID, e.ReleaseID, e.ReleaseScheme, e.GroupKey); err != nil {
 			return fmt.Errorf("upsert peernet content %q: %w", e.FilePath, err)
 		}
 	}
@@ -135,10 +197,8 @@ func (r *PeernetContentRepository) GetByPath(ctx context.Context, filePath strin
 	if p == "" {
 		return PeernetContentEntry{}, false, errors.New("peernet content: empty file path")
 	}
-	var e PeernetContentEntry
-	err := r.db.QueryRowContext(ctx,
-		`SELECT file_path, file_id, release_id FROM peernet_content_index WHERE file_path = ?`, p).
-		Scan(&e.FilePath, &e.FileID, &e.ReleaseID)
+	e, err := scanContent(r.db.QueryRowContext(ctx,
+		`SELECT `+peernetContentCols+` FROM peernet_content_index WHERE file_path = ?`, p))
 	if errors.Is(err, sql.ErrNoRows) {
 		return PeernetContentEntry{}, false, nil
 	}
@@ -209,15 +269,15 @@ func (r *PeernetContentRepository) FindByReleaseID(ctx context.Context, releaseI
 func (r *PeernetContentRepository) find(ctx context.Context, column, id string) ([]PeernetContentEntry, error) {
 	// column is one of two compile-time constants, never caller input.
 	rows, err := r.db.QueryContext(ctx,
-		`SELECT file_path, file_id, release_id FROM peernet_content_index WHERE `+column+` = ? ORDER BY file_path`, id)
+		`SELECT `+peernetContentCols+` FROM peernet_content_index WHERE `+column+` = ? ORDER BY file_path`, id)
 	if err != nil {
 		return nil, fmt.Errorf("query peernet content by %s: %w", column, err)
 	}
 	defer rows.Close()
 	var out []PeernetContentEntry
 	for rows.Next() {
-		var e PeernetContentEntry
-		if err := rows.Scan(&e.FilePath, &e.FileID, &e.ReleaseID); err != nil {
+		e, err := scanContent(rows)
+		if err != nil {
 			return nil, fmt.Errorf("scan peernet content: %w", err)
 		}
 		out = append(out, e)
@@ -302,7 +362,7 @@ func (r *PeernetContentRepository) ListPage(ctx context.Context, after string, l
 		return nil, errors.New("peernet content: page limit must be positive")
 	}
 	rows, err := r.db.QueryContext(ctx,
-		`SELECT file_path, file_id, release_id FROM peernet_content_index
+		`SELECT `+peernetContentCols+` FROM peernet_content_index
 		 WHERE file_path > ? ORDER BY file_path LIMIT ?`, after, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list peernet content page: %w", err)
@@ -310,8 +370,8 @@ func (r *PeernetContentRepository) ListPage(ctx context.Context, after string, l
 	defer rows.Close()
 	var out []PeernetContentEntry
 	for rows.Next() {
-		var e PeernetContentEntry
-		if err := rows.Scan(&e.FilePath, &e.FileID, &e.ReleaseID); err != nil {
+		e, err := scanContent(rows)
+		if err != nil {
 			return nil, fmt.Errorf("scan peernet content: %w", err)
 		}
 		out = append(out, e)
@@ -374,17 +434,25 @@ func (r *PeernetContentRepository) MissingPaths(ctx context.Context, candidates 
 }
 
 // PeernetContentCounts summarises the index: every indexed file and how many
-// of them have a Release ID.
+// of them have a Release ID, by scheme. NoSourceGroup counts files with no
+// Release ID whose metadata names no source (they can never be grouped).
 type PeernetContentCounts struct {
-	Files, WithReleaseID int
+	Files, WithReleaseID                   int
+	WithNZBReleaseID, WithDerivedReleaseID int
+	NoSourceGroup                          int
 }
 
 // Counts returns the size of the index.
 func (r *PeernetContentRepository) Counts(ctx context.Context) (PeernetContentCounts, error) {
 	var c PeernetContentCounts
 	err := r.db.QueryRowContext(ctx,
-		`SELECT COUNT(*), COALESCE(SUM(CASE WHEN release_id <> '' THEN 1 ELSE 0 END), 0) FROM peernet_content_index`).
-		Scan(&c.Files, &c.WithReleaseID)
+		`SELECT COUNT(*),
+			COALESCE(SUM(CASE WHEN release_id <> '' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN release_scheme = 1 THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN release_scheme = 2 THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN release_id = '' AND group_key = '' THEN 1 ELSE 0 END), 0)
+		 FROM peernet_content_index`).
+		Scan(&c.Files, &c.WithReleaseID, &c.WithNZBReleaseID, &c.WithDerivedReleaseID, &c.NoSourceGroup)
 	if err != nil {
 		return PeernetContentCounts{}, fmt.Errorf("count peernet content: %w", err)
 	}

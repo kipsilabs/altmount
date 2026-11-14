@@ -106,6 +106,7 @@ func (s *Server) handleListHealth(c *fiber.Ctx) error {
 			response[i].CheckProgress = s.healthWorker.GetCheckProgress(item.FilePath)
 		}
 	}
+	s.annotateHealthPeerOrigin(c.Context(), items, response)
 
 	// Create metadata
 	meta := &APIMeta{
@@ -167,6 +168,7 @@ func (s *Server) handleGetHealth(c *fiber.Ctx) error {
 	if s.healthWorker != nil && item.Status == database.HealthStatusChecking {
 		response.CheckProgress = s.healthWorker.GetCheckProgress(item.FilePath)
 	}
+	s.annotateHealthPeerOrigin(c.Context(), []*database.FileHealth{item}, []*HealthItemResponse{response})
 	return RespondSuccess(c, response)
 }
 
@@ -631,6 +633,7 @@ func (s *Server) handleListCorrupted(c *fiber.Ctx) error {
 			response[i].CheckProgress = s.healthWorker.GetCheckProgress(item.FilePath)
 		}
 	}
+	s.annotateHealthPeerOrigin(c.Context(), corruptedItems, response)
 
 	// Create metadata
 	meta := &APIMeta{

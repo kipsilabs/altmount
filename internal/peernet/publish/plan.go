@@ -50,6 +50,12 @@ type State struct {
 	// are never put in a record.
 	OriginCategory string
 	OriginIndexer  string
+	// BundleID is the Bundle ID the release record announced (zero: none) and
+	// BundleLevel the exposure level the record was published at. Release
+	// records only. A transient bundle failure stores nothing: the release is
+	// skipped and retried.
+	BundleID    records.BundleID
+	BundleLevel int
 }
 
 // DueRelease reports whether a release record should be published now: never

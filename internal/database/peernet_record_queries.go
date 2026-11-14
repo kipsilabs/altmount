@@ -302,6 +302,8 @@ type PeernetCandidate struct {
 	TotalSize       int64
 	CreatedAt       time.Time
 	Source          int
+	// ReleaseScheme is PeernetSchemeNZB or PeernetSchemeFiles.
+	ReleaseScheme int
 }
 
 // CandidatesByMedia returns non-expired release records for a media key across
@@ -331,7 +333,7 @@ func (r *PeernetRecordRepository) CandidatesByMedia(ctx context.Context, network
 		args = append(args, n)
 	}
 	q := `SELECT seq, network_id, release_id, publisher_node_id, imdb_id, season, episode, title, total_size,
-			created_at, source
+			created_at, source, release_scheme
 		FROM peernet_records
 		WHERE network_id IN (?` + strings.Repeat(",?", len(networkIDs)-1) + `)
 		  AND kind = ? AND imdb_id = ? AND expires_at > ?`
@@ -360,7 +362,7 @@ func (r *PeernetRecordRepository) CandidatesByMedia(ctx context.Context, network
 		var s, e sql.NullInt64
 		var created int64
 		if err := rows.Scan(&c.Seq, &c.NetworkID, &c.ReleaseID, &c.PublisherNodeID, &c.IMDbID, &s, &e, &c.Title,
-			&c.TotalSize, &created, &c.Source); err != nil {
+			&c.TotalSize, &created, &c.Source, &c.ReleaseScheme); err != nil {
 			return nil, fmt.Errorf("scan peernet candidate: %w", err)
 		}
 		if s.Valid {
@@ -431,4 +433,91 @@ func (r *PeernetRecordRepository) Stats(ctx context.Context, networkID string) (
 		return out, fmt.Errorf("count peernet publishers: %w", err)
 	}
 	return out, nil
+}
+
+// PeernetMaxFilesPerQuery bounds AttestationsForFiles input.
+const PeernetMaxFilesPerQuery = 1024
+
+// peernetFileAttestationsMax caps the rows AttestationsForFiles returns.
+const peernetFileAttestationsMax = 5000
+
+// attestationsForFilesSQL is the file-evidence query for n file IDs. The unary
+// plus on expires_at stops SQLite from preferring the (network, expires_at)
+// index, which it otherwise picks when it has no statistics: the file index is
+// the selective one, and a scan of every live record of a network is exactly
+// the cost this query must not have. PostgreSQL ignores the plus.
+func attestationsForFilesSQL(n int) string {
+	return `SELECT publisher_node_id, file_id, healthy, backbones, checked_at, created_at, source,
+			segments_checked, total_segments
+		FROM (
+			SELECT publisher_node_id, file_id, healthy, backbones, checked_at, created_at, source,
+				segments_checked, total_segments,
+				ROW_NUMBER() OVER (PARTITION BY file_id, publisher_node_id, healthy ORDER BY checked_at DESC, seq DESC) AS rn
+			FROM peernet_records
+			WHERE network_id = ? AND kind = ? AND file_id IN (?` + strings.Repeat(",?", n-1) + `)
+			  AND +expires_at > ? AND checked_at >= ? AND healthy IS NOT NULL
+		) ranked
+		WHERE rn = 1
+		ORDER BY healthy, checked_at DESC, publisher_node_id, file_id
+		LIMIT ?`
+}
+
+// AttestationsForFiles returns the non-expired attestations, checked at or
+// after notBefore, of the given files in a network, whatever release ID they
+// were published under: a file's articles are the same whichever release it
+// is part of, so evidence about the file applies to every copy of it.
+//
+// At most one row per (file, publisher, verdict) is returned, the newest, so a
+// publisher cannot fill the result by attesting one file under many invented
+// release IDs, and a publisher counts once per file. Unhealthy rows come first,
+// then newest check first, and at most 5000 rows are returned: truncation can
+// only ever drop healthy evidence. At most PeernetMaxFilesPerQuery distinct
+// files are accepted (ErrPeernetTooManyIDs beyond that). checked_at is clamped
+// to the receive time on insert (see AttestationsFor).
+func (r *PeernetRecordRepository) AttestationsForFiles(ctx context.Context, networkID string, fileIDs []string, notBefore time.Time) ([]PeernetAttestation, error) {
+	if !isLowerHexID(networkID) {
+		return nil, errors.New("peernet records: invalid network id")
+	}
+	seen := make(map[string]struct{}, len(fileIDs))
+	ids := make([]string, 0, len(fileIDs))
+	for _, id := range fileIDs {
+		if !isLowerHexID(id) {
+			return nil, errors.New("peernet records: invalid file id")
+		}
+		if _, dup := seen[id]; !dup {
+			seen[id] = struct{}{}
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) > PeernetMaxFilesPerQuery {
+		return nil, ErrPeernetTooManyIDs
+	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	args := []any{networkID, PeernetRecordKindAttestation}
+	for _, id := range ids {
+		args = append(args, id)
+	}
+	args = append(args, r.now().Unix(), unixOrZero(notBefore), peernetFileAttestationsMax)
+	rows, err := r.db.QueryContext(ctx, attestationsForFilesSQL(len(ids)), args...)
+	if err != nil {
+		return nil, fmt.Errorf("query peernet attestations by file: %w", err)
+	}
+	defer rows.Close()
+	var out []PeernetAttestation
+	for rows.Next() {
+		var a PeernetAttestation
+		var healthy sql.NullInt64
+		var bb string
+		var checked, created int64
+		if err := rows.Scan(&a.PublisherNodeID, &a.FileID, &healthy, &bb, &checked, &created, &a.Source, &a.SegmentsChecked, &a.TotalSegments); err != nil {
+			return nil, fmt.Errorf("scan peernet attestation: %w", err)
+		}
+		a.Healthy = healthy.Valid && healthy.Int64 != 0
+		a.Backbones = splitBackbones(bb)
+		a.CheckedAt, a.CreatedAt = timeOrZero(checked), timeOrZero(created)
+		out = append(out, a)
+	}
+	return out, rows.Err()
 }

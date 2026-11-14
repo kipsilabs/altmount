@@ -90,6 +90,9 @@ type HealthWorker struct {
 	// healthyObserver is notified of fresh healthy results (see observer.go).
 	// Nil by default: no behaviour change and no overhead.
 	healthyObserver atomic.Pointer[observerHolder]
+	// peerBundleGate holds back peer-bundle imports until their full check
+	// passed (see peer_bundle.go). Nil: feature off, nothing extra runs.
+	peerBundleGate atomic.Pointer[peerBundleGateHolder]
 
 	// Worker state
 	status   WorkerStatus
@@ -638,6 +641,23 @@ func (hw *HealthWorker) prepareUpdateForResult(ctx context.Context, fh *database
 	// When delete-on-corruption is enabled, confirmed corruption is handled by removing
 	// the file entirely instead of ever entering the repair flow below (this covers both
 	// freshly-exhausted checks and files already sitting in repair_triggered).
+	// A pending peer import that came back corrupted for good (retries used up,
+	// or delete-on-corruption) is not repaired through an ARR: the corrupted
+	// verdict is written and the peer-bundle gate is told once the write landed
+	// (notifyPeerBundleResults), which fails the whole import: the queue item
+	// turns into a failed one (an ARR that grabbed it sees that in its history
+	// and searches again) and its files, this one included, are removed. The
+	// same item is therefore never acted on twice.
+	if (hw.configGetter().GetHealthDeleteOnCorruption() || fh.RetryCount >= hw.configGetter().GetMaxRetries()-1) &&
+		hw.peerImportFailsFor(ctx, fh.FilePath) {
+		update.Type = database.UpdateTypeCorrupted
+		update.Status = database.HealthStatusCorrupted
+		return update, func() error {
+			slog.WarnContext(ctx, "Peer import failed its full check; no ARR repair is triggered", "file_path", fh.FilePath)
+			return nil
+		}
+	}
+
 	if hw.configGetter().GetHealthDeleteOnCorruption() {
 		return hw.deleteCorruptedFile(ctx, fh)
 	}
@@ -960,6 +980,11 @@ func (hw *HealthWorker) performDirectCheck(ctx context.Context, filePath string,
 	}
 
 	opts := CheckOptions{CurrentStatus: currentStatus, VerifyContentOverride: verifyContentOverride, OnProgress: hw.progressReporter(map[string]*activeCheck{filePath: entry})}
+	// A peer-bundle import owes a full check, whoever asked for this one.
+	peerPending := hw.pendingPeerBundles(ctx, []string{filePath})
+	if len(peerPending) > 0 {
+		opts.FullCheckFiles = peerPending
+	}
 	// Delegate to HealthChecker
 	event := hw.healthChecker.CheckFile(checkCtx, filePath, opts)
 
@@ -999,6 +1024,9 @@ func (hw *HealthWorker) performDirectCheck(ctx context.Context, filePath string,
 		if err != nil {
 			return fmt.Errorf("failed to update health status: %w", err)
 		}
+		// The gate first: the publisher acts on the healthy notice and must
+		// find a passed full check already recorded.
+		hw.notifyPeerBundleResults(ctx, peerPending, []database.HealthStatusUpdate{*updatePtr}, applied, map[string]HealthEvent{filePath: event})
 		hw.notifyHealthyApplied([]database.HealthStatusUpdate{*updatePtr}, applied, map[string]HealthEvent{filePath: event})
 		hw.enqueueDegradedRepair(ctx, *updatePtr)
 		hw.broadcastHealthChanged()
@@ -1110,6 +1138,7 @@ func (hw *HealthWorker) runHealthCheckCycle(ctx context.Context) error {
 	// healthyEvents holds, only while an observer is installed, the healthy
 	// results to announce once their writes have landed.
 	healthyEvents := map[string]HealthEvent{}
+	peerEvents := map[string]HealthEvent{}
 	var resultsMu sync.Mutex
 
 	// The regular-check writes are based on the record being 'checking' (set just above);
@@ -1137,6 +1166,11 @@ func (hw *HealthWorker) runHealthCheckCycle(ctx context.Context) error {
 		statuses[i] = fh.Status
 	}
 	checkOpts := CheckOptions{OnProgress: reportProgress}
+	// Peer-bundle imports owe a full check (nil with no gate: no lookup).
+	peerPending := hw.pendingPeerBundles(ctx, paths)
+	if len(peerPending) > 0 {
+		checkOpts.FullCheckFiles = peerPending
+	}
 	if hw.healthChecker.peerAdviserOn() {
 		checkOpts.PeerFiles = peerFilesFor(unhealthyFiles)
 	}
@@ -1168,6 +1202,9 @@ func (hw *HealthWorker) runHealthCheckCycle(ctx context.Context) error {
 			results = append(results, *updatePtr)
 			if hw.healthyObserver.Load() != nil && event.Type == EventTypeFileHealthy {
 				healthyEvents[fh.FilePath] = event
+			}
+			if _, ok := peerPending[fh.FilePath]; ok {
+				peerEvents[fh.FilePath] = event
 			}
 			resultsMu.Unlock()
 
@@ -1271,6 +1308,8 @@ func (hw *HealthWorker) runHealthCheckCycle(ctx context.Context) error {
 			for _, result := range results {
 				hw.enqueueDegradedRepair(ctx, result)
 			}
+			// The gate first (see the direct check path).
+			hw.notifyPeerBundleResults(ctx, peerPending, results, applied, peerEvents)
 			hw.notifyHealthyApplied(results, applied, healthyEvents)
 		}
 		hw.broadcastHealthChanged()

@@ -24,6 +24,13 @@ type PeernetPublishState struct {
 	// (lower-cased, trimmed) of the release's origin at publish time.
 	OriginCategory string
 	OriginIndexer  string
+	// BundleID is the Bundle ID announced in the release record (lower-case
+	// hex; empty when none). BundleLevel is the exposure level the record was
+	// published at; at 3 or more the record was published with the bundle
+	// decision made (an empty BundleID then means the release is not
+	// shareable as a bundle). Release records only.
+	BundleID    string
+	BundleLevel int
 }
 
 // PeernetPublishStateRepository stores last-published state (table
@@ -59,9 +66,10 @@ func (r *PeernetPublishStateRepository) Get(ctx context.Context, network string,
 	s := PeernetPublishState{NetworkID: network, Kind: kind, ReleaseID: release, FileID: file}
 	var published, checked int64
 	err := r.db.QueryRowContext(ctx,
-		`SELECT published_at, checked_at, verdict, origin_category, origin_indexer FROM peernet_publish_state
-		 WHERE network_id = ? AND kind = ? AND release_id = ? AND file_id = ?`,
-		network, kind, release, file).Scan(&published, &checked, &s.Verdict, &s.OriginCategory, &s.OriginIndexer)
+		`SELECT published_at, checked_at, verdict, origin_category, origin_indexer, bundle_id, bundle_level
+		 FROM peernet_publish_state WHERE network_id = ? AND kind = ? AND release_id = ? AND file_id = ?`,
+		network, kind, release, file).Scan(&published, &checked, &s.Verdict, &s.OriginCategory, &s.OriginIndexer,
+		&s.BundleID, &s.BundleLevel)
 	if errors.Is(err, sql.ErrNoRows) {
 		return PeernetPublishState{}, false, nil
 	}
@@ -77,15 +85,19 @@ func (r *PeernetPublishStateRepository) Put(ctx context.Context, s PeernetPublis
 	if err := validStateKey(s.NetworkID, s.Kind, s.ReleaseID, s.FileID); err != nil {
 		return err
 	}
+	if s.BundleID != "" && (s.Kind != PeernetRecordKindRelease || !isLowerHexID(s.BundleID)) {
+		return errors.New("peernet publish state: invalid bundle id")
+	}
 	_, err := r.db.ExecContext(ctx,
 		`INSERT INTO peernet_publish_state (network_id, kind, release_id, file_id, published_at, checked_at, verdict,
-			origin_category, origin_indexer)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+			origin_category, origin_indexer, bundle_id, bundle_level)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT (network_id, kind, release_id, file_id) DO UPDATE SET
 			published_at = excluded.published_at, checked_at = excluded.checked_at, verdict = excluded.verdict,
-			origin_category = excluded.origin_category, origin_indexer = excluded.origin_indexer`,
+			origin_category = excluded.origin_category, origin_indexer = excluded.origin_indexer,
+			bundle_id = excluded.bundle_id, bundle_level = excluded.bundle_level`,
 		s.NetworkID, s.Kind, s.ReleaseID, s.FileID, unixOrZero(s.PublishedAt), unixOrZero(s.CheckedAt), s.Verdict,
-		normTag(s.OriginCategory), normTag(s.OriginIndexer))
+		normTag(s.OriginCategory), normTag(s.OriginIndexer), s.BundleID, s.BundleLevel)
 	if err != nil {
 		return fmt.Errorf("put peernet publish state: %w", err)
 	}

@@ -104,10 +104,36 @@ type ReleaseInfo struct {
 	Media     records.MediaIDs
 	Category  string
 	Indexer   string
+	// ReleaseScheme says how the Release ID was derived: records.SchemeNZB (also
+	// the zero value) or records.SchemeFiles. It goes into both record types.
+	ReleaseScheme uint8
 	// Secrets are the import's passwords (archive password, password spelled
 	// in the NZB name). They are used only to refuse a title that contains
 	// one: never stored, logged or published.
 	Secrets []string
+}
+
+// BundleMinLevel is the lowest exposure level that announces a bundle.
+const BundleMinLevel = 3
+
+// BundleDecision is what a BundleSource says about one release.
+type BundleDecision struct {
+	// ID is the Bundle ID to announce; zero when the release has no bundle.
+	ID records.BundleID
+	// Skip names the permanent reason a release cannot be shared as a bundle
+	// (the source counts it). The record is published without a Bundle ID and
+	// the decision is remembered.
+	Skip string
+	// Err is a transient failure. The record is published without a Bundle ID
+	// and the decision is not remembered, so it is made again soon.
+	Err error
+}
+
+// BundleSource builds the bundle of a release and returns its ID. It is
+// called only for a network at level BundleMinLevel or higher, and only when a
+// release record is about to be published.
+type BundleSource interface {
+	BundleFor(ctx context.Context, rel records.ReleaseID, info ReleaseInfo) BundleDecision
 }
 
 // Network is one network and this node's exposure level on it.
@@ -182,6 +208,9 @@ type Config struct {
 	Networks   func() []Network
 	Exclusions func() Exclusions
 	Now        func() time.Time
+	// Bundles supplies Bundle IDs for networks at level 3. Nil: no record
+	// carries one.
+	Bundles BundleSource
 
 	Unknown UnknownPolicy
 	// PublishUnhealthy opts in to unhealthy attestations. Default off.
@@ -207,6 +236,7 @@ const (
 	SkipNoBackbone         SkipReason = "no_recognised_backbone"
 	SkipStale              SkipReason = "check_too_old"
 	SkipNotDue             SkipReason = "not_due"
+	SkipBundleUnavailable  SkipReason = "bundle_unavailable"
 	SkipTitleHasPassword   SkipReason = "title_contains_password"
 )
 
@@ -217,6 +247,11 @@ type Outcome struct {
 	Kind    records.Kind
 	Skip    SkipReason
 	Err     error
+	// BundleErr is a transient failure to build the bundle of a release
+	// record. The release is skipped (SkipBundleUnavailable) and its stored
+	// state kept, so a record that had a bundle is never superseded by one
+	// without it; the next pass retries.
+	BundleErr error
 }
 
 // Publisher builds and publishes records. It is safe for concurrent use as
@@ -279,7 +314,7 @@ func (p *Publisher) Publish(ctx context.Context, res CheckResult, info ReleaseIn
 		if err := ctx.Err(); err != nil {
 			return outs, errors.Join(append(errs, err)...)
 		}
-		for _, o := range job.run(ctx, n.ID) {
+		for _, o := range job.run(ctx, n) {
 			outs = append(outs, o)
 			if o.Err != nil {
 				errs = append(errs, o.Err)
@@ -309,10 +344,10 @@ func (p *Publisher) ReannounceRelease(ctx context.Context, nw netid.NetworkID, r
 		o.Err = err
 		return o
 	}
-	allowed := false
+	allowed, level := false, 0
 	for _, n := range p.cfg.Networks() {
 		if n.ID == nw && n.Level >= MinLevel {
-			allowed = true
+			allowed, level = true, n.Level
 			break
 		}
 	}
@@ -325,11 +360,13 @@ func (p *Publisher) ReannounceRelease(ctx context.Context, nw netid.NetworkID, r
 		return o
 	}
 	j := &job{p: p, res: CheckResult{ReleaseID: rel}, info: info, now: now}
-	return j.release(ctx, nw)
+	return j.release(ctx, nw, level)
 }
 
 func validate(res CheckResult, info ReleaseInfo) error {
 	switch {
+	case info.ReleaseScheme > records.SchemeFiles:
+		return fmt.Errorf("%w: release scheme", ErrInvalidInput)
 	case res.ReleaseID == records.ReleaseID{}:
 		return fmt.Errorf("%w: zero release id", ErrInvalidInput)
 	case res.FileID == records.FileID{}:
@@ -452,15 +489,34 @@ func (j *job) backbones(ctx context.Context) []string {
 	return j.backbone
 }
 
-func (j *job) run(ctx context.Context, nw netid.NetworkID) []Outcome {
+func (j *job) run(ctx context.Context, n Network) []Outcome {
 	var outs []Outcome
 	if j.res.Verdict == VerdictHealthy {
-		outs = append(outs, j.release(ctx, nw))
+		outs = append(outs, j.release(ctx, n.ID, n.Level))
 	}
-	return append(outs, j.attestation(ctx, nw))
+	return append(outs, j.attestation(ctx, n.ID))
 }
 
-func (j *job) release(ctx context.Context, nw netid.NetworkID) Outcome {
+// bundleFor decides the bundle part of a release record for a network at the
+// given level: the Bundle ID to announce and the bundle level to remember.
+// Below level 3 (or without a source) the record carries no bundle and the
+// remembered level is the network's. A transient failure returns an error and
+// the caller publishes nothing for this pass.
+func (j *job) bundleFor(ctx context.Context, level int) (id records.BundleID, remembered int, err error) {
+	if level < BundleMinLevel || j.p.cfg.Bundles == nil {
+		return records.BundleID{}, level, nil
+	}
+	d := j.p.cfg.Bundles.BundleFor(ctx, j.res.ReleaseID, j.info)
+	switch {
+	case d.Err != nil:
+		return records.BundleID{}, 0, d.Err
+	case d.Skip == "":
+		return d.ID, level, nil
+	}
+	return records.BundleID{}, level, nil
+}
+
+func (j *job) release(ctx context.Context, nw netid.NetworkID, level int) Outcome {
 	o := Outcome{Network: nw, Kind: records.KindRelease}
 	var zero records.FileID
 	last, ok, err := j.p.cfg.Store.LastPublished(ctx, nw, records.KindRelease, j.res.ReleaseID, zero)
@@ -472,16 +528,24 @@ func (j *job) release(ctx context.Context, nw netid.NetworkID) Outcome {
 	if ok {
 		lp = &last
 	}
-	if !j.p.cfg.Plan.DueRelease(lp, j.now) {
+	// A level change (below 3 to 3 or back) supersedes the record at once: it
+	// is the bundle part of the record that differs.
+	levelChanged := lp != nil && (lp.BundleLevel >= BundleMinLevel) != (level >= BundleMinLevel)
+	if !j.p.cfg.Plan.DueRelease(lp, j.now) && !levelChanged {
 		o.Skip = SkipNotDue
 		return o
 	}
-	enc, err := j.buildRelease(nw)
+	bundle, remembered, bundleErr := j.bundleFor(ctx, level)
+	if bundleErr != nil {
+		o.BundleErr, o.Skip = bundleErr, SkipBundleUnavailable
+		return o
+	}
+	enc, err := j.buildRelease(nw, bundle)
 	if err != nil {
 		o.Err = err
 		return o
 	}
-	o.Err = j.send(ctx, nw, records.KindRelease, zero, enc, State{PublishedAt: j.now})
+	o.Err = j.send(ctx, nw, records.KindRelease, zero, enc, State{PublishedAt: j.now, BundleID: bundle, BundleLevel: remembered})
 	return o
 }
 
@@ -530,15 +594,16 @@ func (j *job) attestation(ctx context.Context, nw netid.NetworkID) Outcome {
 	return o
 }
 
-func (j *job) buildRelease(nw netid.NetworkID) ([]byte, error) {
+func (j *job) buildRelease(nw netid.NetworkID, bundle records.BundleID) ([]byte, error) {
 	in := records.ReleaseRecord{
+		BundleID:  bundle,
 		Title:     releaseTitle(j.info.Title),
 		TotalSize: j.info.TotalSize,
 		FileCount: j.info.FileCount,
 		PostDate:  j.info.PostDate,
 		Media:     j.info.Media,
 	}
-	in.ReleaseID = j.res.ReleaseID
+	in.ReleaseID, in.ReleaseScheme = j.res.ReleaseID, j.info.ReleaseScheme
 	enc, err := j.p.cfg.Signer.BuildRelease(nw, in, j.now)
 	if err != nil && errors.Is(err, records.ErrInvalidField) {
 		// Optional data from a local source is dropped rather than losing the
@@ -562,7 +627,7 @@ func (j *job) buildAttestation(nw netid.NetworkID, checked time.Time, labels []s
 		MediaHeaderVerified: j.res.MediaHeaderVerified && j.res.Verdict == VerdictHealthy,
 		Backbones:           labels,
 	}
-	in.ReleaseID = j.res.ReleaseID
+	in.ReleaseID, in.ReleaseScheme = j.res.ReleaseID, j.info.ReleaseScheme
 	enc, err := j.p.cfg.Signer.BuildAttestation(nw, in, j.now)
 	if err != nil {
 		return nil, fmt.Errorf("publish: build attestation: %w", err)
@@ -642,4 +707,15 @@ func titleLeaks(title string, secrets []string) bool {
 		}
 	}
 	return false
+}
+
+// CoversOrigin reports whether an origin tag (as kept with the publish state:
+// lower-cased category and indexer, either possibly empty) falls under an
+// exclusion. An empty tag and the indexer "unknown" match nothing.
+func (e Exclusions) CoversOrigin(category, indexer string) bool {
+	category, indexer = normName(category), normName(indexer)
+	if category != "" && listed(e.Categories, category) {
+		return true
+	}
+	return indexer != "" && indexer != "unknown" && listed(e.Indexers, indexer)
 }

@@ -72,6 +72,8 @@ type Status struct {
 	Publish PublishStatus
 	// Advice counts what the consuming side did since start.
 	Advice AdviceStatus
+	// Bundles counts bundle building, serving and fetching since start.
+	Bundles BundleStatus
 }
 
 // Status returns the current snapshot.
@@ -116,6 +118,7 @@ func (s *Service) Status(ctx context.Context) (Status, error) {
 		st.Publish = n.pipe.stats.snapshot()
 	}
 	st.Advice = s.adviceStatus()
+	st.Bundles = n.bundleStatus(ctx)
 	st.AdvertiseWarning = advertiseWarning(set.AdvertiseAddress, rows, set, n.deps.allowLoopback)
 	for i := range rows {
 		ns, err := n.networkStatus(ctx, &rows[i], set)

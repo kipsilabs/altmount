@@ -53,16 +53,17 @@ func (i *Indexer) Reconcile(ctx context.Context) (ReconcileResult, error) {
 		}
 		after = page[len(page)-1].FilePath
 		upserts := make([]database.PeernetContentEntry, 0, len(page))
+		olds := make(map[string]database.PeernetContentEntry, len(page))
 		for _, row := range page {
 			if err := ctx.Err(); err != nil {
-				i.flushReconcile(ctx, upserts, &res)
+				i.flushReconcile(ctx, upserts, olds, &res)
 				return res, err
 			}
 			res.Checked++
 			act, entry, err := i.reconcileRow(ctx, row)
 			if err != nil {
 				if ctx.Err() != nil {
-					i.flushReconcile(ctx, upserts, &res)
+					i.flushReconcile(ctx, upserts, olds, &res)
 					return res, ctx.Err()
 				}
 				return res, err
@@ -76,7 +77,7 @@ func (i *Indexer) Reconcile(ctx context.Context) (ReconcileResult, error) {
 				res.Skipped++
 			}
 		}
-		if err := i.flushReconcile(ctx, upserts, &res); err != nil {
+		if err := i.flushReconcile(ctx, upserts, olds, &res); err != nil {
 			return res, err
 		}
 	}
@@ -87,7 +88,7 @@ func (i *Indexer) Reconcile(ctx context.Context) (ReconcileResult, error) {
 	return res, nil
 }
 
-func (i *Indexer) flushReconcile(ctx context.Context, upserts []database.PeernetContentEntry, res *ReconcileResult) error {
+func (i *Indexer) flushReconcile(ctx context.Context, upserts []database.PeernetContentEntry, olds map[string]database.PeernetContentEntry, res *ReconcileResult) error {
 	if len(upserts) == 0 {
 		return nil
 	}
@@ -95,6 +96,9 @@ func (i *Indexer) flushReconcile(ctx context.Context, upserts []database.Peernet
 		return fmt.Errorf("write reindexed rows: %w", err)
 	}
 	res.Reindexed += len(upserts)
+	for _, e := range upserts {
+		i.noteChanged(olds[e.FilePath], e)
+	}
 	return nil
 }
 
@@ -134,7 +138,16 @@ func (i *Indexer) reconcileRow(ctx context.Context, row database.PeernetContentE
 	case err != nil:
 		return actSkip, zero, nil
 	}
-	if fid.String() == row.FileID && (m.StoreRef != "" && !migratedStore(m.StoreRef)) == (row.ReleaseID != "") {
+	if fid.String() == row.FileID && row.GroupKey != "" && groupKey(m.SourceNzbPath) == "" &&
+		(m.StoreRef == "" || migratedStore(m.StoreRef)) {
+		return actKeep, zero, nil // grouped by a verified bundle: the metadata cannot recompute that
+	}
+	// A derived ID (scheme files) belongs to the row's group, not to the
+	// metadata: a row is unchanged while the file, its group and whether it
+	// has a store-based ID agree.
+	storeBased := m.StoreRef != "" && !migratedStore(m.StoreRef)
+	if fid.String() == row.FileID && groupKey(m.SourceNzbPath) == row.GroupKey &&
+		storeBased == (row.ReleaseScheme == database.PeernetSchemeNZB) {
 		return actKeep, zero, nil
 	}
 	entry, err := i.Entry(ctx, row.FilePath)
@@ -144,7 +157,7 @@ func (i *Indexer) reconcileRow(ctx context.Context, row database.PeernetContentE
 		}
 		return actSkip, zero, nil
 	}
-	if entry.FileID == row.FileID && entry.ReleaseID == row.ReleaseID {
+	if sameIdentity(row, entry) {
 		return actKeep, zero, nil // e.g. a store with no real article keeps an empty release ID
 	}
 	return actReindex, entry, nil

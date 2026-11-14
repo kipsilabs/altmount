@@ -99,7 +99,7 @@ func (a *HealthAttestation) Verify(now time.Time, arrivedIn netid.NetworkID) err
 // are ignored; expiry is AttestationValidity after creation. Backbone labels
 // are trimmed, lower-cased, sorted and de-duplicated on a copy.
 func BuildHealthAttestation(key *identity.Key, nw netid.NetworkID, in HealthAttestation, now time.Time) (*HealthAttestation, []byte, error) {
-	h, err := newHeader(key, nw, in.ReleaseID, now, AttestationValidity)
+	h, err := newHeader(key, nw, in.ReleaseID, in.ReleaseScheme, now, AttestationValidity)
 	if err != nil {
 		return nil, nil, err
 	}

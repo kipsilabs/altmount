@@ -33,6 +33,9 @@ const (
 	// skipPatchStatusUnknown: whether a local PAR2 patch covers the file was
 	// not determined (the check began before the observer was installed).
 	skipPatchStatusUnknown = "patch_status_unknown"
+	// skipPeerStatusUnknown: whether the file came from a peer bundle could not
+	// be read, so it is not eligible.
+	skipPeerStatusUnknown = "peer_status_unknown"
 )
 
 // LocalHealth is the read-only view of local file health the re-announce
@@ -219,11 +222,20 @@ func (s stateStore) LastPublished(ctx context.Context, nw netid.NetworkID, kind 
 	if err != nil || !ok {
 		return publish.State{}, false, err
 	}
-	return publish.State{PublishedAt: row.PublishedAt, CheckedAt: row.CheckedAt, Verdict: publish.Verdict(row.Verdict)}, true, nil
+	st := publish.State{PublishedAt: row.PublishedAt, CheckedAt: row.CheckedAt, Verdict: publish.Verdict(row.Verdict),
+		BundleLevel: row.BundleLevel}
+	if id, err := contentid.ParseID(row.BundleID); err == nil {
+		st.BundleID = records.BundleID(id)
+	}
+	return st, true, nil
 }
 
 func (s stateStore) MarkPublished(ctx context.Context, nw netid.NetworkID, kind records.Kind, rel records.ReleaseID, file records.FileID, st publish.State) error {
-	return s.repo.Put(ctx, database.PeernetPublishState{
+	bundleHex := ""
+	if st.BundleID != (records.BundleID{}) {
+		bundleHex = contentid.ID(st.BundleID).String()
+	}
+	return s.repo.Put(ctx, database.PeernetPublishState{BundleID: bundleHex, BundleLevel: st.BundleLevel,
 		NetworkID: nw.String(), Kind: kindToDB(kind), ReleaseID: contentid.ID(rel).String(), FileID: fileHex(file),
 		PublishedAt: st.PublishedAt, CheckedAt: st.CheckedAt, Verdict: int(st.Verdict),
 		OriginCategory: st.OriginCategory, OriginIndexer: st.OriginIndexer,
@@ -271,6 +283,10 @@ type pipelineConfig struct {
 	// stamped with it and checked against real time, so it is never moved
 	// apart from Now outside tests.
 	PublisherNow func() time.Time
+	// Bundles supplies Bundle IDs at level 3; nil announces none.
+	Bundles publish.BundleSource
+	// PeerOrigin gates files that came from a peer bundle; nil means none did.
+	PeerOrigin PeerBundleOrigin
 }
 
 // pipeline turns healthy-check notices into published records. The health
@@ -304,6 +320,7 @@ func newPipeline(cfg pipelineConfig) (*pipeline, error) {
 	pub, err := publish.New(publish.Config{
 		Signer: cfg.Signer, Sink: cfg.Sink, Store: stateStore{repo: cfg.State},
 		Backbones: backboneAdapter{src: cfg.Backbones}, Networks: cfg.Networks, Exclusions: cfg.Exclusions, Now: cfg.PublisherNow,
+		Bundles: cfg.Bundles,
 		// Unhealthy attestations stay off (PublishUnhealthy is false).
 	})
 	if err != nil {
@@ -403,6 +420,26 @@ func (p *pipeline) handle(ctx context.Context, n HealthyNotice) {
 		TotalSegments: uint32(n.TotalSegments), SegmentsChecked: uint32(n.SegmentsChecked),
 		MediaHeaderVerified: n.MediaHeaderVerified, PatchedByPAR2: n.PatchedByPAR2,
 	}
+	// A file that came from a peer bundle is published only once the full
+	// local check it owes has passed (the importer's persistent state, not
+	// this check's size, is the truth: later sampled re-checks of a verified
+	// file publish like any local import).
+	if p.cfg.PeerOrigin != nil {
+		from, passed, err := p.cfg.PeerOrigin.PeerBundleStatus(ctx, n.FilePath)
+		if err != nil {
+			p.cfg.Log(ctx, "publish: peer bundle status", err)
+			p.skip(skipPeerStatusUnknown)
+			return
+		}
+		res.FromPeerBundle = from && !passed
+		res.FullCheckPassed = false
+		if from {
+			// The media ids of a peer's import are that peer's unverified
+			// claim; never sign them as this node's (cached info is shared,
+			// so strip on this copy).
+			info.Media = records.MediaIDs{}
+		}
+	}
 	// A reduced check, or one whose patch status was never determined, may
 	// still announce the release but is no evidence: release record only.
 	switch {
@@ -420,6 +457,9 @@ func (p *pipeline) handle(ctx context.Context, n HealthyNotice) {
 func (p *pipeline) count(ctx context.Context, outs []publish.Outcome, err error) {
 	failed := false
 	for _, o := range outs {
+		if o.BundleErr != nil {
+			p.fail(ctx, "publish: build bundle", o.BundleErr)
+		}
 		switch {
 		case o.Err != nil:
 			failed = true
@@ -484,7 +524,7 @@ func (p *pipeline) reannounce(ctx context.Context, limit int) {
 
 // reannounceOne re-announces one release and reports whether it went through.
 func (p *pipeline) reannounceOne(ctx context.Context, t publish.Tracked, relHex string) bool {
-	ok, err := p.locallyHealthy(ctx, relHex)
+	ok, fromPeer, err := p.locallyHealthy(ctx, relHex)
 	if err != nil {
 		p.cfg.Log(ctx, "publish: re-announce health lookup", err)
 		return false
@@ -503,7 +543,15 @@ func (p *pipeline) reannounceOne(ctx context.Context, t publish.Tracked, relHex 
 		}
 		return false
 	}
+	if fromPeer {
+		info.Media = records.MediaIDs{} // a peer's unverified claim is not re-signed
+	}
 	o := p.pub.ReannounceRelease(ctx, t.Network, t.ReleaseID, info)
+	if o.BundleErr != nil {
+		// The bundle could not be built; nothing was sent. Back off before the next attempt.
+		p.fail(ctx, "publish: build bundle", o.BundleErr)
+		return false
+	}
 	switch {
 	case o.Err != nil:
 		p.fail(ctx, "publish: re-announce", o.Err)
@@ -520,17 +568,18 @@ func (p *pipeline) reannounceOne(ctx context.Context, t publish.Tracked, relHex 
 
 // locallyHealthy reports whether the release is still indexed and each of its
 // indexed files has a healthy status. No health source, no files, too many
-// files or any missing record is "not healthy".
-func (p *pipeline) locallyHealthy(ctx context.Context, relHex string) (bool, error) {
+// files or any missing record is "not healthy". fromPeer reports that any
+// file came from a peer bundle (its media ids must not be re-signed).
+func (p *pipeline) locallyHealthy(ctx context.Context, relHex string) (healthy, fromPeer bool, err error) {
 	if p.cfg.Health == nil {
-		return false, nil
+		return false, false, nil
 	}
 	entries, err := p.cfg.Content.FindByReleaseID(ctx, relHex)
 	if err != nil {
-		return false, fmt.Errorf("list release files: %w", err)
+		return false, false, fmt.Errorf("list release files: %w", err)
 	}
 	if len(entries) == 0 || len(entries) > maxReleaseFiles {
-		return false, nil
+		return false, false, nil
 	}
 	paths := make([]string, len(entries))
 	for i, e := range entries {
@@ -538,14 +587,26 @@ func (p *pipeline) locallyHealthy(ctx context.Context, relHex string) (bool, err
 	}
 	st, err := p.cfg.Health.Statuses(ctx, paths)
 	if err != nil {
-		return false, fmt.Errorf("local health: %w", err)
+		return false, false, fmt.Errorf("local health: %w", err)
 	}
 	for _, path := range paths {
 		if st[path] != string(database.HealthStatusHealthy) {
-			return false, nil
+			return false, false, nil
 		}
 	}
-	return true, nil
+	if p.cfg.PeerOrigin != nil {
+		for _, path := range paths {
+			from, passed, err := p.cfg.PeerOrigin.PeerBundleStatus(ctx, path)
+			if err != nil {
+				return false, false, fmt.Errorf("peer bundle status: %w", err)
+			}
+			if from && !passed {
+				return false, false, nil
+			}
+			fromPeer = fromPeer || from
+		}
+	}
+	return true, fromPeer, nil
 }
 
 func backoffKey(nw netid.NetworkID, rel string) string { return nw.String() + "|" + rel }
@@ -624,18 +685,26 @@ func (n *node) startPublishing() error {
 	if n.rx == nil || d.Content == nil || d.Origins == nil || d.PublishState == nil || d.Metadata == nil {
 		return nil
 	}
-	p, err := newPipeline(pipelineConfig{
+	var bundles publish.BundleSource
+	if n.builder != nil {
+		bundles = bundleSource{b: n.builder}
+	}
+	p, err := newPipeline(pipelineConfig{Bundles: bundles,
 		Signer: nodeSigner{key: n.key}, Sink: exchangeSink{rx: n.rx},
 		Networks: func() []publish.Network {
 			ids := n.rx.PublishNetworks()
 			out := make([]publish.Network, 0, len(ids))
 			for _, id := range ids {
-				out = append(out, publish.Network{ID: id, Level: publish.MinLevel})
+				lvl, ok := n.rx.NetworkLevel(id)
+				if !ok {
+					continue
+				}
+				out = append(out, publish.Network{ID: id, Level: lvl})
 			}
 			return out
 		},
 		Exclusions: d.Exclusions, Backbones: d.Backbones,
-		State: d.PublishState, Content: d.Content, Origins: d.Origins, Meta: d.Metadata, Health: d.Health,
+		State: d.PublishState, Content: d.Content, Origins: d.Origins, Meta: d.Metadata, Health: d.Health, PeerOrigin: d.PeerOrigin,
 		QueueSize: d.publishQueueSize, Now: d.publishNow, PublisherNow: time.Now, Hold: d.beforePublish, Log: n.logChange,
 	})
 	if err != nil {
@@ -669,6 +738,7 @@ func (n *node) maintainPublishing(ctx context.Context, orphans bool) {
 		n.logChange(ctx, "delete orphan publish state", err)
 	}
 	n.pipe.reannounce(ctx, reannounceBatch)
+	n.pipe.reannounceLevelChanges(ctx, reannounceBatch)
 }
 
 // retractExcluded deletes this node's own records and publish state of
@@ -705,3 +775,35 @@ const (
 	reannounceBatch    = 20
 	retractBatch       = 50
 )
+
+// reannounceLevelChanges announces again, up to limit records per network,
+// those published at a different bundle level than the network has now: a
+// network moved to level 3 announces its bundles, one moved below 3 supersedes
+// the records that carried a Bundle ID. A release that fails backs off like any
+// re-announce.
+func (p *pipeline) reannounceLevelChanges(ctx context.Context, limit int) {
+	now := p.cfg.Now()
+	for _, nw := range p.cfg.Networks() {
+		rows, err := p.cfg.State.ListBundleLevelMismatch(ctx, nw.ID.String(), nw.Level >= publish.BundleMinLevel, limit)
+		if err != nil {
+			p.cfg.Log(ctx, "publish: list bundle level changes", err)
+			return
+		}
+		p.cfg.Log(ctx, "publish: list bundle level changes", nil)
+		for _, r := range rows {
+			if ctx.Err() != nil {
+				return
+			}
+			rel, err := contentid.ParseID(r.ReleaseID)
+			if err != nil || p.backedOff(nw.ID, r.ReleaseID, now) {
+				continue
+			}
+			t := publish.Tracked{Network: nw.ID, Kind: records.KindRelease, ReleaseID: records.ReleaseID(rel)}
+			if p.reannounceOne(ctx, t, r.ReleaseID) {
+				p.clearFailure(nw.ID, r.ReleaseID)
+			} else {
+				p.noteFailure(nw.ID, r.ReleaseID, now)
+			}
+		}
+	}
+}

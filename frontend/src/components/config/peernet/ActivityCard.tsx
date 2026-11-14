@@ -1,10 +1,17 @@
+import { formatBytes } from "../../../lib/utils";
 import type { PeernetStatus } from "../../../types/peernet";
 import {
 	backboneHint,
 	describeBreakdown,
+	fetchFailLabel,
+	importRejectLabel,
 	libraryShareLine,
+	notShareableLabel,
 	publishedTotal,
+	serveRefusedLabel,
 	showAdviceBlock,
+	showBundleServing,
+	showBundlesBlock,
 	showPublishingDetails,
 	skipLabel,
 } from "./peernetStats";
@@ -58,6 +65,78 @@ function PublishingBlock({ status }: { status: PeernetStatus }) {
 	);
 }
 
+interface BreakdownListProps {
+	title: string;
+	counts: Readonly<Record<string, number>> | undefined;
+	label: (key: string) => string;
+}
+
+function BreakdownList({ title, counts, label }: BreakdownListProps) {
+	const entries = describeBreakdown(counts, label);
+	if (entries.length === 0) return null;
+	const total = entries.reduce((sum, e) => sum + e.count, 0);
+	return (
+		<div>
+			<p className="text-base-content/70">
+				{title}: {total}
+			</p>
+			<ul className="list-inside list-disc text-xs">
+				{entries.map((entry) => (
+					<li key={entry.key} className="break-words">
+						{entry.label}: {entry.count}
+					</li>
+				))}
+			</ul>
+		</div>
+	);
+}
+
+function BundlesBlock({ status }: { status: PeernetStatus }) {
+	const b = status.bundles;
+	const imp = b?.import;
+	const serving = showBundleServing(status.networks);
+	const backedOff = count(b?.fetch_backed_off);
+	return (
+		<div className="space-y-2 text-sm">
+			{serving && (
+				<div className="space-y-1">
+					<p>Bundles announced: {count(b?.announced)}</p>
+					<p>
+						Bundles served: {count(b?.served)} ({formatBytes(count(b?.served_bytes))})
+					</p>
+					<BreakdownList
+						title="Not shareable as a bundle"
+						counts={b?.not_shareable}
+						label={notShareableLabel}
+					/>
+					<BreakdownList
+						title="Refused requests"
+						counts={b?.serve_refused}
+						label={serveRefusedLabel}
+					/>
+				</div>
+			)}
+			<div className="space-y-1">
+				<p>Bundles fetched: {count(b?.fetched)}</p>
+				<p>Imports accepted: {count(imp?.accepted)}</p>
+				<p>
+					Awaiting full check: {count(imp?.full_check_passed)} passed,{" "}
+					{count(imp?.full_check_failed)} failed
+				</p>
+				{(imp?.pending ?? 0) > 0 && (
+					<p className="text-warning">
+						Waiting for a full check: {count(imp?.pending)}
+						{(imp?.stale ?? 0) > 0 ? ` (${count(imp?.stale)} waited too long and were failed)` : ""}
+					</p>
+				)}
+				<BreakdownList title="Rejected bundles" counts={imp?.rejected} label={importRejectLabel} />
+				<BreakdownList title="Fetch failures" counts={b?.fetch_failed} label={fetchFailLabel} />
+				{backedOff > 0 && <p className="text-warning">Publishers backed off: {backedOff}</p>}
+			</div>
+		</div>
+	);
+}
+
 function AdviceBlock({ status }: { status: PeernetStatus }) {
 	const advice = status.advice;
 	return (
@@ -97,6 +176,14 @@ export function ActivityCard({ status }: ActivityCardProps) {
 					</h4>
 					<PublishingBlock status={status} />
 				</section>
+				{showBundlesBlock(status.networks) && (
+					<section className="space-y-1" aria-labelledby="peernet-bundles-title">
+						<h4 id="peernet-bundles-title" className="font-medium text-sm">
+							Bundles
+						</h4>
+						<BundlesBlock status={status} />
+					</section>
+				)}
 				{showAdviceBlock(status.networks) && (
 					<section className="space-y-1" aria-labelledby="peernet-advice-title">
 						<h4 id="peernet-advice-title" className="font-medium text-sm">

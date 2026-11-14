@@ -177,6 +177,20 @@ func (x *Exchange) network(id netid.NetworkID) (NetworkInfo, bool) {
 	return info, ok
 }
 
+// NetworkLevel returns the exposure level of a registered network. A network
+// that is not registered (unknown, off, or removed by its host) is not found.
+func (x *Exchange) NetworkLevel(id netid.NetworkID) (int, bool) {
+	info, ok := x.network(id)
+	return info.Level, ok
+}
+
+// PeerBackedOff reports whether peer, or the remote address ip (empty when
+// unknown), is currently backed off for sending hostile records in nw. Other
+// services use it to refuse a peer record exchange has already struck.
+func (x *Exchange) PeerBackedOff(nw netid.NetworkID, peer identity.NodeID, ip string) bool {
+	return x.pusherBackedOff(nw, peer, ip)
+}
+
 // networks returns the registered networks sorted by ID.
 func (x *Exchange) networks() []NetworkInfo {
 	x.mu.Lock()

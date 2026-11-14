@@ -93,6 +93,17 @@ type CheckOptions struct {
 	// knows about each due file, keyed by path. Peer advice is considered only
 	// for files listed here; nil (every other caller) means never.
 	PeerFiles map[string]PeerFileInfo
+	// FullCheckFiles lists files that owe a full check of every segment (peer
+	// bundle imports). They are sampled at 100 percent whatever the configured
+	// sample, and never get peer advice.
+	FullCheckFiles map[string]struct{}
+}
+
+// owesFullCheck reports whether the file is a peer-bundle import that must be
+// checked in full.
+func owesFullCheck(o CheckOptions, filePath string) bool {
+	_, ok := o.FullCheckFiles[filePath]
+	return ok
 }
 
 // PatchIndex reports articles restored locally by PAR2 repair.
@@ -295,7 +306,7 @@ func (hc *HealthChecker) prepareCheck(ctx context.Context, filePath string, opts
 	}
 
 	// Override sample percentage if forced full check is requested
-	if len(opts) > 0 && opts[0].ForceFullCheck {
+	if len(opts) > 0 && (opts[0].ForceFullCheck || owesFullCheck(opts[0], filePath)) {
 		samplePercentage = 100
 		slog.InfoContext(ctx, "Forcing full health check (100% sampling)", "file_path", filePath)
 	}
