@@ -17,6 +17,8 @@ func fuzzSeeds() []archivetest.Built {
 		archivetest.RAR5(archivetest.File{Name: "a", Data: p[:40]}, archivetest.File{Name: "m.mkv", Data: p, SplitBefore: true, SplitAfter: true, UnpackedSize: 900}),
 		archivetest.RAR5(archivetest.File{Name: "m.mkv", Data: p, IV: iv}, archivetest.File{Name: "c", Data: p[:9], Service: true}),
 		archivetest.RAR5(archivetest.File{Name: "m.mkv", Data: p, Compressed: true}),
+		archivetest.RAR5Volume(0, archivetest.File{Name: "m.mkv", Data: p, SplitAfter: true, UnpackedSize: 900}),
+		archivetest.RAR5Volume(3, archivetest.File{Name: "m.mkv", Data: p, SplitBefore: true, SplitAfter: true, UnpackedSize: 900, IV: iv}),
 		archivetest.RAR4(archivetest.File{Name: "m.mkv", Data: p}),
 		archivetest.RAR4(archivetest.File{Name: "a", Data: p[:40]}, archivetest.File{Name: "m.mkv", Data: p, SplitBefore: true, UnpackedSize: 600}),
 		archivetest.RAR4(archivetest.File{Name: "m.mkv", Data: p, IV: iv, Compressed: true}),
@@ -57,7 +59,7 @@ func addSeeds(f *testing.F) {
 
 func fuzzVerifyBody(t *testing.T, data []byte, off, length int64, idx, count uint8, fsize int64) {
 	lim := Limits{MaxBlocks: 24, MaxReads: 48, MaxHeader: 4096, Max7zHeader: 4096}
-	e := Extent{Offset: off, Length: length, Index: int(idx), Count: int(count), FileSize: fsize}
+	e := Extent{Offset: off, Length: length, Index: int(idx), Count: int(count), FileSize: fsize, Keyed: count&0x80 != 0}
 	cr := &countingReader{data: data}
 	r := Verify(cr, int64(len(data)), e, lim)
 	if cr.reads > lim.MaxReads {
@@ -68,6 +70,9 @@ func fuzzVerifyBody(t *testing.T, data []byte, off, length int64, idx, count uin
 	}
 	if r.Outcome == Bound && (off < 0 || length < 1 || off > int64(len(data)) || length > int64(len(data))-off) {
 		t.Fatalf("bound an extent [%d,+%d) outside a %d byte volume", off, length, len(data))
+	}
+	if v, _ := Scan(bytes.NewReader(data), int64(len(data)), off, lim); v != nil && v.VolumeNumber < -1 {
+		t.Fatalf("volume number %d", v.VolumeNumber)
 	}
 	if r2 := Verify(bytes.NewReader(data), int64(len(data)), e, lim); r2 != r {
 		t.Fatalf("not deterministic: %+v then %+v", r, r2)

@@ -148,6 +148,8 @@ func (i *Importer) Accept(ctx context.Context, req Request) (*Result, error) {
 		}
 		return i.rejected(r, err)
 	}
+	res.Cost = Cost{Articles: rep.articles, Bytes: rep.bytes, ExtentsBound: rep.bound, ExtentsUnbound: rep.checked - rep.bound,
+		PartsBound: rep.partsBound, PartsUnbound: rep.partsUnbound}
 	if r, err := i.probeMedia(ctx, loc, stage, needsStructure(rep, b)); err != nil {
 		if r == ReasonMediaInvalid || r == ReasonStructureInvalid {
 			i.noteFailedBundle(ctx, req.Origin.BundleID, b.ReleaseID.String())

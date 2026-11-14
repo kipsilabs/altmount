@@ -217,3 +217,78 @@ func TestBuildBusyAndTransientErrors(t *testing.T) {
 		t.Fatal("failure not counted")
 	}
 }
+
+// storedVolumes is a file stored across archive volumes the way the importer
+// writes it: one flat segment list, every volume's slice starting inside its
+// first article and ending inside its last.
+func storedVolumes(name string, volumes, articles int) (*metapb.FileMetadata, [][]string) {
+	var lists [][]string
+	m := &metapb.FileMetadata{Status: metapb.FileStatus_FILE_STATUS_HEALTHY, CreatedAt: 1, ModifiedAt: 2, ReleaseDate: 1700000000, OriginalFilename: name}
+	for v := 0; v < volumes; v++ {
+		list := ids(name+"-vol"+string(rune('a'+v)), articles)
+		lists = append(lists, list)
+		for i, id := range list {
+			s := &metapb.SegmentData{Id: id, SegmentSize: segSize, StartOffset: 0, EndOffset: segSize - 1}
+			if i == 0 {
+				s.StartOffset = 60
+			}
+			if i == articles-1 {
+				s.EndOffset = segSize - 21
+			}
+			m.SegmentData = append(m.SegmentData, s)
+			m.FileSize += s.EndOffset - s.StartOffset + 1
+		}
+	}
+	return m, lists
+}
+
+func TestBuildMultiVolumeStoredSetBecomesAMultiPartBundle(t *testing.T) {
+	m, lists := storedVolumes("movie.mkv", 5, 4)
+	lib := &fakeLib{scheme: database.PeernetSchemeNZB, paths: []string{"movies/R/movie.mkv"},
+		files: map[string]*metapb.FileMetadata{"movies/R/movie.mkv": m}, nzb: lists}
+	rel := releaseHexOfNZB(lib.nzb)
+	got, err := newTestBuilder(t, lib, NoPatches{}).Build(context.Background(), rel, "Some.Movie.2020.1080p", posted)
+	if err != nil {
+		t.Fatalf("a multi-volume stored set must be shareable: %v", err)
+	}
+	rid, _ := contentid.ParseID(rel)
+	bd, err := bundle.Verify(got.Wire, got.ID, rid)
+	if err != nil {
+		t.Fatalf("a receiver would reject the bundle: %v", err)
+	}
+	if want := []int{4, 4, 4, 4, 4}; len(bd.Files) != 1 || !equalInts(bd.Files[0].Parts, want) {
+		t.Fatalf("parts = %v, want %v", bd.Files[0].Parts, want)
+	}
+	again, err := newTestBuilder(t, lib, NoPatches{}).Build(context.Background(), rel, "Some.Movie.2020.1080p", posted)
+	if err != nil || !bytes.Equal(again.Wire, got.Wire) {
+		t.Fatalf("the multi-part build is not deterministic (%v)", err)
+	}
+}
+
+func equalInts(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func TestBuildUnrecoverablePartLayoutIsCountedNotShareable(t *testing.T) {
+	m, lists := storedVolumes("movie.mkv", 3, 4)
+	// a locally patched segment repeats the last article of the set
+	last := m.SegmentData[len(m.SegmentData)-1]
+	m.SegmentData = append(m.SegmentData, &metapb.SegmentData{Id: last.Id, SegmentSize: last.SegmentSize, StartOffset: last.StartOffset, EndOffset: last.StartOffset + 9})
+	lib := &fakeLib{scheme: database.PeernetSchemeNZB, paths: []string{"p"}, files: map[string]*metapb.FileMetadata{"p": m}, nzb: lists}
+	b := newTestBuilder(t, lib, NoPatches{})
+	_, err := b.Build(context.Background(), releaseHexOfNZB(lists), "T", posted)
+	if r := notShareableReason(t, err); r != string(bundle.ReasonPartLayout) {
+		t.Fatalf("reason = %s", r)
+	}
+	if b.Status().NotShareable[string(bundle.ReasonPartLayout)] != 1 {
+		t.Fatalf("not counted: %v", b.Status().NotShareable)
+	}
+}

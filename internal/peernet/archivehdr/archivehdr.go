@@ -22,6 +22,7 @@
 package archivehdr
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -127,6 +128,10 @@ type Volume struct {
 	Format Format
 	// Size is the number of bytes of the volume.
 	Size int64
+	// VolumeNumber is the 0-based volume number a RAR 5 main header declares
+	// (the first volume of a set carries none and is 0); -1 when the format
+	// does not say (RAR 4, 7z, or a RAR 5 archive that is not a volume).
+	VolumeNumber int64
 	// Blocks are the data blocks found in order, up to the offset asked for.
 	Blocks []Block
 	// Reads is the number of reads made.
@@ -203,7 +208,7 @@ func Scan(r io.ReaderAt, size int64, upTo int64, lim Limits) (*Volume, error) {
 		}
 		return nil, err
 	}
-	v := &Volume{Size: size}
+	v := &Volume{Size: size, VolumeNumber: -1}
 	switch {
 	case len(head) >= 8 && string(head[:8]) == string(rar5Sig):
 		v.Format = FormatRAR5
@@ -258,6 +263,10 @@ type Extent struct {
 	Index, Count int
 	// FileSize is the size of the whole file the extents make up.
 	FileSize int64
+	// Keyed says the layout carries an AES key for the file: its entry must be
+	// encrypted, and when both IVs are known they must be equal.
+	Keyed bool
+	IV    []byte
 }
 
 // Check judges an extent against a scan of its volume. A scan that stopped on
@@ -303,8 +312,12 @@ func checkBlock(v *Volume, b *Block, e Extent) Result {
 		return bad("the data area at %d belongs to a service block or a directory, not a file", e.Offset)
 	case !b.Stored:
 		return bad("the file at %d is compressed, not stored", e.Offset)
-	case b.Encrypted:
+	case b.Encrypted && !e.Keyed:
 		return bad("the file at %d is itself encrypted but the layout carries no key for it", e.Offset)
+	case e.Keyed && !b.Encrypted:
+		return bad("the layout carries a key for the file at %d but the entry is not encrypted", e.Offset)
+	case e.Keyed && b.IV != nil && e.IV != nil && !bytes.Equal(b.IV, e.IV):
+		return bad("the IV of the entry at %d differs from the layout's", e.Offset)
 	case b.DataSize != e.Length:
 		return bad("the header says %d bytes in this volume, the layout %d", b.DataSize, e.Length)
 	case b.UnpackedSize >= 0 && b.UnpackedSize != e.FileSize:

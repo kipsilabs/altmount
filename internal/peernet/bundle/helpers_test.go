@@ -249,6 +249,7 @@ func clone(b *Bundle) *Bundle {
 	c.Files = make([]File, len(b.Files))
 	for i, f := range b.Files {
 		f.Segments = append([]Segment(nil), f.Segments...)
+		f.Parts = append([]int(nil), f.Parts...)
 		f.AESKey = append([]byte(nil), f.AESKey...)
 		f.AESIV = append([]byte(nil), f.AESIV...)
 		f.Extents = append([]Extent(nil), f.Extents...)

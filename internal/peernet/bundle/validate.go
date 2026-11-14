@@ -83,9 +83,26 @@ type validator struct {
 	entLen   []int
 	inline   map[int]struct{}
 	sharedE  map[int]struct{}
+	// slicedE are the entries read by the parts of a multi-part file.
+	slicedE map[int]struct{}
+	// uses lists, per pool entry, the usable ranges of the parts that use it at
+	// a part boundary (see checkSlicedTable).
+	uses     map[int64][]articleUse
+	parts    int
 	total    int64
 	lastFile *File
 }
+
+// articleUse is the usable range one part takes from a boundary article.
+type articleUse struct{ start, end int64 }
+
+// Owner marks of a pool entry used by the parts of a multi-part file: it is
+// shared at a part boundary (and listed in validator.uses), or used inside a
+// part, which no other part may touch.
+const (
+	ownerBoundary int32 = -2
+	ownerInterior int32 = -3
+)
 
 // Validate checks every structural rule of the bundle schema: limits, ranges,
 // sums, encryption sizes, names and the message-ID pool. It does not touch the
@@ -127,7 +144,7 @@ func Validate(b *Bundle) error {
 	}
 	if b.Scheme == SchemeFiles {
 		for i, o := range v.owner {
-			if o < 0 {
+			if o == -1 {
 				return fmt.Errorf("%w: pool entry %d is not referenced", ErrBadPool, i)
 			}
 		}
@@ -187,7 +204,7 @@ func (v *validator) checkPool() error {
 			v.entStart[i] = pos
 			pos += n
 		}
-		v.inline, v.sharedE = map[int]struct{}{}, map[int]struct{}{}
+		v.inline, v.sharedE, v.slicedE = map[int]struct{}{}, map[int]struct{}{}, map[int]struct{}{}
 		v.initOwner()
 		return nil
 	}
@@ -251,6 +268,8 @@ func (v *validator) checkFile(f *File) error {
 
 	nested := len(f.Extents) > 0 || len(f.Outer) > 0
 	switch {
+	case len(f.Parts) > 0 && (nested || len(f.Segments) == 0):
+		return fmt.Errorf("%w: parts on a file without an inline table", ErrInvalidField)
 	case nested && len(f.Segments) > 0:
 		return fmt.Errorf("%w: nested file lists inline segments", ErrInvalidField)
 	case nested && len(f.AESKey) > 0:
@@ -322,7 +341,13 @@ func (v *validator) checkInline(f *File) error {
 	if len(f.Segments) == 0 {
 		return fmt.Errorf("%w: file has no data", ErrInvalidField)
 	}
-	covered, err := v.checkTable(f.Segments)
+	var covered int64
+	var err error
+	if len(f.Parts) > 0 {
+		covered, err = v.checkSlicedTable(f)
+	} else {
+		covered, err = v.checkTable(f.Segments)
+	}
 	if err != nil {
 		return err
 	}
@@ -361,6 +386,33 @@ func KeyOf(segs []Segment) TableKey {
 	return k
 }
 
+// checkSegment validates one segment of a table (or of one part of a table).
+// first and last say whether it is the first or last segment of the run that
+// may be read partially at that end.
+func (v *validator) checkSegment(i int, s Segment, first, last bool) error {
+	poolLen := int64(len(v.b.Pool))
+	ceiling := int64(MaxSegmentSize)
+	if v.b.Scheme == SchemeFiles {
+		ceiling = MaxFilesSchemeSegment
+	}
+	switch {
+	case s.Ref == GapRef:
+		// A shareable file has no known holes: a gap is never accepted.
+		return fmt.Errorf("%w: segment %d is a gap", ErrInvalidField, i)
+	case s.Ref < 0 || s.Ref >= poolLen:
+		return fmt.Errorf("%w: segment %d references pool entry %d of %d", ErrOutOfRange, i, s.Ref, poolLen)
+	case s.Size > ceiling:
+		return fmt.Errorf("%w: segment %d is %d bytes", ErrImplausible, i, s.Size)
+	case s.Size < 1:
+		return fmt.Errorf("%w: segment %d size %d", ErrOutOfRange, i, s.Size)
+	case s.Start < 0 || s.End < s.Start || s.End > s.Size-1:
+		return fmt.Errorf("%w: segment %d range [%d,%d] of %d", ErrOutOfRange, i, s.Start, s.End, s.Size)
+	case !first && s.Start != 0, !last && s.End != s.Size-1:
+		return fmt.Errorf("%w: segment %d range [%d,%d] of %d", ErrPartialRange, i, s.Start, s.End, s.Size)
+	}
+	return nil
+}
+
 // checkTable validates one segment table and returns the bytes it covers.
 //
 // A table reads one posted file front to back. Only its first segment may
@@ -372,28 +424,11 @@ func (v *validator) checkTable(segs []Segment) (int64, error) {
 	if v.segs += len(segs); v.segs > MaxSegments {
 		return 0, fmt.Errorf("%w: more than %d segments", ErrLimit, MaxSegments)
 	}
-	poolLen := int64(len(v.b.Pool))
-	ceiling := int64(MaxSegmentSize)
-	if v.b.Scheme == SchemeFiles {
-		ceiling = MaxFilesSchemeSegment
-	}
 	seen := make(map[int64]struct{}, len(segs))
 	var covered int64
 	for i, s := range segs {
-		switch {
-		case s.Ref == GapRef:
-			// A shareable file has no known holes: a gap is never accepted.
-			return 0, fmt.Errorf("%w: segment %d is a gap", ErrInvalidField, i)
-		case s.Ref < 0 || s.Ref >= poolLen:
-			return 0, fmt.Errorf("%w: segment %d references pool entry %d of %d", ErrOutOfRange, i, s.Ref, poolLen)
-		case s.Size > ceiling:
-			return 0, fmt.Errorf("%w: segment %d is %d bytes", ErrImplausible, i, s.Size)
-		case s.Size < 1:
-			return 0, fmt.Errorf("%w: segment %d size %d", ErrOutOfRange, i, s.Size)
-		case s.Start < 0 || s.End < s.Start || s.End > s.Size-1:
-			return 0, fmt.Errorf("%w: segment %d range [%d,%d] of %d", ErrOutOfRange, i, s.Start, s.End, s.Size)
-		case i > 0 && s.Start != 0, i < len(segs)-1 && s.End != s.Size-1:
-			return 0, fmt.Errorf("%w: segment %d range [%d,%d] of %d", ErrPartialRange, i, s.Start, s.End, s.Size)
+		if err := v.checkSegment(i, s, i == 0, i == len(segs)-1); err != nil {
+			return 0, err
 		}
 		if _, dup := seen[s.Ref]; dup {
 			return 0, fmt.Errorf("%w: segment %d repeats pool entry %d within one table", ErrCoverage, i, s.Ref)
@@ -408,12 +443,94 @@ func (v *validator) checkTable(segs []Segment) (int64, error) {
 	id := int32(len(v.tables))
 	v.tables[key] = id
 	for i, s := range segs {
-		if v.owner[s.Ref] >= 0 {
+		if v.owner[s.Ref] != -1 {
 			return 0, fmt.Errorf("%w: segment %d shares pool entry %d with a different table", ErrCoverage, i, s.Ref)
 		}
 		v.owner[s.Ref] = id
 	}
 	return covered, nil
+}
+
+// checkSlicedTable validates the table of a multi-part file: the concatenation
+// of Parts, each a run of one posted file read from some byte of its first
+// article to some byte of its last. Inside a part the rules of a table hold
+// (only the part's first segment may start inside its article, only its last
+// may end inside it); a part boundary is the only place a usable range may skip
+// bytes. A pool entry is used once in the whole table. Two parts of different
+// files may share an article only at their boundaries (a part's first or last
+// segment) with disjoint usable ranges: two files stored back to back in one
+// archive volume share the article where one ends and the next begins. Any
+// other use of an entry by two tables is refused.
+func (v *validator) checkSlicedTable(f *File) (int64, error) {
+	segs := f.Segments
+	if len(f.Parts) > MaxParts {
+		return 0, fmt.Errorf("%w: %d parts", ErrLimit, len(f.Parts))
+	}
+	if v.parts += len(f.Parts); v.parts > MaxTotalParts {
+		return 0, fmt.Errorf("%w: more than %d parts in the bundle", ErrLimit, MaxTotalParts)
+	}
+	sum := 0
+	for i, n := range f.Parts {
+		if n < 1 || n > len(segs)-sum {
+			return 0, fmt.Errorf("%w: part %d holds %d segments", ErrInvalidField, i, n)
+		}
+		sum += n
+	}
+	if sum != len(segs) {
+		return 0, fmt.Errorf("%w: parts hold %d of %d segments", ErrInvalidField, sum, len(segs))
+	}
+	if v.segs += len(segs); v.segs > MaxSegments {
+		return 0, fmt.Errorf("%w: more than %d segments", ErrLimit, MaxSegments)
+	}
+	if v.uses == nil {
+		v.uses = map[int64][]articleUse{}
+	}
+	seen := make(map[int64]struct{}, len(segs))
+	var covered int64
+	at := 0
+	for _, n := range f.Parts {
+		for k := 0; k < n; k++ {
+			i, s := at+k, segs[at+k]
+			first, last := k == 0, k == n-1
+			if err := v.checkSegment(i, s, first, last); err != nil {
+				return 0, err
+			}
+			if _, dup := seen[s.Ref]; dup {
+				return 0, fmt.Errorf("%w: segment %d repeats pool entry %d within one table", ErrCoverage, i, s.Ref)
+			}
+			seen[s.Ref] = struct{}{}
+			if err := v.shareArticle(i, s, first || last); err != nil {
+				return 0, err
+			}
+			covered += s.End - s.Start + 1
+		}
+		at += n
+	}
+	return covered, nil
+}
+
+// shareArticle records the use of a pool entry by a segment of a part and
+// refuses every use the boundary exception does not cover.
+func (v *validator) shareArticle(i int, s Segment, boundary bool) error {
+	use := articleUse{start: s.Start, end: s.End}
+	switch o := v.owner[s.Ref]; {
+	case o == -1:
+		if !boundary {
+			v.owner[s.Ref] = ownerInterior
+			return nil
+		}
+		v.owner[s.Ref] = ownerBoundary
+	case o == ownerBoundary && boundary:
+		for _, u := range v.uses[s.Ref] {
+			if use.start <= u.end && u.start <= use.end {
+				return fmt.Errorf("%w: segment %d overlaps the range another part uses of pool entry %d", ErrCoverage, i, s.Ref)
+			}
+		}
+	default:
+		return fmt.Errorf("%w: segment %d shares pool entry %d with another table, not at a part boundary", ErrCoverage, i, s.Ref)
+	}
+	v.uses[s.Ref] = append(v.uses[s.Ref], use)
+	return nil
 }
 
 func (v *validator) checkNested(f *File) error {
@@ -604,6 +721,9 @@ func (v *validator) checkCoverage(f *File) error {
 			return fmt.Errorf("%w: NZB entry %d is read twice by one file", ErrCoverage, e)
 		}
 		own[e] = struct{}{}
+		if _, sliced := v.slicedE[e]; sliced {
+			return fmt.Errorf("%w: NZB entry %d is used by a multi-part file and elsewhere", ErrCoverage, e)
+		}
 		_, wasInline := v.inline[e]
 		if wasInline || (inline && v.shared(e)) {
 			return fmt.Errorf("%w: NZB entry %d is used inline and elsewhere", ErrCoverage, e)
@@ -615,7 +735,12 @@ func (v *validator) checkCoverage(f *File) error {
 		}
 		return nil
 	}
-	if len(f.Segments) > 0 {
+	switch {
+	case len(f.Parts) > 0:
+		if err := v.slicedCoverage(f, own); err != nil {
+			return err
+		}
+	case len(f.Segments) > 0:
 		if err := use(f.Segments, true); err != nil {
 			return err
 		}
@@ -636,3 +761,39 @@ func (v *validator) checkCoverage(f *File) error {
 func (v *validator) shared(e int) bool { _, ok := v.sharedE[e]; return ok }
 
 func (v *validator) markShared(e int) { v.sharedE[e] = struct{}{} }
+
+// slicedCoverage (nzb scheme) requires every part of a multi-part file to be a
+// contiguous run, in article order, of ONE NZB entry, and every entry to supply
+// at most one part to the file. Entries are not required to be in NZB order (an
+// obfuscated NZB lists a volume set in any order); the order of the parts is the
+// order of the file's bytes, which the accept-time binding checks against the
+// archive's own headers. An entry used by a multi-part file is never also read
+// whole, as an outer volume or as a PAR2 file.
+func (v *validator) slicedCoverage(f *File, own map[int]struct{}) error {
+	at := 0
+	for pi, n := range f.Parts {
+		part := f.Segments[at : at+n]
+		at += n
+		e := v.entryOf(part[0].Ref)
+		if e >= len(v.entStart) {
+			return fmt.Errorf("%w: part %d starts outside the release list", ErrCoverage, pi)
+		}
+		for i, s := range part {
+			if s.Ref != part[0].Ref+int64(i) {
+				return fmt.Errorf("%w: part %d segment %d is out of article order or skips an article", ErrCoverage, pi, i)
+			}
+		}
+		if end := int64(v.entStart[e] + v.entLen[e]); part[len(part)-1].Ref >= end {
+			return fmt.Errorf("%w: part %d spans more than one NZB file entry", ErrCoverage, pi)
+		}
+		if _, dup := own[e]; dup {
+			return fmt.Errorf("%w: NZB entry %d supplies two parts of one file", ErrCoverage, e)
+		}
+		own[e] = struct{}{}
+		if _, wasInline := v.inline[e]; wasInline || v.shared(e) {
+			return fmt.Errorf("%w: NZB entry %d is used by a multi-part file and elsewhere", ErrCoverage, e)
+		}
+		v.slicedE[e] = struct{}{}
+	}
+	return nil
+}

@@ -21,29 +21,66 @@ func headerSampleSize(total int) int {
 }
 
 // tablesOfMeta lists the segment tables a stored file reads: its own and each
-// shared outer volume.
+// shared outer volume. The stored metadata of a file read from several archive
+// volumes is one flat segment list that no longer says where the volumes are, so
+// the boundaries are recovered from the ranges the way the builder does (a
+// segment that starts inside its article, one that ends before its article does,
+// one longer than the one before). Each recovered piece is then checked relative
+// to where its first sampled article begins in its posted file; a table with no
+// boundary is one posted file and is checked as before.
 func tablesOfMeta(name string, m *metapb.FileMetadata) []sampleTable {
 	var out []sampleTable
-	add := func(label string, segs []*metapb.SegmentData) {
-		t := sampleTable{name: label}
-		for _, s := range segs {
-			if s == nil || s.Id == "" || holes.IsPlaceholderID(s.Id) {
-				return // a table with a hole cannot be described by one file
-			}
-			t.ids = append(t.ids, s.Id)
-			t.sizes = append(t.sizes, s.SegmentSize)
-			t.prefix = append(t.prefix, t.total)
-			t.total += s.SegmentSize
+	add := func(label string, segs []*metapb.SegmentData, split bool) {
+		var cuts []int
+		if split {
+			cuts = metaBoundaries(segs)
 		}
-		if len(t.ids) > 0 {
-			out = append(out, t)
+		from := 0
+		for k := 0; k <= len(cuts); k++ {
+			to := len(segs)
+			if k < len(cuts) {
+				to = cuts[k]
+			}
+			t := sampleTable{name: label, rel: len(cuts) > 0}
+			if len(cuts) > 0 {
+				t.name = fmt.Sprintf("%s (part %d of %d)", label, k+1, len(cuts)+1)
+			}
+			for _, s := range segs[from:to] {
+				if s == nil || s.Id == "" || holes.IsPlaceholderID(s.Id) {
+					return // a table with a hole cannot be described by one file
+				}
+				t.ids = append(t.ids, s.Id)
+				t.sizes = append(t.sizes, s.SegmentSize)
+				t.prefix = append(t.prefix, t.total)
+				t.total += s.SegmentSize
+			}
+			if len(t.ids) > 0 {
+				out = append(out, t)
+			}
+			from = to
 		}
 	}
-	add(name, m.SegmentData)
+	add(name, m.SegmentData, true)
 	for j, o := range m.SharedOuterSources {
-		add(fmt.Sprintf("%s (volume %d)", name, j+1), o.Segments)
+		add(fmt.Sprintf("%s (volume %d)", name, j+1), o.Segments, false)
 	}
 	return out
+}
+
+// metaBoundaries returns the indices at which a flat segment list starts a new
+// part.
+func metaBoundaries(segs []*metapb.SegmentData) []int {
+	var cuts []int
+	for i := 1; i < len(segs); i++ {
+		a, b := segs[i-1], segs[i]
+		if a == nil || b == nil {
+			continue
+		}
+		if b.StartOffset > 0 || a.EndOffset < a.SegmentSize-1 || b.SegmentSize > a.SegmentSize {
+			cuts = append(cuts, i)
+		}
+	}
+	return cuts
 }
 
 // VerifyPeerHeaders is the optional extra of the forced full check of a pending
@@ -98,7 +135,7 @@ func (i *Importer) VerifyPeerHeaders(ctx context.Context, filePath string) error
 	}
 	ctx, cancel := context.WithTimeout(ctx, i.cfg.Policy.YencTimeoutOrDefault())
 	defer cancel()
-	verdicts := i.runSamples(ctx, tables, plan)
+	verdicts := i.runSamples(ctx, tables, plan, newRelState())
 	var inconclusive error
 	for _, v := range verdicts {
 		switch v.reason {

@@ -57,6 +57,10 @@ const (
 	ReasonOtherEncryption ShareReason = "unsupported_encryption"
 	ReasonPasswordNotNZB  ShareReason = "password_not_from_nzb"
 	ReasonLocalPatch      ShareReason = "healed_by_local_patch"
+	// ReasonPartLayout: the file is stored across archive volumes but its part
+	// boundaries cannot be recovered reliably (a repeated article, or two
+	// separate runs of one volume).
+	ReasonPartLayout ShareReason = "part_layout_unrecoverable"
 )
 
 // NotShareableError reports the first file that makes the release not
@@ -154,6 +158,9 @@ type poolBuilder struct {
 	nzb  bool
 	idx  map[string]int64
 	pool []string
+	// nzb scheme: the pool range of every NZB file entry.
+	entStart []int64
+	entLen   []int
 }
 
 func (p *poolBuilder) ref(raw string) (int64, error) {
@@ -232,6 +239,76 @@ func effectiveOuter(m *metapb.FileMetadata, ns *metapb.NestedSegmentSource) *met
 	return ns
 }
 
+// entryOf returns the NZB file entry that holds pool position pos (nzb scheme).
+func (p *poolBuilder) entryOf(pos int64) int {
+	i := sort.Search(len(p.entStart), func(k int) bool { return p.entStart[k]+int64(p.entLen[k]) > pos })
+	for i < len(p.entStart) && p.entLen[i] == 0 {
+		i++
+	}
+	return i
+}
+
+// partsOf recovers the part boundaries of an inline table, deterministically.
+// It returns nil for a table that is one whole posted file (the original
+// layout, which encodes without parts).
+//
+// Nzb scheme: the NZB list says which entry (archive volume) every article
+// belongs to, so a part is a maximal run of consecutive articles of one entry.
+// A single run that is a whole entry is the original layout; anything else is a
+// multi-part layout, and a layout in which an entry supplies two runs (a
+// repeated article from a local patch, a skipped article) is refused.
+//
+// Files scheme: no entries are known. A boundary is a segment that starts
+// inside its article (every volume of a RAR set begins with a header, so this is
+// exact for RAR 4 and 5), a segment that ends before its article does, or a
+// segment longer than the one before it (a posted file's last article is its
+// shortest, which marks the volume boundary of a split 7z set that leaves both
+// sides whole). It cannot see a boundary between two volumes that are both whole
+// and have equal article sizes; such a file is then built as one posted file,
+// which a receiver will not accept.
+func (p *poolBuilder) partsOf(name string, segs []Segment) ([]int, error) {
+	if len(segs) < 2 {
+		return nil, nil
+	}
+	if !p.nzb {
+		return rangeParts(segs), nil
+	}
+	var lens []int
+	var entries []int
+	for i, s := range segs {
+		if i == 0 || s.Ref != segs[i-1].Ref+1 || p.entryOf(s.Ref) != entries[len(entries)-1] {
+			lens, entries = append(lens, 0), append(entries, p.entryOf(s.Ref))
+		}
+		lens[len(lens)-1]++
+	}
+	seen := make(map[int]struct{}, len(entries))
+	for _, e := range entries {
+		if _, dup := seen[e]; dup {
+			return nil, &NotShareableError{File: name, Reason: ReasonPartLayout}
+		}
+		seen[e] = struct{}{}
+	}
+	if len(lens) == 1 && segs[0].Ref == p.entStart[entries[0]] && lens[0] == p.entLen[entries[0]] {
+		return nil, nil
+	}
+	return lens, nil
+}
+
+func rangeParts(segs []Segment) []int {
+	var lens []int
+	start := 0
+	for i := 1; i < len(segs); i++ {
+		if segs[i].Start > 0 || segs[i-1].End < segs[i-1].Size-1 || segs[i].Size > segs[i-1].Size {
+			lens = append(lens, i-start)
+			start = i
+		}
+	}
+	if len(lens) == 0 {
+		return nil
+	}
+	return append(lens, len(segs)-start)
+}
+
 func (p *poolBuilder) file(pf preparedFile) (File, error) {
 	m := pf.in.Meta
 	if (len(m.AesKey) > 0) != (m.Encryption == metapb.Encryption_AES) {
@@ -244,6 +321,9 @@ func (p *poolBuilder) file(pf preparedFile) (File, error) {
 	}
 	var err error
 	if f.Segments, err = p.table(m.SegmentData); err != nil {
+		return File{}, err
+	}
+	if f.Parts, err = p.partsOf(pf.name, f.Segments); err != nil {
 		return File{}, err
 	}
 	index := map[string]int{}
@@ -298,7 +378,9 @@ func nzbPool(files [][]string) (*poolBuilder, []int, error) {
 	}
 	p := &poolBuilder{nzb: true, idx: map[string]int64{}}
 	counts := make([]int, len(files))
+	p.entStart = make([]int64, len(files))
 	for i, f := range files {
+		p.entStart[i] = int64(len(p.pool))
 		for _, raw := range f {
 			if holes.IsPlaceholderID(raw) {
 				continue
@@ -317,6 +399,7 @@ func nzbPool(files [][]string) (*poolBuilder, []int, error) {
 			counts[i]++
 		}
 	}
+	p.entLen = counts
 	return p, counts, nil
 }
 

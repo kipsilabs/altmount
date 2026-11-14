@@ -51,7 +51,14 @@ func vint(v uint64) []byte {
 
 // RAR5 builds a RAR 5 archive: signature, main header, one block per file, end
 // of archive.
-func RAR5(files ...File) Built {
+func RAR5(files ...File) Built { return rar5(-1, files) }
+
+// RAR5Volume builds one volume of a multi-volume RAR 5 set: the main header
+// carries the volume flag and, after the first volume, the volume number
+// (0-based).
+func RAR5Volume(volume int, files ...File) Built { return rar5(volume, files) }
+
+func rar5(volume int, files []File) Built {
 	var buf bytes.Buffer
 	buf.Write([]byte{'R', 'a', 'r', '!', 0x1A, 0x07, 0x01, 0x00})
 	block := func(content []byte) {
@@ -63,7 +70,16 @@ func RAR5(files ...File) Built {
 		buf.Write(size)
 		buf.Write(content)
 	}
-	block(append(vint(1), append(vint(0), vint(0)...)...)) // main: type 1, flags 0, archive flags 0
+	main := append(vint(1), vint(0)...) // main: type 1, flags 0
+	switch {
+	case volume < 0:
+		main = append(main, vint(0)...) // archive flags 0
+	case volume == 0:
+		main = append(main, vint(0x1)...)
+	default:
+		main = append(append(main, vint(0x3)...), vint(uint64(volume))...)
+	}
+	block(main)
 	var offsets []int64
 	for _, f := range files {
 		typ, flags := uint64(2), uint64(0x2)

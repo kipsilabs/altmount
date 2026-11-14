@@ -91,6 +91,11 @@ type File struct {
 	FileID contentid.ID
 	// Segments is the file's own segment table (empty for nested files).
 	Segments []Segment
+	// Parts, when set, makes the table a multi-part inline layout: the table is
+	// the concatenation of slices, one per part, and Parts lists how many
+	// segments each part holds. Empty means the table is read as one posted
+	// file (the original layout; it encodes without this field).
+	Parts []int
 	// AESKey and AESIV are set together for a directly AES-encrypted file.
 	AESKey []byte
 	AESIV  []byte

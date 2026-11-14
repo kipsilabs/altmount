@@ -124,6 +124,7 @@ type decoder struct {
 	clipBudget   int
 	outerBudget  int
 	par2Budget   int
+	partBudget   int
 	poolLen      int64
 }
 
@@ -422,6 +423,8 @@ func (d *decoder) decodeFile(b []byte) (File, error) {
 		case fFileID:
 			err = fixedField(fl, f.FileID[:], "file id")
 			haveID = true
+		case fParts:
+			f.Parts, err = d.decodeParts(fl, len(f.Segments))
 		default:
 			err = fmt.Errorf("%w: unknown file field %d", ErrMalformed, fl.num)
 		}
@@ -463,6 +466,40 @@ func (d *decoder) decodeExtents(f field) ([]Extent, error) {
 			return nil, err
 		}
 		out = append(out, e)
+	}
+	return out, nil
+}
+
+// decodeParts reads the part lengths of a multi-part file. The field is only
+// ever written for a file that has parts, so an empty one is not canonical. The
+// count is bounded by the segments already decoded and by the bundle-wide part
+// budget before anything is allocated.
+func (d *decoder) decodeParts(f field, segments int) ([]int, error) {
+	b, err := bytesField(f, "parts")
+	if err != nil {
+		return nil, err
+	}
+	nv := countVarints(b)
+	if nv == 0 {
+		return nil, fmt.Errorf("%w: empty parts field", ErrMalformed)
+	}
+	if nv > MaxParts || nv > segments {
+		return nil, fmt.Errorf("%w: %d parts for %d segments", ErrLimit, nv, segments)
+	}
+	if err := take(&d.partBudget, nv, "parts", MaxTotalParts); err != nil {
+		return nil, err
+	}
+	out := make([]int, 0, nv)
+	r := varReader{b: b}
+	for r.more() {
+		n, err := r.next()
+		if err != nil {
+			return nil, err
+		}
+		if n > MaxSegments {
+			return nil, fmt.Errorf("%w: part length", ErrInvalidField)
+		}
+		out = append(out, int(n))
 	}
 	return out, nil
 }
@@ -548,7 +585,7 @@ func decodeRaw(raw []byte) (*Bundle, error) {
 	}
 	b := &Bundle{}
 	d := &decoder{segBudget: MaxSegments, extentBudget: MaxExtents, clipBudget: MaxTotalClips,
-		outerBudget: MaxTotalOuterSources, par2Budget: MaxTotalPar2Files}
+		outerBudget: MaxTotalOuterSources, par2Budget: MaxTotalPar2Files, partBudget: MaxTotalParts}
 	var val *validator
 	r := fieldReader{b: raw, repeated: isRepeatedBundleField}
 	have := 0

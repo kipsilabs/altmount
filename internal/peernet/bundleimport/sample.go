@@ -67,6 +67,20 @@ type sampleTable struct {
 	// nzbName is the file name the user's NZB subject gives the NZB entry this
 	// table reads ("" when unknown); the first article's yEnc name must agree.
 	nzbName string
+	// part is set for a table that is one part of a multi-part file. A part
+	// that is not a whole posted file (rel) is checked relative to where its
+	// first article begins in that file, which the sampled headers reveal; a
+	// whole one is checked as before (offset 0, file total = sum of the part).
+	part bool
+	rel  bool
+	// mainPart marks a part of the main media file: its interior samples are
+	// planned over all the parts together (planMust).
+	mainPart bool
+	// file and index place a part table in its bundle file.
+	file, index int
+	// need0 makes the first article a mandatory sample (the header binding of
+	// the part needs where it begins).
+	need0 bool
 }
 
 // sample is one article to read. A mandatory one must be answered for the
@@ -99,7 +113,7 @@ func entryNameAt(b *bundle.Bundle, names []string, pos int64) string {
 func tablesOf(b *bundle.Bundle, names []string) []sampleTable {
 	var out []sampleTable
 	seen := map[bundle.TableKey]struct{}{}
-	add := func(name string, segs []bundle.Segment, main bool) {
+	add := func(name string, segs []bundle.Segment, main bool, tag func(*sampleTable)) {
 		if len(segs) == 0 {
 			return
 		}
@@ -114,14 +128,26 @@ func tablesOf(b *bundle.Bundle, names []string) []sampleTable {
 			t.ids[i], t.sizes[i], t.prefix[i] = b.Pool[s.Ref], s.Size, t.total
 			t.total += s.Size
 		}
+		if tag != nil {
+			tag(&t)
+		}
 		out = append(out, t)
 	}
+	ents := newEntryIndex(b)
 	mainFile := mainMediaFile(b)
 	for i := range b.Files {
 		f := &b.Files[i]
-		add(f.Name, f.Segments, i == mainFile)
+		if len(f.Parts) == 0 {
+			add(f.Name, f.Segments, i == mainFile, nil)
+		}
+		for k, ps := range partsOfSliced(f) {
+			add(fmt.Sprintf("%s (part %d of %d)", f.Name, k+1, len(f.Parts)), ps, false, func(t *sampleTable) {
+				t.part, t.file, t.index, t.mainPart = true, i, k, i == mainFile
+				t.rel = !ents.wholeYenc(ps)
+			})
+		}
 		for j := range f.Outer {
-			add(fmt.Sprintf("%s (volume %d)", f.Name, j+1), f.Outer[j].Segments, i == mainFile)
+			add(fmt.Sprintf("%s (volume %d)", f.Name, j+1), f.Outer[j].Segments, i == mainFile, nil)
 		}
 	}
 	return out
@@ -216,6 +242,9 @@ func planMust(tables []sampleTable) (plan []sample, bytes int64) {
 			continue
 		}
 		push(t, n-1)
+		if tables[t].need0 {
+			push(t, 0)
+		}
 		if !tables[t].main {
 			continue
 		}
@@ -227,7 +256,41 @@ func planMust(tables []sampleTable) (plan []sample, bytes int64) {
 			}
 		}
 	}
+	planMainParts(tables, push)
 	return plan, bytes
+}
+
+// planMainParts plans the interior samples of the parts of the main media file as
+// if they were one table: one per mediaPerSegments segments of the whole file, at
+// least three, drawn uniformly over all their interior articles.
+func planMainParts(tables []sampleTable, push func(t, pos int) bool) {
+	var at []int // table of every interior position, flattened
+	var pos []int
+	for t := range tables {
+		if !tables[t].mainPart {
+			continue
+		}
+		for p := 1; p < len(tables[t].ids)-1; p++ {
+			at, pos = append(at, t), append(pos, p)
+		}
+	}
+	want := min(max(3, (len(at)+2*countParts(tables))/mediaPerSegments), len(at))
+	for k, tries := 0, 0; k < want && tries < 32*want+32; tries++ {
+		g := randN(len(at))
+		if push(at[g], pos[g]) {
+			k++
+		}
+	}
+}
+
+func countParts(tables []sampleTable) int {
+	n := 0
+	for i := range tables {
+		if tables[i].mainPart {
+			n++
+		}
+	}
+	return n
 }
 
 // planOptional spends what is left of the budget on the first article of
@@ -317,12 +380,15 @@ func SubjectFilename(subject string) string {
 // The returned report says which files have extents that could not be bound to
 // an archive header.
 func (i *Importer) verifyYenc(ctx context.Context, b *bundle.Bundle, names []string, stage stageFunc) (rep extentReport, reason Reason, attributable bool, err error) {
+	rep.unbound = map[int]string{}
 	if i.cfg.Headers == nil {
 		return rep, ReasonProbeInconclusive, false, errors.New("no way to read article headers")
 	}
 	tables := tablesOf(b, names)
 	picks := pickExtents(b)
-	reserve := extentReserve(b, picks)
+	partPicks := pickParts(b)
+	markNeed0(tables, partPicks)
+	reserve := extentReserve(b, picks) + partReserve(b, partPicks)
 	must, mustBytes := planMust(tables)
 	limit, ceiling := i.cfg.Policy.YencSamples(), i.cfg.Policy.YencBytes()
 	if len(must) > limit || mustBytes+reserve > ceiling {
@@ -330,18 +396,25 @@ func (i *Importer) verifyYenc(ctx context.Context, b *bundle.Bundle, names []str
 			errTooManyTables, len(tables), len(must), mustBytes, reserve, limit, ceiling)
 	}
 	bud := newCostBudget(max(yencCap(releaseBytes(tables), ceiling), mustBytes+reserve))
-	_ = bud.charge(mustBytes)
+	_ = bud.chargeMany(mustBytes, len(must))
+	defer func() { rep.articles, rep.bytes = bud.articles(), bud.spent() }()
 	ctx, cancel := context.WithTimeout(ctx, i.cfg.Policy.YencTimeoutOrDefault())
 	defer cancel()
-	if reason, attributable, err := judge(i.runSamples(ctx, tables, must)); err != nil {
+	rel := newRelState()
+	if reason, attributable, err := judge(i.runSamples(ctx, tables, must, rel)); err != nil {
 		return rep, reason, attributable, err
 	}
-	if len(picks) > 0 {
+	if len(picks) > 0 || len(partPicks) > 0 {
 		st, r, serr := stage()
 		if serr != nil {
 			return rep, r, false, serr
 		}
-		if rep, reason, attributable, err = i.verifyExtents(ctx, b, st, picks, bud); err != nil {
+		if len(picks) > 0 {
+			if rep, reason, attributable, err = i.verifyExtents(ctx, b, st, picks, bud); err != nil {
+				return rep, reason, attributable, err
+			}
+		}
+		if reason, attributable, err = i.verifyParts(ctx, b, tables, st, partPicks, rel, bud, &rep); err != nil {
 			return rep, reason, attributable, err
 		}
 	}
@@ -349,7 +422,7 @@ func (i *Importer) verifyYenc(ctx context.Context, b *bundle.Bundle, names []str
 	for _, s := range optional {
 		_ = bud.charge(tables[s.table].sizes[s.pos])
 	}
-	reason, attributable, err = judge(i.runSamples(ctx, tables, optional))
+	reason, attributable, err = judge(i.runSamples(ctx, tables, optional, rel))
 	return rep, reason, attributable, err
 }
 
@@ -376,11 +449,57 @@ type sampleVerdict struct {
 	reason       Reason
 	err          error
 	attributable bool
+	// hdr is the article's header when it was read.
+	hdr YencHeader
+	ok  bool
+}
+
+// relState collects, across the runs of one accept, what the sampled articles
+// of the parts that are slices of a larger posted file say: where the part's
+// first article begins in the posted file (every sample implies it) and the
+// posted file's total size. Every sample of one part must agree.
+type relState struct {
+	base  map[int]int64
+	total map[int]int64
+	// first is the 0-based offset of article 0 of a table, when it was sampled.
+	first map[int]int64
+}
+
+func newRelState() *relState {
+	return &relState{base: map[int]int64{}, total: map[int]int64{}, first: map[int]int64{}}
+}
+
+// judgeRelative compares the samples of every relative part with each other.
+func (st *relState) judge(tables []sampleTable, plan []sample, res []sampleVerdict) {
+	for k, s := range plan {
+		t := &tables[s.table]
+		if !res[k].ok || res[k].reason != "" {
+			continue
+		}
+		h := res[k].hdr
+		if s.pos == 0 {
+			st.first[s.table] = h.PartBegin
+		}
+		if !t.rel {
+			continue
+		}
+		base := h.PartBegin - t.prefix[s.pos]
+		bad := base < 0 || base+t.total > h.FileSize
+		if b0, ok := st.base[s.table]; ok && (b0 != base || st.total[s.table] != h.FileSize) {
+			bad = true
+		}
+		if bad {
+			res[k] = sampleVerdict{reason: ReasonYencMismatch, attributable: true, err: fmt.Errorf("%s: article %d begins at %d of %d, which does not fit the other articles of the part (%d bytes in the layout)",
+				t.name, s.pos, h.PartBegin, h.FileSize, t.total)}
+			continue
+		}
+		st.base[s.table], st.total[s.table] = base, h.FileSize
+	}
 }
 
 // runSamples reads the planned articles' headers (four at a time) and compares
 // each with the layout of its table.
-func (i *Importer) runSamples(ctx context.Context, tables []sampleTable, plan []sample) []sampleVerdict {
+func (i *Importer) runSamples(ctx context.Context, tables []sampleTable, plan []sample, rel *relState) []sampleVerdict {
 	results := make([]sampleVerdict, len(plan))
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, 4)
@@ -399,14 +518,21 @@ func (i *Importer) runSamples(ctx context.Context, tables []sampleTable, plan []
 				// An optional sample that ran out of time is dropped, not a failure.
 			case err != nil:
 				results[k] = sampleVerdict{reason: ReasonProbeInconclusive, err: fmt.Errorf("%s: %w", t.name, err)}
-			case h.PartSize != t.sizes[s.pos] || h.PartBegin != t.prefix[s.pos] || h.FileSize != t.total:
+			case t.rel && h.PartSize != t.sizes[s.pos]:
+				results[k] = sampleVerdict{reason: ReasonYencMismatch, attributable: true, err: fmt.Errorf("%s: article %d says part %d, layout says %d", t.name, s.pos, h.PartSize, t.sizes[s.pos])}
+			case !t.rel && (h.PartSize != t.sizes[s.pos] || h.PartBegin != t.prefix[s.pos] || h.FileSize != t.total):
 				results[k] = sampleVerdict{reason: ReasonYencMismatch, attributable: true, err: fmt.Errorf("%s: article %d says part %d at %d of %d, layout says %d at %d of %d",
 					t.name, s.pos, h.PartSize, h.PartBegin, h.FileSize, t.sizes[s.pos], t.prefix[s.pos], t.total)}
 			case s.pos == 0 && t.nzbName != "" && h.Name != "" && !strings.EqualFold(h.Name, t.nzbName):
 				results[k] = sampleVerdict{reason: ReasonYencMismatch, err: fmt.Errorf("%s: first article is named %q, your NZB names this entry %q", t.name, h.Name, t.nzbName)}
+			default:
+				results[k] = sampleVerdict{hdr: h, ok: true}
 			}
 		}()
 	}
 	wg.Wait()
+	if rel != nil {
+		rel.judge(tables, plan, results)
+	}
 	return results
 }

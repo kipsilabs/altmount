@@ -52,6 +52,10 @@ const (
 	MaxTotalClips        = 200_000
 	MaxTotalOuterSources = 50_000
 	MaxTotalPar2Files    = 10_000
+	// MaxParts caps the parts of one multi-part file (its archive volumes) and
+	// MaxTotalParts those of the whole bundle.
+	MaxParts      = 10_000
+	MaxTotalParts = 50_000
 	// MaxPar2Files caps the PAR2 file references of one file.
 	MaxPar2Files = 1_000
 

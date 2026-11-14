@@ -35,6 +35,7 @@ const (
 	fClips   protowire.Number = 9
 	fPar2    protowire.Number = 10
 	fFileID  protowire.Number = 11
+	fParts   protowire.Number = 12
 
 	// OuterSource.
 	fOuterSegs protowire.Number = 1
@@ -132,6 +133,19 @@ func sameRun(a, b Segment) bool {
 	return b.Ref == a.Ref+1
 }
 
+// appendParts encodes the part lengths of a multi-part file as one packed
+// field. It is empty for a file read as one posted file.
+func appendParts(parts []int) []byte {
+	if len(parts) == 0 {
+		return nil
+	}
+	var pb []byte
+	for _, n := range parts {
+		pb = protowire.AppendVarint(pb, uint64(n))
+	}
+	return appendBytes(nil, fParts, pb)
+}
+
 func appendFile(f *File) []byte {
 	var b []byte
 	b = appendString(b, fName, f.Name)
@@ -182,7 +196,8 @@ func appendFile(f *File) []byte {
 		pb = appendBytes(pb, fPar2Segs, appendTable(p.Segments))
 		b = appendBytes(b, fPar2, pb)
 	}
-	return appendBytes(b, fFileID, f.FileID[:])
+	b = appendBytes(b, fFileID, f.FileID[:])
+	return append(b, appendParts(f.Parts)...)
 }
 
 // encodeUnchecked writes the canonical bytes without validating b. Callers

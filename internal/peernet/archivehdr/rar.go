@@ -117,6 +117,8 @@ func scanRAR5(d *reader, v *Volume, upTo int64, lim Limits) error {
 			return err
 		}
 		switch kind {
+		case r5Main:
+			v.VolumeNumber = rar5VolumeNumber(hdr[4+n:])
 		case r5Encrypt:
 			return ErrEncryptedHeaders
 		case r5End:
@@ -181,6 +183,34 @@ func parseRAR5(body []byte, off, total int64) (Block, uint64, error) {
 		return Block{}, 0, err
 	}
 	return blk, typ, nil
+}
+
+// rar5VolumeNumber reads the volume number of a RAR 5 main header (body after
+// the size field): archive flags bit 0x1 says the archive is a volume, bit 0x2
+// that a volume number follows (the first volume has none and is 0). It returns
+// -1 for an archive that is not a volume or a header it cannot read.
+func rar5VolumeNumber(body []byte) int64 {
+	c := &cursor{b: body}
+	c.vint() // type
+	flags := c.vint()
+	if flags&r5FlagExtra != 0 {
+		c.vint()
+	}
+	if flags&r5FlagData != 0 {
+		c.vint()
+	}
+	arch := c.vint()
+	if c.err || arch&0x1 == 0 {
+		return -1
+	}
+	if arch&0x2 == 0 {
+		return 0
+	}
+	n := c.vint()
+	if c.err || n > 1<<40 {
+		return -1
+	}
+	return int64(n)
 }
 
 // parseRAR5Extra reads the extra records of a file header for the file

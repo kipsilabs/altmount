@@ -292,3 +292,36 @@ func TestRealArchivesFromTheImporterFixtures(t *testing.T) {
 		assert.ErrorIs(t, err, ErrCompressedHeader, "a real 7z whose end header is encoded is unverifiable")
 	}
 }
+
+func TestRAR5VolumeNumberIsReported(t *testing.T) {
+	scan := func(data []byte) *Volume {
+		v, err := Scan(bytes.NewReader(data), int64(len(data)), int64(len(data)), Limits{})
+		require.NoError(t, err)
+		return v
+	}
+	for n := 0; n < 4; n++ {
+		a := archivetest.RAR5Volume(n, archivetest.File{Name: "movie.mkv", Data: payload(100), SplitBefore: n > 0, SplitAfter: true})
+		assert.EqualValues(t, n, scan(a.Data).VolumeNumber, "volume %d", n)
+	}
+	assert.EqualValues(t, -1, scan(archivetest.RAR5(archivetest.File{Name: "a", Data: payload(10)}).Data).VolumeNumber, "not a volume")
+	assert.EqualValues(t, -1, scan(archivetest.RAR4(archivetest.File{Name: "a", Data: payload(10)}).Data).VolumeNumber, "rar4 has none")
+}
+
+func TestKeyedExtentNeedsAnEncryptedEntryWithTheSameIV(t *testing.T) {
+	iv := bytes.Repeat([]byte{7}, 16)
+	p := payload(64)
+	a := archivetest.RAR5(archivetest.File{Name: "movie.mkv", Data: p, IV: iv})
+	keyed := func(iv []byte) Extent {
+		e := ext(a.DataOffsets[0], 64, 0, 1, 64)
+		e.Keyed, e.IV = true, iv
+		return e
+	}
+	assert.Equal(t, Bound, verify(a.Data, keyed(iv)).Outcome)
+	assert.Equal(t, Bound, verify(a.Data, keyed(nil)).Outcome, "no IV to compare")
+	assert.Equal(t, Mismatch, verify(a.Data, keyed(bytes.Repeat([]byte{8}, 16))).Outcome)
+	assert.Equal(t, Mismatch, verify(a.Data, ext(a.DataOffsets[0], 64, 0, 1, 64)).Outcome, "an encrypted entry needs a keyed extent")
+	plain := archivetest.RAR5(archivetest.File{Name: "movie.mkv", Data: p})
+	e := ext(plain.DataOffsets[0], 64, 0, 1, 64)
+	e.Keyed = true
+	assert.Equal(t, Mismatch, verify(plain.Data, e).Outcome, "a keyed extent needs an encrypted entry")
+}

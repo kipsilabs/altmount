@@ -419,6 +419,21 @@ type Result struct {
 	// AlreadyImported is set when every file was already present locally with
 	// the same File ID (nothing was written).
 	AlreadyImported bool
+	// Cost is what the accept-time article reads cost.
+	Cost Cost
+}
+
+// Cost reports the accept-time reads of one bundle: the articles and declared
+// bytes charged to the shared budget (yEnc header samples, archive header
+// reads), and how the archive header checks came out.
+type Cost struct {
+	Articles int
+	Bytes    int64
+	// ExtentsBound and ExtentsUnbound count the nested-layout extents that were
+	// bound to an archive header or could not be; PartsBound and PartsUnbound
+	// do the same for the slices of multi-part files.
+	ExtentsBound, ExtentsUnbound int
+	PartsBound, PartsUnbound     int
 }
 
 // Counters is a snapshot of the accept counters.

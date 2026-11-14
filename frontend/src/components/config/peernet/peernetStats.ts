@@ -51,6 +51,7 @@ const NOT_SHAREABLE_LABELS: ReadonlyMap<string, string> = new Map([
 	["unsupported_encryption", "Uses an encryption type that cannot be shared"],
 	["password_not_from_nzb", "Password did not come inside the NZB"],
 	["healed_by_local_patch", "Repaired with local PAR2 patches"],
+	["part_layout_unrecoverable", "Archive volumes could not be told apart reliably"],
 	["known_holes", "Has known missing parts"],
 	["patch_status_unknown", "Repair status was not known"],
 	["no_nzb_segment_list", "No stored NZB segment list"],

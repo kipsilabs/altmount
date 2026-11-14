@@ -8,7 +8,7 @@ import (
 func seedBundles(t testing.TB) [][]byte {
 	t.Helper()
 	var out [][]byte
-	for _, b := range []*Bundle{goodBundle(t), goodNZBBundle(t), syntheticBundle(t, 50, 716_800)} {
+	for _, b := range []*Bundle{goodBundle(t), goodNZBBundle(t), syntheticBundle(t, 50, 716_800), partsNZBBundle(t)} {
 		out = append(out, mustEncode(t, b))
 	}
 	return out
@@ -71,7 +71,7 @@ func FuzzDecompress(f *testing.F) {
 // mutateBundle breaks one field of a good bundle, chosen by sel.
 func mutateBundle(b *Bundle, sel uint8, v int64) {
 	f := &b.Files[int(sel/32)%len(b.Files)]
-	switch sel % 16 {
+	switch sel % 18 {
 	case 0:
 		f.Size = v
 	case 1:
@@ -128,6 +128,12 @@ func mutateBundle(b *Bundle, sel uint8, v int64) {
 		if len(f.Par2) > 0 && len(f.Par2[0].Segments) > 0 {
 			f.Par2[0].Segments[0].Size = v
 		}
+	case 16:
+		if len(f.Parts) > 0 {
+			f.Parts[int(sel)%len(f.Parts)] = int(v)
+		}
+	case 17:
+		f.Parts = append(f.Parts, int(v))
 	}
 }
 
@@ -140,7 +146,7 @@ func FuzzValidate(f *testing.F) {
 	f.Add([]byte{}, uint8(70), int64(576))
 	// The good bundles are built (and their ids hashed) once; every exec
 	// mutates a cheap deep copy, so the fuzzer spends its time on Validate.
-	bases := []*Bundle{goodBundle(f), goodNZBBundle(f)}
+	bases := []*Bundle{goodBundle(f), goodNZBBundle(f), partsNZBBundle(f)}
 	f.Fuzz(func(t *testing.T, data []byte, sel uint8, v int64) {
 		check := func(b *Bundle) {
 			if err := Validate(b); err != nil {

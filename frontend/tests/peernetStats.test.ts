@@ -76,6 +76,7 @@ const BACKEND_NOT_SHAREABLE_KEYS = [
 	"unsupported_encryption",
 	"password_not_from_nzb",
 	"healed_by_local_patch",
+	"part_layout_unrecoverable",
 	"known_holes",
 	"patch_status_unknown",
 	"no_nzb_segment_list",

@@ -210,6 +210,11 @@ type extentReport struct {
 	unbound map[int]string
 	bound   int
 	checked int
+	// partsBound and partsUnbound count the header checks of multi-part files.
+	partsBound, partsUnbound int
+	// articles and bytes are what the shared budget was charged.
+	articles int
+	bytes    int64
 }
 
 // verifyExtents runs the header check for the picked extents. A mismatch is

@@ -34,6 +34,18 @@ func (c *costBudget) charge(n int64) error {
 	return nil
 }
 
+// chargeMany takes bytes for n articles at once (the mandatory samples).
+func (c *costBudget) chargeMany(bytes int64, n int) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if bytes < 0 || c.used+bytes > c.limit {
+		return errCost
+	}
+	c.used += bytes
+	c.n += n
+	return nil
+}
+
 // left is what remains.
 func (c *costBudget) left() int64 {
 	c.mu.Lock()

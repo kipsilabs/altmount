@@ -324,3 +324,62 @@ func TestAccept_OptionalSamplesRunningOutOfTimeAreDropped(t *testing.T) {
 	require.Error(t, err)
 	assert.Equal(t, ReasonProbeInconclusive, ReasonOf(err))
 }
+
+// The parts of the main media file are sampled like one table: one interior
+// article per 500 segments of the whole file (at least three), spread over the
+// parts at random, plus the last article of every part and the first article of
+// every part that gets an archive header check.
+func TestPlanMust_MainFilePartsAreSampledAsOneTable(t *testing.T) {
+	parts := func(n, articles int) []sampleTable {
+		out := make([]sampleTable, n)
+		for i := range out {
+			out[i] = bigTable(articles, false)
+			out[i].part, out[i].mainPart, out[i].index, out[i].need0 = true, true, i, true
+		}
+		return out
+	}
+	for _, tc := range []struct{ n, articles, interior int }{{50, 140, 14}, {200, 140, 56}, {3, 100, 3}} {
+		tables := parts(tc.n, tc.articles)
+		must, _ := planMust(tables)
+		last, first, interior := 0, 0, 0
+		for _, s := range must {
+			switch s.pos {
+			case tc.articles - 1:
+				last++
+			case 0:
+				first++
+			default:
+				interior++
+			}
+		}
+		assert.Equal(t, tc.n, last, "the last article of every part")
+		assert.Equal(t, tc.n, first, "the first article of every part that is bound")
+		assert.Equal(t, tc.interior, interior, "%d parts: one interior article per 500 segments of the file, at least 3", tc.n)
+	}
+}
+
+// What the multi-part checks cost for stored sets of 100 MB volumes at 768 KB
+// articles (140 per volume): the mandatory samples plus one header read per
+// checked part.
+func TestSamplingCostOfMultiVolumeSets(t *testing.T) {
+	for _, tc := range []struct {
+		volumes         int
+		articles        int
+		maxMB           float64
+		wantArticlesMax int
+	}{{50, 150, 130, 170}, {200, 150, 300, 390}} {
+		tables := make([]sampleTable, tc.volumes)
+		for i := range tables {
+			tables[i] = bigTable(tc.articles, false)
+			tables[i].part, tables[i].mainPart, tables[i].index = true, true, i
+			tables[i].need0 = i < maxPartChecks
+		}
+		must, mustBytes := planMust(tables)
+		checked := min(tc.volumes, maxPartChecks)
+		articles := len(must) + checked
+		mb := float64(mustBytes+int64(checked)*768_000) / 1e6
+		t.Logf("%d volumes: %d mandatory samples + %d header reads = %d articles, %.0f MB", tc.volumes, len(must), checked, articles, mb)
+		assert.LessOrEqual(t, mb, tc.maxMB)
+		assert.LessOrEqual(t, articles, tc.wantArticlesMax)
+	}
+}
