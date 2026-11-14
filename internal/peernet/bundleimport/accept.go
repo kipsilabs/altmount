@@ -104,11 +104,6 @@ func (i *Importer) Accept(ctx context.Context, req Request) (*Result, error) {
 		return i.rejected(r, err)
 	}
 	b, loc = subset(b, loc, keep)
-	if req.Origin.Open {
-		if err := plainLayoutOnly(b); err != nil {
-			return i.rejected(ReasonLayoutNotAllowedOpen, err)
-		}
-	}
 
 	paths := make([]string, len(loc.Files))
 	for n, lf := range loc.Files {
@@ -138,7 +133,10 @@ func (i *Importer) Accept(ctx context.Context, req Request) (*Result, error) {
 		}
 		return i.rejected(ReasonProbeInconclusive, err)
 	}
-	if r, attributable, err := i.verifyYenc(ctx, b, req.ExpectedNZBNames); err != nil {
+	stage, closeStage := i.stager()
+	defer closeStage()
+	rep, r, attributable, err := i.verifyYenc(ctx, b, req.ExpectedNZBNames, stage)
+	if err != nil {
 		if attributable && i.cfg.Reporter != nil {
 			// The layout contradicts the articles themselves: the publisher
 			// served a bad bundle, which is attributable (fetch domain only).
@@ -150,7 +148,7 @@ func (i *Importer) Accept(ctx context.Context, req Request) (*Result, error) {
 		}
 		return i.rejected(r, err)
 	}
-	if r, err := i.probeMedia(ctx, loc, req.Origin.Open); err != nil {
+	if r, err := i.probeMedia(ctx, loc, stage, needsStructure(rep, b)); err != nil {
 		if r == ReasonMediaInvalid || r == ReasonStructureInvalid {
 			i.noteFailedBundle(ctx, req.Origin.BundleID, b.ReleaseID.String())
 		}
@@ -177,27 +175,6 @@ func (i *Importer) Accept(ctx context.Context, req Request) (*Result, error) {
 	}
 	i.cnt.add(func(c *counters) { c.accepted++ })
 	return res, nil
-}
-
-// plainLayoutOnly requires every written file to be exactly one inline segment
-// table: no outer volumes, extents, AES key or clips. Archive layouts cannot be
-// bound to the articles without reading archive headers, so the open network
-// does not carry them (private networks do).
-func plainLayoutOnly(b *bundle.Bundle) error {
-	for k := range b.Files {
-		f := &b.Files[k]
-		switch {
-		case len(f.Outer) > 0 || len(f.Extents) > 0:
-			return fmt.Errorf("%s: read through outer archive volumes", f.Name)
-		case len(f.AESKey) > 0:
-			return fmt.Errorf("%s: encrypted", f.Name)
-		case len(f.Clips) > 0:
-			return fmt.Errorf("%s: clipped", f.Name)
-		case len(f.Segments) == 0:
-			return fmt.Errorf("%s: no inline segments", f.Name)
-		}
-	}
-	return nil
 }
 
 // noteFailedBundle puts a layout that contradicted the articles or the media on
@@ -322,9 +299,40 @@ func probeFiles(loc *bundle.Local) []ProbeFile {
 	return out
 }
 
+// stageFunc returns the hidden staging area of one accept, creating it on first
+// use.
+type stageFunc func() (Staging, Reason, error)
+
+// stager returns the lazily created staging area of one accept and the function
+// that removes it (a no-op when it was never created).
+func (i *Importer) stager() (stageFunc, func()) {
+	var st Staging
+	get := func() (Staging, Reason, error) {
+		if st != nil {
+			return st, "", nil
+		}
+		if i.cfg.Stager == nil {
+			return nil, ReasonStaging, errors.New("no stager")
+		}
+		s, err := i.cfg.Stager.NewStaging()
+		if err != nil {
+			return nil, ReasonStaging, err
+		}
+		st = s
+		return st, "", nil
+	}
+	return get, func() {
+		if st != nil {
+			_ = st.Close()
+		}
+	}
+}
+
 // probeMedia reads the head of the main media file(s) through the real reader
-// stack, in a hidden staging area that is removed on every outcome.
-func (i *Importer) probeMedia(ctx context.Context, loc *bundle.Local, open bool) (Reason, error) {
+// stack, in a hidden staging area that is removed on every outcome. strong
+// names the files whose archive extents could not be bound to an archive
+// header: their container must have a real structural check.
+func (i *Importer) probeMedia(ctx context.Context, loc *bundle.Local, stage stageFunc, strong map[string]string) (Reason, error) {
 	var media []bundle.LocalFile
 	for _, lf := range loc.Files {
 		if fileinfo.IsVerifiableMediaFile(lf.Name) {
@@ -334,14 +342,10 @@ func (i *Importer) probeMedia(ctx context.Context, loc *bundle.Local, open bool)
 	if len(media) == 0 {
 		return ReasonNoMediaFile, errors.New("no file the media probe can verify")
 	}
-	if i.cfg.Stager == nil {
-		return ReasonStaging, errors.New("no stager")
-	}
-	st, err := i.cfg.Stager.NewStaging()
+	st, r, err := stage()
 	if err != nil {
-		return ReasonStaging, err
+		return r, err
 	}
-	defer func() { _ = st.Close() }()
 	for _, lf := range media {
 		if err := st.WriteFileMetadata(lf.Name, lf.Meta); err != nil {
 			return ReasonStaging, err
@@ -356,7 +360,11 @@ func (i *Importer) probeMedia(ctx context.Context, loc *bundle.Local, open bool)
 		default:
 			return ReasonMediaInconclusive, fmt.Errorf("%s: %w", lf.Name, res.Err)
 		}
-		if err := verifyStructure(ctx, st.Opener(), lf.Name, lf.Meta.FileSize, open); err != nil {
+		why, unbound := strong[lf.Name]
+		if err := verifyStructure(ctx, st.Opener(), lf.Name, lf.Meta.FileSize, unbound); err != nil {
+			if unbound && errors.Is(err, errNotVerifiable) {
+				err = fmt.Errorf("%w (its archive extents could not be checked: %s)", err, why)
+			}
 			return structureReason(err), fmt.Errorf("%s: %w", lf.Name, err)
 		}
 	}

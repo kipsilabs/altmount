@@ -138,8 +138,8 @@ const BACKEND_IMPORT_REJECT_KEYS = [
 	"size_implausible",
 	"yenc_mismatch",
 	"structure_invalid",
-	"layout_not_allowed_open",
-	"container_not_verifiable",
+	"extent_mismatch",
+	"extent_unverifiable",
 	"too_many_tables",
 ];
 
@@ -174,6 +174,17 @@ describe("bundle block visibility", () => {
 		expect(showBundleServing([{ level: 1 }], { announced: 8 })).toBe(true);
 		expect(showBundleServing([{ level: 2 }], { serve_refused: { busy: 2 } })).toBe(true);
 		expect(showBundleServing([{ level: 2 }], { announced: 0, fetched: 4 })).toBe(false);
+	});
+	test("open network at level 0 with a private network at level 3, as the API sends it", () => {
+		// The shape of GET /peernet/status in the live run: the open network's level comes
+		// from the configuration, the private network's from its own row; both use "level".
+		const status = JSON.parse(
+			'{"networks":[{"kind":"open","role":"open","level":0},{"kind":"private","role":"host","level":3}],' +
+				'"bundles":{"announced":0,"served":0,"import":{}}}',
+		) as { networks: { level: number }[]; bundles: unknown };
+		expect(showBundlesBlock(status.networks)).toBe(true);
+		expect(showBundleServing(status.networks, status.bundles)).toBe(true);
+		expect(showBundleServing(status.networks)).toBe(true);
 	});
 	test("activity detection ignores junk", () => {
 		expect(bundleHasActivity(undefined)).toBe(false);

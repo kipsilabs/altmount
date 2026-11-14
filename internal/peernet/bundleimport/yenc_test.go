@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/javi11/nntppool/v5"
 	"github.com/stretchr/testify/assert"
@@ -116,11 +117,35 @@ func mkTable(n int, main bool) sampleTable {
 	t := sampleTable{ids: make([]string, n), sizes: make([]int64, n), prefix: make([]int64, n), main: main}
 	for i := range t.sizes {
 		t.sizes[i] = 100
+		t.prefix[i] = int64(i) * 100
+		t.total += 100
 	}
 	return t
 }
 
-func TestPlanSamples_EveryTableGetsFirstLastAndAnInterior(t *testing.T) {
+// bigTable is a table of n articles of 768,000 bytes.
+func bigTable(n int, main bool) sampleTable {
+	t := mkTable(n, main)
+	t.total = 0
+	for i := range t.sizes {
+		t.sizes[i] = 768_000
+		t.prefix[i] = t.total
+		t.total += 768_000
+	}
+	return t
+}
+
+func planBytes(tables []sampleTable, plan []sample) (n int, bytes int64) {
+	for _, s := range plan {
+		bytes += tables[s.table].sizes[s.pos]
+	}
+	return len(plan), bytes
+}
+
+// Every table's LAST article is always read (a size lie anywhere in a table
+// shifts the offsets after it, so the last article shows it); the first and a
+// random interior one are read when the budget allows.
+func TestPlanSamples_EveryTableGetsItsLastArticle(t *testing.T) {
 	tables := make([]sampleTable, 50)
 	for i := range tables {
 		tables[i] = mkTable(10, false)
@@ -132,38 +157,83 @@ func TestPlanSamples_EveryTableGetsFirstLastAndAnInterior(t *testing.T) {
 		per[s.table] = append(per[s.table], s.pos)
 	}
 	require.Len(t, per, 50, "no table is left unsampled")
-	seen := map[int]struct{}{}
 	for _, ps := range per {
-		require.Len(t, ps, 3)
-		assert.Contains(t, ps, 0)
-		assert.Contains(t, ps, 9)
-		for _, p := range ps {
-			if p != 0 && p != 9 {
-				seen[p] = struct{}{}
-			}
-		}
+		assert.Contains(t, ps, 9, "the last article of every table")
+		assert.Contains(t, ps, 0, "a roomy budget also reads the first")
+		assert.Len(t, ps, 3, "and one interior article")
 	}
-	assert.Greater(t, len(seen), 3, "interior picks vary")
 }
 
 func TestPlanSamples_MediaTablesAreSampledDenserAndTheCapHolds(t *testing.T) {
 	plan, err := planSamples([]sampleTable{mkTable(5000, true)}, 600, 1<<30)
 	require.NoError(t, err)
 	assert.Len(t, plan, 2+10, "first, last and one interior per 500 segments")
-	plan, err = planSamples([]sampleTable{mkTable(5000, true), mkTable(10, false)}, 8, 1<<30)
+	// Scarce article budget: the main file's tables are still read in full at
+	// that rate; the rest of the release gets only what is left.
+	plan, err = planSamples([]sampleTable{mkTable(5000, true), mkTable(10, false), mkTable(10, false)}, 14, 1<<30)
 	require.NoError(t, err)
-	assert.LessOrEqual(t, len(plan), 8)
+	assert.LessOrEqual(t, len(plan), 14)
+	main := 0
+	for _, s := range plan {
+		if s.table == 0 {
+			main++
+		}
+	}
+	assert.Equal(t, 12, main)
 }
 
-func TestPlanSamples_RejectsWhenTheMinimumDoesNotFit(t *testing.T) {
-	tables := make([]sampleTable, 20)
+// A release with many small volumes is not rejected: the last article of each
+// is read, and the byte cap is raised to fit them (it only ever refuses beyond
+// the absolute ceiling).
+func TestPlanSamples_ManyVolumesAreThinnedNotRejected(t *testing.T) {
+	tables := make([]sampleTable, 300)
 	for i := range tables {
-		tables[i] = mkTable(10, false)
+		tables[i] = bigTable(20, false) // 15 MB volumes: a 4.6 GB release
 	}
-	_, err := planSamples(tables, 59, 1<<30)
+	plan, err := planSamples(tables, 2000, 1<<30)
+	require.NoError(t, err, "300 volumes must not be rejected")
+	n, bytes := planBytes(tables, plan)
+	assert.Equal(t, 300, n, "the last article of every volume, and nothing else fits")
+	assert.EqualValues(t, 300*768_000, bytes)
+	for _, s := range plan {
+		assert.Equal(t, 19, s.pos)
+	}
+}
+
+func TestPlanSamples_RejectsOnlyBeyondTheCeiling(t *testing.T) {
+	tables := make([]sampleTable, 1500) // 1500 last articles of 768 KB are 1.15 GB
+	for i := range tables {
+		tables[i] = bigTable(20, false)
+	}
+	_, err := planSamples(tables, 5000, 1<<30)
 	require.ErrorIs(t, err, errTooManyTables)
-	_, err = planSamples(tables, 600, 100) // bytes
+	_, err = planSamples(tables[:1000], 5000, 1<<30)
+	require.NoError(t, err)
+	_, err = planSamples(tables[:100], 50, 1<<30) // article ceiling
 	require.ErrorIs(t, err, errTooManyTables)
+}
+
+// When the budget covers the last articles but not everything, the tables that
+// also get their first and an interior article are chosen at random.
+func TestPlanSamples_OptionalSamplesGoToRandomTables(t *testing.T) {
+	tables := make([]sampleTable, 100)
+	for i := range tables {
+		tables[i] = bigTable(120, false) // 100 x 92 MB: a 9.2 GB release, 1% = 92 MB
+	}
+	chosen := map[int]int{}
+	for range 30 {
+		plan, err := planSamples(tables, 5000, 1<<30)
+		require.NoError(t, err)
+		n, bytes := planBytes(tables, plan)
+		assert.GreaterOrEqual(t, n, 100)
+		assert.LessOrEqual(t, bytes, int64(92_160_000), "within 1 percent of the release")
+		for _, s := range plan {
+			if s.pos == 0 {
+				chosen[s.table]++
+			}
+		}
+	}
+	assert.Greater(t, len(chosen), 60, "which tables get the optional articles is random, so every table is eventually covered")
 }
 
 // Two tables that start with the same article are two tables (they used to
@@ -178,40 +248,79 @@ func TestTablesOf_KeysByTheWholeTable(t *testing.T) {
 }
 
 // The cost of the accept-time header sampling for typical release shapes (768 KB
-// articles). Logged for the documentation; the bounds are asserted.
+// articles, 100 MB volumes). Logged for the documentation; the bounds are
+// asserted.
 func TestSamplingCostByReleaseShape(t *testing.T) {
-	pol := DefaultPolicy()
-	table := func(n int, main bool) sampleTable {
-		tb := mkTable(n, main)
-		for i := range tb.sizes {
-			tb.sizes[i] = 768_000
-		}
-		return tb
-	}
-	volumes := func(n int) []sampleTable {
+	volumes := func(n, articles int) []sampleTable {
 		out := make([]sampleTable, n)
 		for i := range out {
-			out[i] = table(140, false) // a 100 MB volume
+			out[i] = bigTable(articles, false)
 		}
 		return out
 	}
 	for name, tc := range map[string]struct {
-		tables  []sampleTable
-		wantMax int
+		tables   []sampleTable
+		maxBytes int64
 	}{
-		"1 file (1.1 GB mkv)": {[]sampleTable{table(1500, true)}, 5},
-		"50 volumes":          {volumes(50), 150},
-		"200 volumes":         {volumes(200), 600},
+		"1 file (1.1 GB mkv)":  {[]sampleTable{bigTable(1500, true)}, 8 << 20},
+		"50 volumes (100 MB)":  {volumes(50, 140), 70_000_000},
+		"200 volumes (100 MB)": {volumes(200, 140), 220_000_000},
+		"300 volumes (50 MB)":  {volumes(300, 70), 250 << 20},
+		"500 volumes (100 MB)": {volumes(500, 140), 540_000_000},
 	} {
-		plan, err := planSamples(tc.tables, pol.YencSamples(), pol.YencBytes())
+		plan, err := planSamples(tc.tables, 2000, 1<<30)
 		require.NoError(t, err, name)
-		var bytes int64
-		for _, s := range plan {
-			bytes += tc.tables[s.table].sizes[s.pos]
-		}
-		t.Logf("%s: %d articles, %.0f MB read", name, len(plan), float64(bytes)/1e6)
-		assert.LessOrEqual(t, len(plan), tc.wantMax, name)
+		n, bytes := planBytes(tc.tables, plan)
+		t.Logf("%s: %d articles, %.0f MB read", name, n, float64(bytes)/1e6)
+		assert.LessOrEqual(t, bytes, tc.maxBytes, name)
 	}
-	_, err := planSamples(volumes(201), pol.YencSamples(), pol.YencBytes())
-	require.ErrorIs(t, err, errTooManyTables, "201 volumes exceed the budget and are rejected, not skipped")
+}
+
+// slowHeaders answers instantly for the articles in fast and blocks the rest
+// until the sampling time is over.
+type slowHeaders struct {
+	SegmentHeaders
+	fast map[string]bool
+}
+
+func (s slowHeaders) SegmentHeader(ctx context.Context, id string) (YencHeader, error) {
+	if s.fast[id] {
+		return s.SegmentHeaders.SegmentHeader(ctx, id)
+	}
+	<-ctx.Done()
+	return YencHeader{}, ctx.Err()
+}
+
+// The sampling is capped by time, not rejected: optional samples that do not
+// answer in time are dropped, while every mandatory one still has to answer.
+func TestAccept_OptionalSamplesRunningOutOfTimeAreDropped(t *testing.T) {
+	e := newEnv(t)
+	b := e.mkBundle("slow", fileSpec{name: "main.mkv", plain: mkvPlain(512), segSize: 128}, fileSpec{name: "side.mkv", plain: mkvPlain(256), segSize: 64})
+	fast := map[string]bool{}
+	var sideLast string
+	for _, f := range b.Files {
+		last := b.Pool[f.Segments[len(f.Segments)-1].Ref]
+		if f.Name == "side.mkv" {
+			sideLast = last
+		}
+		if f.Name == "main.mkv" {
+			for _, s := range f.Segments {
+				fast[b.Pool[s.Ref]] = true // everything of the main file
+			}
+		}
+	}
+	fast[sideLast] = true // only the last article of the other file
+	e.imp.cfg.Headers = slowHeaders{SegmentHeaders: e.imp.cfg.Headers, fast: fast}
+	e.imp.cfg.Policy.YencTimeout = 200 * time.Millisecond
+	_, err := e.imp.Accept(context.Background(), e.req(b))
+	require.NoError(t, err, "%v", err)
+
+	delete(fast, sideLast) // now a mandatory sample does not answer
+	e2 := newEnv(t)
+	b2 := e2.mkBundle("slow2", fileSpec{name: "main.mkv", plain: mkvPlain(512), segSize: 128})
+	e2.imp.cfg.Headers = slowHeaders{SegmentHeaders: e2.imp.cfg.Headers, fast: map[string]bool{}}
+	e2.imp.cfg.Policy.YencTimeout = 100 * time.Millisecond
+	_, err = e2.imp.Accept(context.Background(), e2.req(b2))
+	require.Error(t, err)
+	assert.Equal(t, ReasonProbeInconclusive, ReasonOf(err))
 }

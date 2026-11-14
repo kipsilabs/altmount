@@ -85,11 +85,11 @@ func (i *Importer) VerifyPeerHeaders(ctx context.Context, filePath string) error
 			g -= len(tables[ti].ids)
 			ti++
 		}
-		s := sample{ti, g}
+		s := sample{table: ti, pos: g, must: true}
 		if _, dup := picked[s]; dup {
 			continue
 		}
-		if bytes+tables[ti].sizes[g] > i.cfg.Policy.YencBytes() {
+		if bytes+tables[ti].sizes[g] > fullCheckHeaderBytes {
 			break
 		}
 		picked[s] = struct{}{}

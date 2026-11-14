@@ -262,11 +262,12 @@ const (
 	ReasonStructureInvalid  Reason = "structure_invalid"  // media structure check failed beyond the first bytes
 	ReasonForbiddenFile     Reason = "forbidden_file"     // a file a media server or the OS could act on
 	ReasonSidecarTooLarge   Reason = "sidecar_too_large"  // a subtitle or nfo over its size cap
-	// ReasonLayoutNotAllowedOpen: the open network only carries plain layouts.
-	ReasonLayoutNotAllowedOpen Reason = "layout_not_allowed_open"
-	// ReasonContainerNotVerifiable: the open network only carries media whose
-	// container has a real structural check.
-	ReasonContainerNotVerifiable Reason = "container_not_verifiable"
+	// ReasonExtentMismatch: an archive extent contradicts the archive's own file
+	// header (attributable to the publisher).
+	ReasonExtentMismatch Reason = "extent_mismatch"
+	// ReasonExtentUnverifiable: a file's archive extents could not be bound to
+	// a header and its container has no structural check to stand in.
+	ReasonExtentUnverifiable Reason = "extent_unverifiable"
 	// ReasonTooManyTables: the layout has more segment tables than the yEnc
 	// sampling budget can cover at the minimum rate.
 	ReasonTooManyTables Reason = "too_many_tables"
@@ -310,10 +311,12 @@ type Policy struct {
 	// AcceptTimeout bounds the whole of Accept.
 	AcceptTimeout time.Duration
 	// MaxYencSamples caps the articles whose yEnc headers are read, MaxYencBytes
-	// the declared bytes those reads cost (the pool reads whole articles) and
-	// YencTimeout the time of the whole sampling. Every segment table gets its
-	// first, last and at least one random interior article; a layout whose
-	// tables do not fit the cap at that rate is rejected, never left unsampled.
+	// is the absolute ceiling of the declared bytes those reads (and the archive
+	// header reads) cost (the pool reads whole articles) and YencTimeout the
+	// time of the whole sampling. Every segment table gets its last article
+	// read; the byte cap is one percent of the release, at least 64 MiB and at
+	// most MaxYencBytes (raised to fit the last articles), and a layout whose
+	// last articles alone exceed the ceiling is rejected, never left unsampled.
 	MaxYencSamples int
 	MaxYencBytes   int64
 	YencTimeout    time.Duration
@@ -334,8 +337,8 @@ func DefaultPolicy() Policy {
 		MaxMediaProbes:    4,
 		MediaProbeTimeout: 30 * time.Second,
 		AcceptTimeout:     2 * time.Minute,
-		MaxYencSamples:    600,
-		MaxYencBytes:      512 << 20,
+		MaxYencSamples:    2000,
+		MaxYencBytes:      1 << 30,
 		YencTimeout:       90 * time.Second,
 		MaxMediaFiles:     40,
 		MaxSidecars:       50,
@@ -469,6 +472,10 @@ func (p Policy) YencBytes() int64 {
 	}
 	return p.MaxYencBytes
 }
+
+// fullCheckHeaderBytes caps the declared bytes of the forced full check's
+// header sample.
+const fullCheckHeaderBytes int64 = 512 << 20
 
 // YencTimeoutOrDefault is the time budget of the yEnc sampling.
 func (p Policy) YencTimeoutOrDefault() time.Duration {

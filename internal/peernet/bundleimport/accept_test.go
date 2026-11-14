@@ -557,21 +557,16 @@ func TestAccept_ResultCarriesFileSizesInPathOrder(t *testing.T) {
 	}
 }
 
-// Open network: only plain layouts are accepted (no outer sources, extents,
-// AES key or clips); a private network keeps accepting them.
-func TestAccept_OpenNetworkRejectsEncryptedLayout(t *testing.T) {
+// Every network accepts the same layouts: a keyed layout from the open network
+// is accepted when it passes the checks (here the media structure through the
+// key), exactly as from a private one.
+func TestAccept_OpenNetworkAcceptsKeyedLayout(t *testing.T) {
 	e := newEnv(t)
 	b := e.mkBundle("openaes", fileSpec{name: "movie.mkv", plain: mkvPlain(512), segSize: 128, key: testKey})
 	req := e.req(b)
 	req.Origin.Open = true
 	_, err := e.imp.Accept(context.Background(), req)
-	require.Error(t, err)
-	assert.Equal(t, ReasonLayoutNotAllowedOpen, ReasonOf(err), "%v", err)
-	e.assertNothingBehind()
-
-	req.Origin.Open = false
-	_, err = e.imp.Accept(context.Background(), req)
-	require.NoError(t, err, "a private network may still carry encrypted layouts")
+	require.NoError(t, err, "%v", err)
 }
 
 func TestAccept_OpenNetworkAcceptsPlainLayout(t *testing.T) {

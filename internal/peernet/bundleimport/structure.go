@@ -37,7 +37,10 @@ import (
 //	MPEG-TS / M2TS   the sync byte on the packet grid (188, 192 with the
 //	                 4-byte timestamp, or 204 bytes) at the start, quartiles and
 //	                 the last packet.
-//	anything else    full-length reads at the quartiles and the last bytes.
+//	anything else    full-length reads at the quartiles and the last bytes. A
+//	                 file whose archive extents could not be bound to an archive
+//	                 header (strong) is refused instead: readable windows prove
+//	                 nothing about bytes the layout may have misplaced.
 //
 // There is no deeper media parser in the repository (no MediaStructure probe),
 // so this is the strongest check available without adding one.
@@ -51,8 +54,9 @@ const (
 
 var errStructure = errors.New("media structure is not valid")
 
-// errNotVerifiable says the container has no structural check here: the open
-// network does not carry such media.
+// errNotVerifiable says a file whose archive extents could not be bound to a
+// header has a container with no structural check, so readable windows are not
+// enough.
 var errNotVerifiable = errors.New("container has no structural check")
 
 type readerAt struct {
@@ -102,7 +106,7 @@ func (r *readerAt) readRaw(off int64, n int) ([]byte, error) {
 }
 
 // verifyStructure runs the container check for the staged file name.
-func verifyStructure(ctx context.Context, op contentverify.Opener, name string, size int64, open bool) error {
+func verifyStructure(ctx context.Context, op contentverify.Opener, name string, size int64, strong bool) error {
 	ctx, cancel := context.WithTimeout(ctx, structReadTimeout)
 	defer cancel()
 	ctx = context.WithValue(ctx, utils.MaxPrefetchKey, 1)
@@ -125,7 +129,7 @@ func verifyStructure(ctx context.Context, op contentverify.Opener, name string, 
 	case tsStride(r) != 0:
 		return verifyTS(r, tsStride(r))
 	}
-	if open {
+	if strong {
 		return fmt.Errorf("%w: %s", errNotVerifiable, name)
 	}
 	return verifyWindows(r)
@@ -579,7 +583,7 @@ func parseSeek(b []byte) (id []byte, pos int64, err error) {
 func structureReason(err error) Reason {
 	switch {
 	case errors.Is(err, errNotVerifiable):
-		return ReasonContainerNotVerifiable
+		return ReasonExtentUnverifiable
 	case errors.Is(err, errStructure):
 		return ReasonStructureInvalid
 	case errors.Is(err, nntppool.ErrArticleNotFound):

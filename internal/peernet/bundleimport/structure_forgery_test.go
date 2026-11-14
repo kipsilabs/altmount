@@ -10,11 +10,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func structureOpen(t *testing.T, data []byte, name string, open bool) error {
+func structureOpen(t *testing.T, data []byte, name string) error {
 	t.Helper()
 	fs := afero.NewMemMapFs()
 	require.NoError(t, afero.WriteFile(fs, name, data, 0o644))
-	return verifyStructure(context.Background(), memOpener{fs}, name, int64(len(data)), open)
+	return verifyStructure(context.Background(), memOpener{fs}, name, int64(len(data)), false)
 }
 
 func box(typ string, payload []byte) []byte {
@@ -34,7 +34,7 @@ func TestForgery_FragmentedMP4WithGarbageMiddleAndFreeTail(t *testing.T) {
 	}
 	b = append(b, bytes.Repeat([]byte{0xAB}, 3<<20)...)
 	b = append(b, box("free", nil)...)
-	err := structureOpen(t, b, "a.mp4", false)
+	err := structureOpen(t, b, "a.mp4")
 	require.Error(t, err)
 	assert.ErrorIs(t, err, errStructure)
 }
@@ -57,15 +57,15 @@ func TestForgery_RealFragmentTailsStillPass(t *testing.T) {
 		"moof+mdat then mfra":  append(append([]byte{}, head...), mfra()...),
 		"mfra then free, skip": append(append(append([]byte{}, head...), mfra()...), append(mp4Box("free", 10), mp4Box("skip", 12)...)...),
 	} {
-		t.Run(name, func(t *testing.T) { assert.NoError(t, structureOpen(t, data, "a.mp4", false)) })
+		t.Run(name, func(t *testing.T) { assert.NoError(t, structureOpen(t, data, "a.mp4")) })
 	}
 	bad := append([]byte{}, head...)
 	bad = append(bad, box("mfra", box("mfro", []byte{0, 0, 0, 0, 0, 0, 0, 99}))...) // mfro lies about its mfra
-	assert.Error(t, structureOpen(t, bad, "a.mp4", false), "an mfro that does not describe its mfra")
+	assert.Error(t, structureOpen(t, bad, "a.mp4"), "an mfro that does not describe its mfra")
 	lone := append(append([]byte{}, head[:len(head)-len(mp4Box("mdat", 200))]...), mp4Box("mdat", 200)...)
 	_ = lone
 	notPair := append(append([]byte{}, head...), mp4Box("sidx", 40)...)
-	assert.Error(t, structureOpen(t, notPair, "a.mp4", false), "a tail that is neither a moof+mdat pair nor an mfra")
+	assert.Error(t, structureOpen(t, notPair, "a.mp4"), "a tail that is neither a moof+mdat pair nor an mfra")
 }
 
 func TestStructure_NonFragmentedMP4WithManyTopLevelBoxes(t *testing.T) {
@@ -75,7 +75,7 @@ func TestStructure_NonFragmentedMP4WithManyTopLevelBoxes(t *testing.T) {
 	}
 	data = append(data, mp4Box("moov", 200)...)
 	data = append(data, mp4Box("mdat", 600)...)
-	assert.NoError(t, structureOpen(t, data, "a.mp4", false), "a legitimate file with more than 63 boxes is not a 'too many reads' rejection")
+	assert.NoError(t, structureOpen(t, data, "a.mp4"), "a legitimate file with more than 63 boxes is not a 'too many reads' rejection")
 }
 
 // Reviewer forgery: a Matroska with valid head (SeekHead promising Cues at the
@@ -102,7 +102,7 @@ func forgedMKV(total int, fill func(b []byte)) []byte {
 }
 
 func TestForgery_MatroskaWithValidHeadAndTailButZeroMiddle(t *testing.T) {
-	err := structureOpen(t, forgedMKV(4<<20, nil), "a.mkv", false)
+	err := structureOpen(t, forgedMKV(4<<20, nil), "a.mkv")
 	require.Error(t, err)
 	assert.ErrorIs(t, err, errStructure)
 }
@@ -110,7 +110,7 @@ func TestForgery_MatroskaWithValidHeadAndTailButZeroMiddle(t *testing.T) {
 // The same shape with real SimpleBlock chains in the middle is a real file.
 func TestForgery_MatroskaWithRealClustersStillPasses(t *testing.T) {
 	data := forgedMKV(4<<20, func(b []byte) { fillSimpleBlocks(b, 200, 3000) })
-	assert.NoError(t, structureOpen(t, data, "a.mkv", false))
+	assert.NoError(t, structureOpen(t, data, "a.mkv"))
 }
 
 func TestForgery_TransportStreamWithLostSyncInTheMiddle(t *testing.T) {
@@ -124,27 +124,26 @@ func TestForgery_TransportStreamWithLostSyncInTheMiddle(t *testing.T) {
 	}
 	hit := 0
 	for range 40 {
-		if structureOpen(t, ts, "a.ts", false) != nil {
+		if structureOpen(t, ts, "a.ts") != nil {
 			hit++
 		}
 	}
 	assert.Greater(t, hit, 30, "random grid positions must find the broken band almost every time")
 }
 
-// The open network only carries containers with a real structural check.
-func TestOpenNetwork_GenericContainersAreNotVerifiable(t *testing.T) {
+// Every network accepts the same containers: a generic one (avi, mpg, ...)
+// gets the head signature and readable-windows check wherever it came from
+// (the structure check no longer depends on the network).
+func TestGenericContainersAreAcceptedEverywhere(t *testing.T) {
 	generic := make([]byte, 5000)
 	for i := range generic {
 		generic[i] = byte(i%251 + 1)
 	}
-	err := structureOpen(t, generic, "a.avi", true)
-	require.Error(t, err)
-	assert.Equal(t, ReasonContainerNotVerifiable, structureReason(err))
-	assert.NoError(t, structureOpen(t, generic, "a.avi", false), "private networks keep the readable-only check")
-	assert.NoError(t, structureOpen(t, mkvPlain(4096), "a.mkv", true), "Matroska is verified, so open accepts it")
-	assert.NoError(t, structureOpen(t, tsFile(188, 0, 60), "a.ts", true))
-	assert.Equal(t, ReasonContainerNotVerifiable, structureReason(structureOpen(t, append(make([]byte, 77), tsFile(188, 0, 60)...), "a.ts", true)),
-		"a capture that starts mid-packet is read as an unknown container")
+	assert.NoError(t, structureOpen(t, generic, "a.avi"), "readable windows are enough for a generic container")
+	assert.NoError(t, structureOpen(t, mkvPlain(4096), "a.mkv"))
+	assert.NoError(t, structureOpen(t, tsFile(188, 0, 60), "a.ts"))
+	assert.NoError(t, structureOpen(t, append(make([]byte, 77), tsFile(188, 0, 60)...), "a.ts"),
+		"a capture that starts mid-packet is read as a generic container")
 }
 
 // simpleBlocks returns exactly n bytes (n >= 7) of consecutive Matroska

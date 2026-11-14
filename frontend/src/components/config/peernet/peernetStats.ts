@@ -113,15 +113,12 @@ const IMPORT_REJECT_LABELS: ReadonlyMap<string, string> = new Map([
 	["size_implausible", "Declared file sizes do not fit your NZB"],
 	["yenc_mismatch", "Sampled articles contradict the bundle"],
 	["structure_invalid", "Media file structure is broken"],
+	["extent_mismatch", "An archive part contradicts the archive's own file header"],
 	[
-		"layout_not_allowed_open",
-		"Archive or encrypted layouts are not accepted from the open network",
+		"extent_unverifiable",
+		"Archive layout could not be checked and the media format cannot stand in",
 	],
-	[
-		"container_not_verifiable",
-		"Media container cannot be checked, so the open network does not carry it",
-	],
-	["too_many_tables", "More archive volumes than the verification budget covers"],
+	["too_many_tables", "Too many archive volumes for the verification limit"],
 ]);
 
 export function notShareableLabel(key: string): string {
