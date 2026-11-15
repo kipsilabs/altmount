@@ -574,6 +574,71 @@ func (proc *Processor) preParseFastFail(ctx context.Context, n *nzbparser.Nzb, c
 			return nil, nil, nil, multifile.ErrNoFilesProcessed
 		}
 
+		// import.fail_fast_on_missing_articles: when no damage is acceptable,
+		// a definitive miss in the media is the verdict. Mapping which files
+		// are broken first (phase 2, a per-file sweep at the full percentage)
+		// can take minutes on a taken-down release while the client that
+		// queued it (an addon waiting to stream) gives up; failing now lets it
+		// move on to its next release. Misses confined to sidecars re-check
+		// the rest once without them.
+		if cfg.GetImportFailFastOnMissingArticles() && acceptableMissingPercent == 0 {
+			if !probeMissesOnlySidecars(fastFailFiles, verdict.MissingIDs) {
+				if proc.log != nil {
+					proc.log.InfoContext(ctx, "Import segment check failed: release has missing articles",
+						"missing_sampled", len(verdict.MissingIDs),
+						"files", len(fastFailFiles),
+						"duration", time.Since(probeStart).Round(time.Millisecond))
+				}
+				return nil, nil, nil, multifile.ErrNoFilesProcessed
+			}
+			withoutSidecars := make([]validation.FastFailFile, len(fastFailFiles))
+			for i, ff := range fastFailFiles {
+				if isSidecarFile(ff.Filename) {
+					withoutSidecars[i] = validation.FastFailFile{Filename: ff.Filename}
+					continue
+				}
+				withoutSidecars[i] = ff
+			}
+			recheck, err := validation.FastFailReleaseProbeVerdict(
+				ctx, withoutSidecars, proc.poolManager, cfg.Import.SegmentSamplePercentage,
+				concurrency, proc.validationTimeout, proc.patchIndex, releaseDate,
+				cfg.GetImportSegmentCheckTimeout(),
+			)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			if recheck.Missing {
+				if proc.log != nil {
+					proc.log.InfoContext(ctx, "Import segment check failed: release has missing articles",
+						"missing_sampled", len(recheck.MissingIDs),
+						"files", len(fastFailFiles),
+						"duration", time.Since(probeStart).Round(time.Millisecond))
+				}
+				return nil, nil, nil, multifile.ErrNoFilesProcessed
+			}
+			// Media clean: drop only the sidecars that missed.
+			gone := make(map[string]struct{}, len(verdict.MissingIDs))
+			for _, id := range verdict.MissingIDs {
+				gone[id] = struct{}{}
+			}
+			results = validation.PlaceholderResults(fastFailFiles, proc.patchIndex)
+			for i, ff := range fastFailFiles {
+				if !isSidecarFile(ff.Filename) {
+					continue
+				}
+				for _, seg := range ff.Segments {
+					if seg == nil {
+						continue
+					}
+					if _, miss := gone[seg.Id]; miss {
+						results[i].Broken = true
+						results[i].MissingSegmentIDs = append(results[i].MissingSegmentIDs, seg.Id)
+					}
+				}
+			}
+			break
+		}
+
 		// Phase 2 (escalation): the probe found an unreachable segment, so map
 		// exactly which files are broken. This sweeps a per-file sample of every
 		// file but only runs for releases that are already known to have missing
