@@ -271,6 +271,28 @@ export function ImportConfigSection({
 							</div>
 						</div>
 
+						<fieldset className="fieldset min-w-0">
+							<legend className="fieldset-legend font-semibold">Check Time Limit (Seconds)</legend>
+							<input
+								type="number"
+								className="input input-bordered w-full min-w-0 max-w-full bg-base-100 font-mono text-sm"
+								value={formData.segment_check_timeout_seconds ?? 45}
+								readOnly={isReadOnly}
+								min={5}
+								max={300}
+								onChange={(e) =>
+									handleInputChange(
+										"segment_check_timeout_seconds",
+										Number.parseInt(e.target.value, 10) || 45,
+									)
+								}
+							/>
+							<p className="label text-[11px] text-base-content/50">
+								How long the check may run. If time runs out with nothing missing among at least 64
+								checked segments, the import passes on what was checked.
+							</p>
+						</fieldset>
+
 						<div className="divider my-1 text-base-content/70" />
 
 						<div className="grid min-w-0 grid-cols-1 gap-3 md:grid-cols-2">

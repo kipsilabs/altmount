@@ -336,6 +336,15 @@ func (c *Config) GetImportVerifyContentTimeout() time.Duration {
 	return time.Duration(*c.Import.VerifyContentTimeoutSeconds) * time.Second
 }
 
+// GetImportSegmentCheckTimeout returns how long the import availability check
+// may run. 0 (unset) leaves the choice to the validator, whose default is 45s.
+func (c *Config) GetImportSegmentCheckTimeout() time.Duration {
+	if c.Import.SegmentCheckTimeoutSeconds == nil || *c.Import.SegmentCheckTimeoutSeconds <= 0 {
+		return 0
+	}
+	return time.Duration(*c.Import.SegmentCheckTimeoutSeconds) * time.Second
+}
+
 // GetHealthVerifyContent returns whether health checks should probe media
 // files for a valid container signature.
 func (c *Config) GetHealthVerifyContent() bool {

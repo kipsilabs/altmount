@@ -20,7 +20,7 @@ func TestFastFailReleaseProbeVerdictJudgesDeadPostFromFirstWave(t *testing.T) {
 	}
 	client := newScriptedStatClient(outcomes)
 
-	v, err := FastFailReleaseProbeVerdict(context.Background(), probeFile(64), fastFailPoolManager{client: client}, 100, 64, 30*time.Second, nil, time.Time{})
+	v, err := FastFailReleaseProbeVerdict(context.Background(), probeFile(64), fastFailPoolManager{client: client}, 100, 64, 30*time.Second, nil, time.Time{}, 0)
 	if err != nil {
 		t.Fatalf("FastFailReleaseProbeVerdict error = %v", err)
 	}
@@ -42,7 +42,7 @@ func TestFastFailReleaseProbeVerdictJudgesDeadPostFromFirstWave(t *testing.T) {
 func TestFastFailReleaseProbeVerdictHealthyPostChecksWholeSample(t *testing.T) {
 	client := newScriptedStatClient(nil)
 
-	v, err := FastFailReleaseProbeVerdict(context.Background(), probeFile(64), fastFailPoolManager{client: client}, 100, 64, 30*time.Second, nil, time.Time{})
+	v, err := FastFailReleaseProbeVerdict(context.Background(), probeFile(64), fastFailPoolManager{client: client}, 100, 64, 30*time.Second, nil, time.Time{}, 0)
 	if err != nil || v.Missing || v.Dead {
 		t.Fatalf("verdict = %+v, err = %v, want healthy", v, err)
 	}
@@ -58,7 +58,7 @@ func TestFastFailReleaseProbeVerdictHealthyPostChecksWholeSample(t *testing.T) {
 func TestFastFailReleaseProbeVerdictPartialDamageIsNotDead(t *testing.T) {
 	client := newScriptedStatClient(map[string][]error{"seg-1": {nntppool.ErrArticleNotFound}})
 
-	v, err := FastFailReleaseProbeVerdict(context.Background(), probeFile(64), fastFailPoolManager{client: client}, 100, 64, 30*time.Second, nil, time.Time{})
+	v, err := FastFailReleaseProbeVerdict(context.Background(), probeFile(64), fastFailPoolManager{client: client}, 100, 64, 30*time.Second, nil, time.Time{}, 0)
 	if err != nil {
 		t.Fatalf("FastFailReleaseProbeVerdict error = %v", err)
 	}

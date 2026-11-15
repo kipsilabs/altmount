@@ -13,7 +13,6 @@ import (
 	metapb "github.com/kipsilabs/altmount/internal/metadata/proto"
 	"github.com/kipsilabs/altmount/internal/pool"
 	"github.com/kipsilabs/altmount/internal/testsupport/fakepool"
-	"github.com/kipsilabs/altmount/internal/usenet"
 )
 
 type fastFailPoolManager struct {
@@ -984,31 +983,6 @@ func TestFastFailCheckFilesPlaceholdersAreKnownMissesWithoutStat(t *testing.T) {
 	}
 	if got := client.PerMessageCalls(segs[1].Id); got != 0 {
 		t.Fatalf("placeholder STAT-ed %d times, want 0", got)
-	}
-}
-
-func TestCapReleaseProbeSampleKeepsEdgesAndBounds(t *testing.T) {
-	segs := makeTestSegments("big", 400)
-	selected := usenet.SelectSegmentsForValidation(segs, 100)
-	capped := capReleaseProbeSample(selected)
-	if len(capped) != maxReleaseProbeSamples {
-		t.Fatalf("capped sample = %d, want %d", len(capped), maxReleaseProbeSamples)
-	}
-	for i := 0; i < 5; i++ {
-		if capped[i] != selected[i] {
-			t.Fatalf("edge pick %d changed: %v vs %v", i, capped[i].Id, selected[i].Id)
-		}
-	}
-	seen := make(map[string]struct{})
-	for _, s := range capped {
-		if _, dup := seen[s.Id]; dup {
-			t.Fatalf("duplicate id %s in capped sample", s.Id)
-		}
-		seen[s.Id] = struct{}{}
-	}
-	small := makeTestSegments("small", 20)
-	if got := capReleaseProbeSample(small); len(got) != 20 {
-		t.Fatalf("small sample must pass through untouched, got %d", len(got))
 	}
 }
 

@@ -25,7 +25,7 @@ func TestFastFailReleaseProbeRetriesSlowProviderFallback(t *testing.T) {
 				}
 			}
 
-			verdict, err := FastFailReleaseProbeVerdict(context.Background(), probeFile(8), fastFailPoolManager{client: client}, 100, 8, 5*time.Second, nil, time.Time{})
+			verdict, err := FastFailReleaseProbeVerdict(context.Background(), probeFile(8), fastFailPoolManager{client: client}, 100, 8, 5*time.Second, nil, time.Time{}, 0)
 			if err != nil {
 				t.Fatalf("probe error = %v, want a conclusive provider answer", err)
 			}
@@ -40,11 +40,14 @@ func TestFastFailReleaseProbeBudgetCancelsInFlightAttempt(t *testing.T) {
 	prev := fastFailStatBudget
 	fastFailStatBudget = 150 * time.Millisecond
 	t.Cleanup(func() { fastFailStatBudget = prev })
+	prevProbe := releaseProbeBudget
+	releaseProbeBudget = 150 * time.Millisecond
+	t.Cleanup(func() { releaseProbeBudget = prevProbe })
 	client := newDelayedStatClient(nil, nil)
 	client.alwaysDelay = map[string]time.Duration{"seg-0": time.Second}
 
 	start := time.Now()
-	verdict, err := FastFailReleaseProbeVerdict(context.Background(), probeFile(1), fastFailPoolManager{client: client}, 100, 8, 30*time.Second, nil, time.Time{})
+	verdict, err := FastFailReleaseProbeVerdict(context.Background(), probeFile(1), fastFailPoolManager{client: client}, 100, 8, 30*time.Second, nil, time.Time{}, 0)
 	if !errors.Is(err, ErrFastFailInconclusive) || !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("probe error = %v, want an inconclusive deadline", err)
 	}
@@ -60,13 +63,16 @@ func TestFastFailReleaseProbeBudgetSpansBothWaves(t *testing.T) {
 	prev := fastFailStatBudget
 	fastFailStatBudget = 300 * time.Millisecond
 	t.Cleanup(func() { fastFailStatBudget = prev })
+	prevProbe := releaseProbeBudget
+	releaseProbeBudget = 300 * time.Millisecond
+	t.Cleanup(func() { releaseProbeBudget = prevProbe })
 	client := newDelayedStatClient(nil, nil)
 	client.alwaysDelay = make(map[string]time.Duration)
 	for i := range 9 {
 		client.alwaysDelay[fmt.Sprintf("seg-%d", i)] = 200 * time.Millisecond
 	}
 
-	_, err := FastFailReleaseProbeVerdict(context.Background(), probeFile(9), fastFailPoolManager{client: client}, 100, 8, 30*time.Second, nil, time.Time{})
+	_, err := FastFailReleaseProbeVerdict(context.Background(), probeFile(9), fastFailPoolManager{client: client}, 100, 8, 30*time.Second, nil, time.Time{}, 0)
 	if !errors.Is(err, ErrFastFailInconclusive) || !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("probe error = %v, want both waves bounded by one budget", err)
 	}
