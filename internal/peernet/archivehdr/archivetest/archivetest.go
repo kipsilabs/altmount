@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"hash/crc32"
+	"unicode/utf16"
 )
 
 // File is one entry of a built archive.
@@ -299,6 +300,18 @@ func SevenZip(o SevenZipOpts, files ...File) Built {
 	}
 	h.WriteByte(0x05) // FilesInfo
 	h.Write(z7num(uint64(len(files))))
+	var names bytes.Buffer
+	names.WriteByte(0) // not external
+	for _, f := range files {
+		for _, u := range utf16.Encode([]rune(f.Name)) {
+			names.WriteByte(byte(u))
+			names.WriteByte(byte(u >> 8))
+		}
+		names.Write([]byte{0, 0})
+	}
+	h.WriteByte(0x11) // Names
+	h.Write(z7num(uint64(names.Len())))
+	h.Write(names.Bytes())
 	h.WriteByte(0x00)
 	h.WriteByte(0x00)
 	end := h.Bytes()

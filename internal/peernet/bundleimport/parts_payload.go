@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"slices"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/kipsilabs/altmount/internal/peernet/bundle"
 	"github.com/kipsilabs/altmount/internal/utils"
@@ -15,34 +17,43 @@ import (
 
 // Part order from the payload.
 //
-// When the volume names do not parse (an obfuscated release) and the archive
-// format declares no volume number (RAR 4, split 7z), nothing in the archives
-// says which part follows which, so two swapped middle volumes are accepted by
-// every other check. A Matroska file does say where in the stream any piece of
-// it sits: its Clusters carry increasing timecodes. The first Cluster after
-// each part boundary is read through the staged reader of the assembled file;
-// the timecodes must not decrease along the parts in order. A swap of two
-// middle volumes puts a later cluster before an earlier one.
+// The order of the parts of a multi-part file is bound by, in turn: the RAR 5
+// volume numbers of the parts, the volume names the articles carry (when they
+// parse as one numbered set), and, for a Matroska file, the payload itself. A
+// multi-part file whose order none of these binds is DECLINED
+// (part_order_unverifiable): two swapped middle volumes would otherwise pass
+// every other check.
 //
-// Bounded: at most orderMaxBoundaries boundaries (the first and the last
-// always, the rest chosen with crypto/rand), each read as one window of
-// orderScanWindow bytes charged to the accept's budget; a boundary whose window
-// holds no cluster start (a cluster longer than the window) or that does not
-// fit the budget is skipped. The check needs two boundaries that were read.
+// A Matroska file says where in the stream any piece of it sits: its Clusters
+// carry increasing timecodes. The first Cluster that starts after EVERY part
+// boundary is read through the staged reader of the assembled file (the bytes
+// right after a boundary are in the part's first article, which the accept has
+// already fetched and keeps in its article cache, so most boundaries cost
+// nothing; the window grows only when no Cluster starts in it, up to
+// orderScanWindow), and the timecodes must not decrease along the parts in
+// order. A swap of two parts puts a later cluster before an earlier one. A
+// boundary with no Cluster in its window, a spent allowance or a container that
+// is not Matroska leaves the order unverified. The reads are charged as really
+// downloaded, against an allowance of orderArticlesPerBoundary articles per
+// boundary on top of the accept's budget (bounded by the node-wide ceiling).
+//
+// Not verifiable this way, and so declined when no volume number or name binds
+// the order: MP4 and MOV (the box chain does not change when the data inside
+// the media box is reordered), MPEG-TS and M2TS (a PCR or a continuity counter
+// wraps and is no safe order), AVI and every other container, and a Matroska
+// file whose clusters are longer than the window.
 //
 // Cluster timecodes are in units of one TimecodeScale per file, so comparing
 // them needs no scaling.
-//
-// Not verifiable this way (the order of their parts is bound only by names and
-// by RAR 5 volume numbers, when they exist): MP4 and MOV, MPEG-TS and M2TS (a
-// PCR or a continuity counter wraps and is no safe order), AVI and every other
-// container, a Matroska file with a single Cluster per part or clusters longer
-// than the window, and a file of fewer than three parts.
 const (
-	orderMaxBoundaries = 8
-	orderScanWindow    = 6 << 20
-	idCluster          = 0x1F43B675
-	idTimecode         = 0xE7
+	orderScanWindow = 6 << 20
+	// orderArticlesPerBoundary is the allowance, in articles of the part's first
+	// article size, of the window search of one boundary.
+	orderArticlesPerBoundary = 8
+	// orderWorkers is how many boundaries are read at once.
+	orderWorkers = 4
+	idCluster    = 0x1F43B675
+	idTimecode   = 0xE7
 )
 
 // clusterTimecodeAt returns the timecode of the first Cluster that starts in
@@ -81,26 +92,6 @@ func clusterTimecodeAt(win []byte) (uint64, bool) {
 	return 0, false
 }
 
-// pickBoundaries chooses up to max of the n-1 part boundaries (numbered 1..n-1):
-// the first and the last, then random ones, returned in order.
-func pickBoundaries(n, max int) []int {
-	if n < 2 {
-		return nil
-	}
-	all := make([]int, 0, n-1)
-	for k := 1; k < n; k++ {
-		all = append(all, k)
-	}
-	if len(all) <= max {
-		return all
-	}
-	rest := append([]int(nil), all[1:len(all)-1]...)
-	shuffle(rest)
-	picks := append([]int{all[0], all[len(all)-1]}, rest[:max-2]...)
-	slices.Sort(picks)
-	return picks
-}
-
 // timecodesNondecreasing reports whether the timecodes never decrease.
 func timecodesNondecreasing(tcs []uint64) (int, bool) {
 	for k := 1; k < len(tcs); k++ {
@@ -111,60 +102,130 @@ func timecodesNondecreasing(tcs []uint64) (int, bool) {
 	return 0, true
 }
 
+// boundaryWindows lists the window sizes tried at one boundary: the part's first
+// article, four times that, then the cap.
+func boundaryWindows(first, room int64) []int64 {
+	first = min(max(first, 64<<10), orderScanWindow)
+	var out []int64
+	for _, w := range []int64{first, 4 * first, orderScanWindow} {
+		w = min(w, room, orderScanWindow)
+		if w > 0 && (len(out) == 0 || w > out[len(out)-1]) {
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
 // verifyPayloadOrder binds the order of the parts of one staged media file to
-// its Matroska clusters. It returns ReasonPartOrder when two boundaries' first
-// clusters run backwards, and "" when the order is confirmed or cannot be judged.
-func (i *Importer) verifyPayloadOrder(ctx context.Context, st Staging, b *bundle.Bundle, name string, size int64, bud *costBudget) (Reason, error) {
+// its Matroska clusters. It is called for the files whose order no volume number
+// or name binds (required). It returns ReasonPartOrder when two boundaries'
+// first clusters run backwards, ReasonPartOrderUnverifiable when the order could
+// not be confirmed at every boundary, and "" when it is confirmed (or the file
+// has nothing to order).
+func (i *Importer) verifyPayloadOrder(ctx context.Context, st Staging, b *bundle.Bundle, name string, size int64, bud *costBudget, required bool) (Reason, error) {
 	var f *bundle.File
 	for k := range b.Files {
 		if b.Files[k].Name == name {
 			f = &b.Files[k]
 		}
 	}
-	parts := partsOfSliced(f)
-	if f == nil || len(parts) < 3 || bud == nil {
+	if f == nil || bud == nil || !required {
 		return "", nil
 	}
-	ctx, cancel := context.WithTimeout(ctx, structReadTimeout)
+	parts := partsOfSliced(f)
+	if len(parts) < 2 {
+		return "", nil
+	}
+	unverified := func(format string, a ...any) (Reason, error) {
+		return ReasonPartOrderUnverifiable, fmt.Errorf("%s: the order of its %d parts is bound by no volume number or name and %s", name, len(parts), fmt.Sprintf(format, a...))
+	}
+	ctx, cancel := context.WithTimeout(ctx, structReadTimeout+time.Duration(len(parts))*500*time.Millisecond)
 	defer cancel()
 	ctx = context.WithValue(ctx, utils.MaxPrefetchKey, 1)
 	ctx = context.WithValue(ctx, utils.SuppressStreamTrackingKey, true)
-	fh, err := st.Opener().OpenFile(ctx, name, os.O_RDONLY, 0)
-	if err != nil {
-		return "", nil
+	open := func() (io.ReaderAt, func(), error) {
+		fh, err := st.Opener().OpenFile(ctx, name, os.O_RDONLY, 0)
+		if err != nil {
+			return nil, nil, err
+		}
+		return fh, func() { _ = fh.Close() }, nil
 	}
-	defer func() { _ = fh.Close() }()
+	fh, closeFh, err := open()
+	if err != nil {
+		return unverified("the file could not be opened (%v)", err)
+	}
 	var magic [4]byte
-	if n, _ := fh.ReadAt(magic[:], 0); n < 4 || magic != [4]byte{0x1A, 0x45, 0xDF, 0xA3} {
-		return "", nil // not Matroska: no cheap property orders its parts
+	n, _ := fh.ReadAt(magic[:], 0)
+	closeFh()
+	if n < 4 || magic != [4]byte{0x1A, 0x45, 0xDF, 0xA3} {
+		return unverified("its container (not Matroska) has no check that orders the parts")
 	}
 	starts := make([]int64, len(parts))
 	for k := 1; k < len(parts); k++ {
 		starts[k] = starts[k-1] + bundle.Usable(parts[k-1])
 	}
-	var tcs []uint64
-	var from []int
-	for _, k := range pickBoundaries(len(parts), orderMaxBoundaries) {
-		n := int(min(orderScanWindow, size-starts[k]))
-		if n <= 0 || bud.chargeStaged(int64(n)) != nil {
-			continue
-		}
-		win := make([]byte, n)
-		got, err := fh.ReadAt(win, starts[k])
-		i.verifyDebit(int64(n))
-		if err != nil && !errors.Is(err, io.EOF) && got < n {
-			if ctx.Err() != nil {
-				return "", nil
+	var biggest int64
+	for _, ps := range parts[1:] {
+		biggest = max(biggest, ps[0].Size)
+	}
+	bud.grow(int64(len(parts)-1)*orderArticlesPerBoundary*max(biggest, 64<<10), i.cfg.Policy.YencBytes())
+	down := stagedDownloads(st)
+
+	type found struct {
+		tc uint64
+		ok bool
+	}
+	results := make([]found, len(parts))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, orderWorkers)
+	var spent atomic.Bool
+	for k := 1; k < len(parts); k++ {
+		sem <- struct{}{}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if spent.Load() || ctx.Err() != nil {
+				return
 			}
-			continue
+			h, closeH, err := open()
+			if err != nil {
+				return
+			}
+			defer closeH()
+			for _, w := range boundaryWindows(parts[k][0].Size, size-starts[k]) {
+				win := make([]byte, w)
+				got, err := h.ReadAt(win, starts[k])
+				if down != nil {
+					if oerr := bud.noteStaged(down()); oerr != nil {
+						spent.Store(true)
+						return
+					}
+				}
+				if err != nil && !errors.Is(err, io.EOF) && got < int(w) {
+					return
+				}
+				if tc, ok := clusterTimecodeAt(win[:got]); ok {
+					results[k] = found{tc: tc, ok: true}
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	if spent.Load() {
+		return unverified("the allowance for reading the part boundaries was used up")
+	}
+	tcs := make([]uint64, 0, len(parts)-1)
+	for k := 1; k < len(parts); k++ {
+		if !results[k].ok {
+			return unverified("no Matroska cluster could be read after the boundary before part %d", k+1)
 		}
-		if tc, ok := clusterTimecodeAt(win[:got]); ok {
-			tcs, from = append(tcs, tc), append(from, k)
-		}
+		tcs = append(tcs, results[k].tc)
 	}
 	if at, ok := timecodesNondecreasing(tcs); !ok {
 		return ReasonPartOrder, fmt.Errorf("%s: the first cluster after part %d starts at timecode %d, the one after part %d at %d: the parts are not in stream order",
-			name, from[at-1], tcs[at-1], from[at], tcs[at])
+			name, at, tcs[at-1], at+1, tcs[at])
 	}
 	return "", nil
 }

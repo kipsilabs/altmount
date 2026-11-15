@@ -108,6 +108,12 @@ func (i *Importer) VerifyPeerHeaders(ctx context.Context, filePath string) error
 		return nil
 	}
 	tables := tablesOfMeta(filePath, m, parts, known)
+	for k := range tables {
+		tables[k].fileID = row.FileID
+		if known && len(parts) > 0 {
+			tables[k].index = k
+		}
+	}
 	var total int
 	for _, t := range tables {
 		total += len(t.ids)
@@ -144,7 +150,7 @@ func (i *Importer) VerifyPeerHeaders(ctx context.Context, filePath string) error
 		switch v.reason {
 		case "":
 		case ReasonYencMismatch:
-			i.mismatched.Store(filePath, v.err.Error())
+			i.mismatched.Store(filePath, evidenceOf(v.err))
 			slog.WarnContext(ctx, "peer import: article header contradicts the layout", "file_path", filePath, "detail", v.err)
 			return &LayoutMismatchError{Detail: v.err.Error()}
 		default:
@@ -156,8 +162,9 @@ func (i *Importer) VerifyPeerHeaders(ctx context.Context, filePath string) error
 	return inconclusive
 }
 
-// takeMismatch returns the detail of the header contradiction a sample found in
-// the file (naming the article), and forgets it.
+// takeMismatch returns the evidence key of the header contradiction a sample
+// found in the file (the contradicting article's message-ID, as at accept), and
+// forgets it.
 func (i *Importer) takeMismatch(path string) (string, bool) {
 	v, ok := i.mismatched.LoadAndDelete(path)
 	detail, _ := v.(string)

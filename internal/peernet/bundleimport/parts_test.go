@@ -47,6 +47,8 @@ type setSpec struct {
 	// obfuscate gives every posted volume a random yEnc file name, as an
 	// obfuscated release does (no volume number can be read from a name).
 	obfuscate bool
+	// encodedHeader writes the 7z end header encoded (7z only).
+	encodedHeader bool
 }
 
 type builtSet struct {
@@ -90,7 +92,7 @@ func (e *env) mkStoredSet(sp setSpec) builtSet {
 	var extraLo, extraHi int
 	switch sp.kind {
 	case "7z":
-		a := archivetest.SevenZip(archivetest.SevenZipOpts{}, archivetest.File{Name: "movie.mkv", Data: sp.payload})
+		a := archivetest.SevenZip(archivetest.SevenZipOpts{EncodedHeader: sp.encodedHeader}, archivetest.File{Name: "movie.mkv", Data: sp.payload})
 		at := 0
 		for _, n := range sp.cuts {
 			s.posted = append(s.posted, a.Data[at:at+n])
@@ -380,8 +382,9 @@ func TestParts_FastPathChecksEntriesNamesAndSizes(t *testing.T) {
 
 // (d) A split 7z archive continues across volumes with no header of its own: the
 // middle volumes are whole posted files, the first and last are slices whose
-// header (at the end of the last volume) cannot be read, so the file is
-// accepted on its media structure alone.
+// header (at the end of the last volume) is read through the NZB list when the
+// layout has one, so the set is bound; without it the file is accepted on its
+// media structure and its container's size equation.
 func TestParts_SplitSevenZipIsAcceptedOnItsStructure(t *testing.T) {
 	for _, scheme := range []bundle.Scheme{bundle.SchemeNZB, bundle.SchemeFiles} {
 		t.Run(scheme.String(), func(t *testing.T) {
@@ -393,7 +396,11 @@ func TestParts_SplitSevenZipIsAcceptedOnItsStructure(t *testing.T) {
 			res, err := e.imp.Accept(context.Background(), e.openReq(s.b))
 			require.NoError(t, err, "%v", err)
 			assert.Equal(t, payload, e.stagedBytes(res.Paths[0]))
-			assert.Positive(t, res.Cost.PartsUnbound, "the 7z end header is not in the volume that holds the slice")
+			if scheme == bundle.SchemeNZB {
+				assert.Zero(t, res.Cost.PartsUnbound, "the NZB list reaches the end header: every part is bound through the 7z headers")
+			} else {
+				assert.Positive(t, res.Cost.PartsUnbound, "a layout without the NZB list does not carry the articles of the end header")
+			}
 		})
 	}
 }

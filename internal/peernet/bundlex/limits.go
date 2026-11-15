@@ -89,6 +89,9 @@ type FetchLimits struct {
 	// BackoffBase and BackoffMax: hostile publishers are skipped for a time that
 	// doubles per strike. SoftBackoff is the skip after an ordinary failure.
 	BackoffBase, BackoffMax, SoftBackoff time.Duration
+	// BusyRetryDelay is the wait before the one retry of a "busy" answer and
+	// BusyBackoff the short skip of a bundle whose publisher stayed busy.
+	BusyRetryDelay, BusyBackoff time.Duration
 	// FullCheckBackoffBase, FullCheckBackoffMax and FullCheckDecay shape the mild
 	// penalty of a publisher whose verified bundle failed the local full check.
 	FullCheckBackoffBase, FullCheckBackoffMax, FullCheckDecay time.Duration
@@ -104,6 +107,7 @@ func DefaultFetchLimits() FetchLimits {
 		MaxAttempts: 3, GlobalPerHour: 60, GlobalBurst: 10, PerPublisherPerHour: 60, PerPublisherBurst: 10,
 		MaxConcurrent: 2, Timeout: 60 * time.Second,
 		BackoffBase: 10 * time.Minute, BackoffMax: 2 * time.Hour, SoftBackoff: 5 * time.Minute,
+		BusyRetryDelay: 1500 * time.Millisecond, BusyBackoff: 20 * time.Second,
 		FullCheckBackoffBase: 30 * time.Minute, FullCheckBackoffMax: 6 * time.Hour, FullCheckDecay: 24 * time.Hour,
 		MaxTracked: 2048, MaxOffers: 32,
 	}
@@ -133,6 +137,8 @@ func (l FetchLimits) withDefaults() FetchLimits {
 	dur(&l.BackoffBase, d.BackoffBase)
 	dur(&l.BackoffMax, d.BackoffMax)
 	dur(&l.SoftBackoff, d.SoftBackoff)
+	dur(&l.BusyRetryDelay, d.BusyRetryDelay)
+	dur(&l.BusyBackoff, d.BusyBackoff)
 	dur(&l.FullCheckBackoffBase, d.FullCheckBackoffBase)
 	dur(&l.FullCheckBackoffMax, d.FullCheckBackoffMax)
 	dur(&l.FullCheckDecay, d.FullCheckDecay)

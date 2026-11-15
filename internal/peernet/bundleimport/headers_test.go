@@ -140,3 +140,17 @@ func TestNegativeCache_AcceptTimeContradictionAndFullCheckMismatchAreReported(t 
 	e3.imp.FullCheckFailed(context.Background(), res3.Paths[0])
 	assert.Empty(t, e3.rep.failedBundles)
 }
+
+// One evidence key everywhere: the contradicting article's message-ID, so the
+// same corrupt article seen at accept and again in the forced check counts once.
+func TestVerifyPeerHeaders_EvidenceIsTheArticleMessageID(t *testing.T) {
+	e := newEnv(t)
+	b, res := e.accept("vh-ev", mkvSpec("a.mkv"))
+	beh := e.fp.BehaviorFor(b.Pool[2])
+	beh.YEnc.PartBegin += 9
+	e.fp.SetBehavior(b.Pool[2], beh)
+	require.Error(t, e.imp.VerifyPeerHeaders(context.Background(), res.Paths[0]))
+	key, ok := e.imp.takeMismatch(res.Paths[0])
+	require.True(t, ok)
+	assert.Equal(t, b.Pool[2], key, "the evidence of a header contradiction is the article, never the error text")
+}

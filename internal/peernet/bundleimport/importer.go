@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"golang.org/x/sync/singleflight"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -53,13 +54,26 @@ func (c Config) Missing() []string {
 			out = append(out, name)
 		}
 	}
-	add(c.Library == nil, "Library")
-	add(c.Stager == nil, "Stager")
-	add(c.Prober == nil, "Prober")
-	add(c.State == nil, "State")
-	add(c.Headers == nil, "Headers")
+	add(isNil(c.Library), "Library")
+	add(isNil(c.Stager), "Stager")
+	add(isNil(c.Prober), "Prober")
+	add(isNil(c.State), "State")
+	add(isNil(c.Headers), "Headers")
 	add(c.HealthEnabled == nil, "HealthEnabled")
 	return out
+}
+
+// isNil reports an interface that is nil or holds a nil pointer, map, slice,
+// function or channel (a typed nil panics at first use just like a nil one).
+func isNil(v any) bool {
+	if v == nil {
+		return true
+	}
+	switch rv := reflect.ValueOf(v); rv.Kind() {
+	case reflect.Pointer, reflect.Map, reflect.Slice, reflect.Func, reflect.Chan, reflect.Interface:
+		return rv.IsNil()
+	}
+	return false
 }
 
 // Importer accepts bundles. It is safe for concurrent use.
@@ -75,6 +89,8 @@ type Importer struct {
 	mismatched sync.Map
 	// strikes counts the distinct contradicting articles per Bundle ID.
 	strikes strikeBook
+	// declines backs off a Bundle ID after a deterministic local decline.
+	declines declineBook
 
 	// writeMu: a write holds it shared from its first state row to its commit;
 	// Reconcile takes it exclusively, so it can never roll back a live write.

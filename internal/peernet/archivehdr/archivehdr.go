@@ -142,6 +142,10 @@ type Volume struct {
 	Blocks []Block
 	// Reads is the number of reads made.
 	Reads int
+	// EndHeaderEnd is, for a 7z archive whose plain end header was read, the
+	// offset just past that header: a complete archive ends there, so a caller
+	// that knows the archive's real length can tell a dropped tail.
+	EndHeaderEnd int64
 	// Done says the walk reached the end of the archive or got past the offset
 	// asked for without error: a block that is not in Blocks does not exist.
 	Done bool

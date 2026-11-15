@@ -381,3 +381,12 @@ func TestSamplingCostOfMultiVolumeSets(t *testing.T) {
 		assert.LessOrEqual(t, len(must), tc.wantArticlesMax)
 	}
 }
+
+func TestReadableName(t *testing.T) {
+	assert.True(t, readableName("Release.part01.rar"))
+	assert.True(t, readableName("a8.mkv"))
+	assert.False(t, readableName("3f9a1c7e5b2d4a6c8e0f1a2b"), "random, no extension")
+	assert.False(t, readableName("3f9a1c7e5b2d4a6c8e0f1a2b.rar"), "random stem")
+	assert.False(t, readableName(""))
+	assert.False(t, readableName("name."))
+}

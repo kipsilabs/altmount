@@ -28,34 +28,35 @@ import (
 // can contradict the bundle under it. A reason that is not listed here fails
 // TestReasonAttributionCoversEveryReason, so adding one forces a decision.
 var reasonAttribution = map[Reason]bool{
-	ReasonInvalid:            false, // decided from the bundle alone, before any article
-	ReasonTooLarge:           false,
-	ReasonTooManyFiles:       false,
-	ReasonBadName:            false,
-	ReasonBadTarget:          false,
-	ReasonCollision:          false,
-	ReasonHealthDisabled:     false,
-	ReasonProbeMissing:       false, // missing articles
-	ReasonProbeInconclusive:  false,
-	ReasonNoMediaFile:        false,
-	ReasonMediaInvalid:       false, // a receiver-side media decode, no declared number contradicted
-	ReasonMediaMissing:       false,
-	ReasonMediaInconclusive:  false,
-	ReasonStaging:            false,
-	ReasonWriteFailed:        false,
-	ReasonNZBMismatch:        false, // the bundle against the user's NZB, not article bytes
-	ReasonUnavailable:        false,
-	ReasonNoNetwork:          false,
-	ReasonSizeImplausible:    false,
-	ReasonYencMismatch:       true,  // yEnc header against declared size, offset, total or name
-	ReasonStructureInvalid:   false, // receiver-side media structure check
-	ReasonForbiddenFile:      false,
-	ReasonSidecarTooLarge:    false,
-	ReasonExtentMismatch:     true, // archive header against declared extent or part
-	ReasonExtentUnverifiable: false,
-	ReasonPartOrder:          false, // names are poster-chosen
-	ReasonTooManyTables:      false,
-	ReasonVerifyBudget:       false, // local budget, the bundle was not read
+	ReasonInvalid:               false, // decided from the bundle alone, before any article
+	ReasonTooLarge:              false,
+	ReasonTooManyFiles:          false,
+	ReasonBadName:               false,
+	ReasonBadTarget:             false,
+	ReasonCollision:             false,
+	ReasonHealthDisabled:        false,
+	ReasonProbeMissing:          false, // missing articles
+	ReasonProbeInconclusive:     false,
+	ReasonNoMediaFile:           false,
+	ReasonMediaInvalid:          false, // a receiver-side media decode, no declared number contradicted
+	ReasonMediaMissing:          false,
+	ReasonMediaInconclusive:     false,
+	ReasonStaging:               false,
+	ReasonWriteFailed:           false,
+	ReasonNZBMismatch:           false, // the bundle against the user's NZB, not article bytes
+	ReasonUnavailable:           false,
+	ReasonNoNetwork:             false,
+	ReasonSizeImplausible:       false,
+	ReasonYencMismatch:          true,  // yEnc header against declared size, offset, total or name
+	ReasonStructureInvalid:      false, // receiver-side media structure check
+	ReasonForbiddenFile:         false,
+	ReasonSidecarTooLarge:       false,
+	ReasonExtentMismatch:        true, // archive header against declared extent or part
+	ReasonExtentUnverifiable:    false,
+	ReasonPartOrder:             false, // names are poster-chosen
+	ReasonPartOrderUnverifiable: false, // nothing bound the order: a local limitation
+	ReasonTooManyTables:         false,
+	ReasonVerifyBudget:          false, // local budget, the bundle was not read
 }
 
 // rejection is a typed rejection as the attribution rule sees it.

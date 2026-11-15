@@ -274,6 +274,10 @@ const (
 	// the volumes their names (or numbers) say. Names are poster-chosen, so this
 	// is a local judgement and never blames the publisher.
 	ReasonPartOrder Reason = "part_order"
+	// ReasonPartOrderUnverifiable: the order of the parts of a multi-part file is
+	// bound by nothing (no volume numbers, no parseable names, no complete
+	// payload order check). A local limitation, never the publisher's fault.
+	ReasonPartOrderUnverifiable Reason = "part_order_unverifiable"
 	// ReasonTooManyTables: the layout has more segment tables than the yEnc
 	// sampling budget can cover at the minimum rate.
 	ReasonTooManyTables Reason = "too_many_tables"
@@ -413,6 +417,10 @@ type Request struct {
 	// article of a table must carry the same yEnc name as its NZB entry, which
 	// binds the table to that entry.
 	ExpectedNZBNames []string
+	// Progress, when set, is called each time the verification has read an article
+	// (from any goroutine). The importer's fast path uses it to let a verification
+	// that is making progress run past its base deadline.
+	Progress func()
 	// Automatic marks an attempt the importer makes on its own (the fast path,
 	// which falls back to a normal import when declined). It draws on a smaller
 	// share of the node-wide verification budget than an explicit request.

@@ -335,7 +335,7 @@ func TestChargedReader_BoundsTheArticlesOfOneVolumeAndChargesTheBudget(t *testin
 		_, err = cr.ReadAt(buf, int64(k*1000+500)) // the same article again is free
 		require.NoError(t, err)
 	}
-	assert.EqualValues(t, maxVolumeArticles*1000, bud.spent())
+	assert.EqualValues(t, maxVolumeArticles*1000, bud.used, "the declared sizes are reserved")
 	_, err := cr.ReadAt(buf, 90_000)
 	require.ErrorIs(t, err, errCost, "one volume may not walk more than %d articles", maxVolumeArticles)
 
@@ -438,4 +438,32 @@ func TestExtents_CostForManyVolumes(t *testing.T) {
 			})
 		}
 	}
+}
+
+// The meter shows what was really read: the declared charges of a staged read
+// are a reservation, settled to the staging area's own download count (a read
+// served from the accept's cache downloaded nothing).
+func TestChargedReader_SettlesTheReservationToTheBytesReallyDownloaded(t *testing.T) {
+	o := &bundle.OuterSource{}
+	for i := 0; i < 10; i++ {
+		o.Segments = append(o.Segments, bundle.Segment{Ref: int64(i), Size: 1000, Start: 0, End: 999})
+	}
+	bud := newCostBudget(1 << 30)
+	cr := newChargedReader(bytesReaderAt(make([]byte, 10_000)), o, bud)
+	var downloaded int64
+	cr.downloaded = func() int64 { return downloaded }
+	buf := make([]byte, 10)
+	for k := 0; k < 4; k++ {
+		_, err := cr.ReadAt(buf, int64(k*1000))
+		require.NoError(t, err)
+	}
+	downloaded = 1500 // three of the four articles came from the cache
+	_, err := cr.ReadAt(buf, 0)
+	require.NoError(t, err)
+	assert.EqualValues(t, 4000, bud.used, "reserved")
+	assert.EqualValues(t, 1500, bud.spent(), "settled to the bytes really downloaded")
+	downloaded = 6000 // more than declared: the excess is charged as before
+	_, err = cr.ReadAt(buf, 0)
+	require.NoError(t, err)
+	assert.EqualValues(t, 6000, bud.spent())
 }

@@ -97,3 +97,31 @@ func TestPathObserver_UserDeleteThroughTheLibraryEndsTheStateRow(t *testing.T) {
 		return !ok
 	}, 2*time.Second, 20*time.Millisecond, "the row of a deleted file must not outlive it")
 }
+
+// The user deletes an imported release and imports the same release again under
+// another category before the rename grace has passed: the delete must not
+// leave its row behind, and the fresh import's row (and hold) must stand.
+func TestPathObserver_ReimportWithinGraceUnderAnotherCategoryDropsTheStaleRow(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	b := e.mkBundle("rg", mkvSpec("a.mkv"))
+	res, err := e.imp.Accept(ctx, e.req(b))
+	require.NoError(t, err)
+	obs := e.imp.PathObserver()
+	e.lib.SetSecondaryFileObserver(obs)
+	oldPath := res.Paths[0]
+	require.NoError(t, e.lib.DeleteFileMetadata(ctx, oldPath))
+
+	req := e.req(b)
+	req.Target = Target{Dir: "tv/Test.Release", Category: "tv", QueueID: 12}
+	res2, err := e.imp.Accept(ctx, req)
+	require.NoError(t, err)
+
+	obs.Flush()
+	_, ok, _ := e.repo.Get(ctx, oldPath)
+	assert.False(t, ok, "the deleted file's row must not outlive it")
+	row, ok, _ := e.repo.Get(ctx, res2.Paths[0])
+	require.True(t, ok, "the fresh import keeps its row")
+	assert.Equal(t, "pending", row.State, "a delete must not lift the fresh import's hold")
+	assert.Equal(t, 1, e.stateRows())
+}

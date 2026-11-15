@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/kipsilabs/altmount/internal/importer"
@@ -46,14 +47,44 @@ func AcceptWindow(volumes int) time.Duration {
 	return min(DefaultFastPathAcceptTimeout+time.Duration(max(volumes, 0))*FastPathPerPartAllowance, MaxFastPathAcceptTimeout)
 }
 
-// volumesOf counts the archive volumes a layout reads through.
-func volumesOf(b *bundle.Bundle) int {
-	n := 0
-	for i := range b.Files {
-		n += len(b.Files[i].Parts) + len(b.Files[i].Outer)
-	}
-	return n
+const (
+	// DefaultFastPathExtraDelayCap is the most the fast path adds to an import
+	// (fetch and verification together) unless verification is making progress.
+	DefaultFastPathExtraDelayCap = 45 * time.Second
+	// DefaultFastPathProgressAllowance is how long past the last verified article
+	// a progressing verification may go on, up to the hard window.
+	DefaultFastPathProgressAllowance = 15 * time.Second
+)
+
+// progressTimer is the deadline of one verification: it is cut at the cap, each
+// sign of progress moves it to the allowance after the latest progress, and it
+// never passes the hard end.
+type progressTimer struct {
+	mu        sync.Mutex
+	timer     *time.Timer
+	cancel    context.CancelFunc
+	hard      time.Time
+	allowance time.Duration
 }
+
+func newProgressTimer(cancel context.CancelFunc, first, hardWindow, allowance time.Duration) *progressTimer {
+	p := &progressTimer{cancel: cancel, hard: time.Now().Add(hardWindow), allowance: allowance}
+	p.timer = time.AfterFunc(min(first, hardWindow), cancel)
+	return p
+}
+
+func (p *progressTimer) progress() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+	if !now.Before(p.hard) {
+		return
+	}
+	// Reset can only lengthen the wait here: a timer that already fired stays fired.
+	p.timer.Reset(min(p.allowance, p.hard.Sub(now)))
+}
+
+func (p *progressTimer) stop() { p.timer.Stop() }
 
 // minOpenCorroborators is how many distinct network ranges must announce the
 // same Bundle ID before an open-network layout may replace archive analysis.
@@ -90,6 +121,15 @@ type FastPathConfig struct {
 	AcceptTimeout time.Duration
 	// FetchTimeout bounds the fetch (zero: DefaultFastPathFetchTimeout).
 	FetchTimeout time.Duration
+	// ExtraDelayCap is the most the fast path adds to an import unless the
+	// verification is making progress (zero: DefaultFastPathExtraDelayCap).
+	ExtraDelayCap time.Duration
+	// ProgressAllowance is how long past the latest verified article a
+	// progressing verification may go on (zero: DefaultFastPathProgressAllowance).
+	ProgressAllowance time.Duration
+	// HardWindow is the hard ceiling of the verification, whatever its progress
+	// (zero: AcceptWindow of the user's own NZB entries).
+	HardWindow time.Duration
 }
 
 type fastPath struct{ cfg FastPathConfig }
@@ -102,6 +142,12 @@ func NewPeerBundleFastPath(cfg FastPathConfig) importer.PeerBundleFastPath {
 	}
 	if cfg.FetchTimeout <= 0 {
 		cfg.FetchTimeout = DefaultFastPathFetchTimeout
+	}
+	if cfg.ExtraDelayCap <= 0 {
+		cfg.ExtraDelayCap = DefaultFastPathExtraDelayCap
+	}
+	if cfg.ProgressAllowance <= 0 {
+		cfg.ProgressAllowance = DefaultFastPathProgressAllowance
 	}
 	return &fastPath{cfg: cfg}
 }
@@ -154,6 +200,7 @@ func (f *fastPath) TryBundle(ctx context.Context, req importer.PeerBundleRequest
 	if err != nil {
 		return importer.PeerBundleOutcome{}, false
 	}
+	started := time.Now()
 	fetchCtx, cancel := context.WithTimeout(ctx, f.cfg.FetchTimeout)
 	// The caller's requirements go to the fetcher, which filters the offers
 	// before dialing anyone: with the switch off an open-network offer is never
@@ -173,17 +220,32 @@ func (f *fastPath) TryBundle(ctx context.Context, req importer.PeerBundleRequest
 	if origin.Open && (f.cfg.OpenFastPath == nil || !f.cfg.OpenFastPath() || origin.Corroborators < minOpenCorroborators) {
 		return importer.PeerBundleOutcome{}, false
 	}
-	window := f.cfg.AcceptTimeout
-	if window <= 0 {
-		window = AcceptWindow(volumesOf(b))
+	// The window follows the user's own NZB, never what the peer declares: a
+	// peer must not be able to stretch how long the user's import is held. Unless
+	// the verification is making progress it is cut so that fetch and
+	// verification together add at most ExtraDelayCap.
+	hard := f.cfg.HardWindow
+	if hard <= 0 {
+		hard = AcceptWindow(len(req.NZB.GetFiles()))
 	}
-	acceptCtx, cancelAccept := context.WithTimeout(ctx, window)
+	acceptCtx, cancelAccept := context.WithCancel(ctx)
 	defer cancelAccept()
-	res, err := f.cfg.Acceptor.Accept(acceptCtx, bundleimport.Request{
+	areq := bundleimport.Request{
 		Bundle: b, Origin: origin, ExpectedNZB: canonicalIDs(req.NZB), ExpectedNZBSizes: encodedSizes(req.NZB), ExpectedNZBNames: subjectNames(req.NZB), Automatic: true,
 		Target: bundleimport.Target{Dir: req.TargetDir, Category: req.Category, QueueID: int64(req.QueueID),
 			TargetPath: req.TargetPath, SkipArr: req.SkipArr},
-	})
+	}
+	if f.cfg.AcceptTimeout > 0 {
+		// A fixed window set by the caller: no progress extension.
+		var stop context.CancelFunc
+		acceptCtx, stop = context.WithTimeout(ctx, f.cfg.AcceptTimeout)
+		defer stop()
+	} else {
+		pt := newProgressTimer(cancelAccept, max(f.cfg.ExtraDelayCap-time.Since(started), f.cfg.ExtraDelayCap/2), hard, f.cfg.ProgressAllowance)
+		defer pt.stop()
+		areq.Progress = pt.progress
+	}
+	res, err := f.cfg.Acceptor.Accept(acceptCtx, areq)
 	if err != nil {
 		slog.InfoContext(ctx, "Peer bundle not used; importing normally", "reason", string(bundleimport.ReasonOf(err)))
 		return importer.PeerBundleOutcome{}, false

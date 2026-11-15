@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"slices"
 	"strings"
 	"sync"
@@ -72,6 +73,11 @@ type poolHeaders struct{ p pool.Manager }
 func NewPoolHeaderReader(p pool.Manager) SegmentHeaders { return poolHeaders{p: p} }
 
 func (h poolHeaders) SegmentHeader(ctx context.Context, id string) (YencHeader, error) {
+	ac := articleCacheFrom(ctx)
+	if a, ok := ac.get(id); ok {
+		return YencHeader{Name: a.head.YEnc.FileName, PartBegin: a.head.YEnc.PartBegin, PartSize: a.head.YEnc.PartSize, FileSize: a.head.YEnc.FileSize,
+			Prefix: a.body[:min(len(a.body), headerPrefixCap)], Bytes: 0}, nil
+	}
 	cli, err := h.p.GetPool()
 	if err != nil {
 		return YencHeader{}, err
@@ -85,9 +91,13 @@ func (h poolHeaders) SegmentHeader(ctx context.Context, id string) (YencHeader, 
 	}
 	defer release()
 	w := &prefixWriter{}
-	body, err := cli.Fetch(ctx, nntppool.Req{MessageID: id, Writer: w})
+	cw := &captureWriter{over: ac == nil}
+	body, err := cli.Fetch(ctx, nntppool.Req{MessageID: id, Writer: io.MultiWriter(w, cw)})
 	if err != nil {
 		return YencHeader{}, err
+	}
+	if ac != nil && !cw.over && int64(len(cw.buf)) == w.n {
+		ac.put(id, *body, cw.buf)
 	}
 	return YencHeader{Name: body.YEnc.FileName, PartBegin: body.YEnc.PartBegin, PartSize: body.YEnc.PartSize, FileSize: body.YEnc.FileSize, Prefix: w.buf, Bytes: w.n}, nil
 }
@@ -116,6 +126,9 @@ type sampleTable struct {
 	mainPart bool
 	// file and index place a part table in its bundle file.
 	file, index int
+	// fileID is the File ID of the file a part table belongs to (the canonical
+	// evidence of a disagreement among the part's articles is fileID:index).
+	fileID string
 	// need0 makes the first article a mandatory sample (the header binding of
 	// the part needs where it begins).
 	need0 bool
@@ -181,6 +194,7 @@ func tablesOf(b *bundle.Bundle, names []string) []sampleTable {
 		for k, ps := range partsOfSliced(f) {
 			add(fmt.Sprintf("%s (part %d of %d)", f.Name, k+1, len(f.Parts)), ps, false, func(t *sampleTable) {
 				t.part, t.file, t.index, t.mainPart = true, i, k, i == mainFile
+				t.fileID = f.FileID.String()
 				t.rel = !ents.wholeYenc(ps)
 			})
 		}
@@ -408,6 +422,20 @@ func SubjectFilename(subject string) string {
 	return strings.TrimSpace(subject[i+1 : j])
 }
 
+// readableName says a file name looks like one a person or a release tool
+// chose: it has an extension and a stem that is not one unbroken run of letters
+// and digits of 16 or more (the shape of a random obfuscation name). The subject
+// and the yEnc name of an obfuscated post are two unrelated random strings, so
+// comparing them says nothing and an honest bundle must not be refused for it.
+func readableName(n string) bool {
+	dot := strings.LastIndexByte(n, '.')
+	if dot <= 0 || dot == len(n)-1 || len(n)-dot > 8 {
+		return false
+	}
+	stem := n[:dot]
+	return len(stem) < 16 || strings.ContainsAny(stem, " ._-[]()")
+}
+
 // verifyYenc reads the yEnc headers of sampled articles and requires each to
 // agree with the layout: decoded part size equals the declared size, the part
 // begins at the cumulative offset the layout implies, and the file total equals
@@ -425,8 +453,13 @@ func SubjectFilename(subject string) string {
 // an archive header.
 func (i *Importer) verifyYenc(ctx context.Context, b *bundle.Bundle, names []string, stage stageFunc) (rep extentReport, reason Reason, attributable bool, err error) {
 	rep.unbound = map[int]string{}
+	rep.sizeEquation = map[int]bool{}
+	rep.orderRequired = map[int]string{}
 	if i.cfg.Headers == nil {
 		return rep, ReasonProbeInconclusive, false, errors.New("no way to read article headers")
+	}
+	if articleCacheFrom(ctx) == nil {
+		ctx = withArticleCache(ctx, newArticleCache(articleCacheBytes))
 	}
 	tables := tablesOf(b, names)
 	picks := pickExtents(b)
@@ -440,12 +473,21 @@ func (i *Importer) verifyYenc(ctx context.Context, b *bundle.Bundle, names []str
 			errTooManyTables, len(tables), len(must), mustBytes, reserve, limit, ceiling)
 	}
 	bud := newCostBudget(max(yencCap(releaseBytes(tables), ceiling), mustBytes+reserve))
+	bud.onProgress = progressFrom(ctx)
 	defer func() { rep.articles, rep.bytes, rep.bud = bud.articles(), bud.spent(), bud }()
 	lease, lerr := i.cfg.Verify.Begin(verifyClassOf(ctx), bud.limit)
 	if lerr != nil {
 		return rep, ReasonVerifyBudget, false, lerr
 	}
-	defer func() { lease.End(bud.spent()) }()
+	defer func() {
+		if err != nil {
+			lease.End(bud.spent())
+			return
+		}
+		// The lease stays open through the media probe, which reads through the
+		// same staging area; the accept ends it.
+		rep.lease = lease
+	}()
 	ctx, cancel := context.WithTimeout(ctx, i.cfg.Policy.YencTimeoutOrDefault())
 	defer cancel()
 	rel := newRelState()
@@ -544,7 +586,7 @@ func (st *relState) judgeOne(t *sampleTable, s sample, v *sampleVerdict) {
 	}
 	if bad {
 		*v = sampleVerdict{reason: ReasonYencMismatch, attributable: true, err: evidenceError{fmt.Errorf("%s: article %d begins at %d of %d, which does not fit the other articles of the part (%d bytes in the layout)",
-			t.name, s.pos, h.PartBegin, h.FileSize, t.total), fmt.Sprintf("part:%x", t.key[:8])}}
+			t.name, s.pos, h.PartBegin, h.FileSize, t.total), partEvidence(t.fileID, t.index, t.key)}}
 		return
 	}
 	st.base[s.table], st.total[s.table] = base, h.FileSize
@@ -613,13 +655,28 @@ type evidenceError struct {
 
 func (e evidenceError) Unwrap() error { return e.error }
 
-// evidenceOf returns the evidence key of err, falling back to its text.
+// evidenceOf returns the evidence key of err. The key is canonical and never
+// free text (text can carry numbers parsed from article bytes, so one corrupt
+// article could read as two contradictions): a contradicting article's
+// message-ID, or fileID:part-index when no single article is at fault. An error
+// that names no evidence counts as one anonymous piece, so it can never reach
+// the blacklist threshold alone.
 func evidenceOf(err error) string {
 	var ee evidenceError
 	if errors.As(err, &ee) {
 		return ee.id
 	}
-	return err.Error()
+	return "unkeyed"
+}
+
+// partEvidence is the evidence key of a disagreement among the articles of one
+// part (or of a part against its archive header): the file and the part. A
+// table with no file identity falls back to its table key.
+func partEvidence(fileID string, index int, key bundle.TableKey) string {
+	if fileID == "" {
+		return fmt.Sprintf("table:%x", key[:8])
+	}
+	return fmt.Sprintf("%s:%d", fileID, index)
 }
 
 // readSample reads one article's header and judges it against its table.
@@ -627,7 +684,13 @@ func (i *Importer) readSample(ctx context.Context, t sampleTable, s sample, bud 
 	h, err := i.cfg.Headers.SegmentHeader(ctx, t.ids[s.pos])
 	if err == nil {
 		if cerr := bud.chargeActual(h.Bytes); cerr != nil {
-			return sampleVerdict{reason: ReasonYencMismatch, attributable: true, err: evidenceError{fmt.Errorf("%s: article %d delivered %d bytes, the layout declares %d, and the reads so far used up the verification budget", t.name, s.pos, h.Bytes, t.sizes[s.pos]), t.ids[s.pos]}}
+			// Only an article that itself delivers more than the layout declares
+			// contradicts it. A budget that other reads had spent already is this
+			// node's own accounting.
+			if h.Bytes > t.sizes[s.pos] {
+				return sampleVerdict{reason: ReasonYencMismatch, attributable: true, err: evidenceError{fmt.Errorf("%s: article %d delivered %d bytes, the layout declares %d, and the reads so far used up the verification budget", t.name, s.pos, h.Bytes, t.sizes[s.pos]), t.ids[s.pos]}}
+			}
+			return sampleVerdict{reason: ReasonVerifyBudget, err: fmt.Errorf("%s: article %d: the verification budget is spent", t.name, s.pos)}
 		}
 	}
 	switch {
@@ -643,7 +706,7 @@ func (i *Importer) readSample(ctx context.Context, t sampleTable, s sample, bud 
 	case !t.rel && (h.PartSize != t.sizes[s.pos] || h.PartBegin != t.prefix[s.pos] || h.FileSize != t.total):
 		return sampleVerdict{reason: ReasonYencMismatch, attributable: true, err: evidenceError{fmt.Errorf("%s: article %d says part %d at %d of %d, layout says %d at %d of %d",
 			t.name, s.pos, h.PartSize, h.PartBegin, h.FileSize, t.sizes[s.pos], t.prefix[s.pos], t.total), t.ids[s.pos]}}
-	case s.pos == 0 && t.nzbName != "" && h.Name != "" && !strings.EqualFold(h.Name, t.nzbName):
+	case s.pos == 0 && t.nzbName != "" && h.Name != "" && readableName(t.nzbName) && readableName(h.Name) && !strings.EqualFold(h.Name, t.nzbName):
 		return sampleVerdict{reason: ReasonYencMismatch, err: fmt.Errorf("%s: first article is named %q, your NZB names this entry %q", t.name, h.Name, t.nzbName)}
 	}
 	return sampleVerdict{hdr: h, ok: true}

@@ -164,6 +164,7 @@ func scan7z(d *reader, v *Volume, lim Limits) error {
 	if err != nil {
 		return err
 	}
+	v.EndHeaderEnd = pos + int64(size)
 	v.Blocks = blocks
 	v.Done = true
 	return nil

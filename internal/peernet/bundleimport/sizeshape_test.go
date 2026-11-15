@@ -22,9 +22,29 @@ func TestSizeShape_UniformArticlesAndASmallerLastOneAreHonest(t *testing.T) {
 	for _, sizes := range [][]int64{{100}, {100, 100, 100}, {100, 100, 37}, {100, 100, 100, 100}} {
 		assert.NoError(t, runShape(segsOfSizes(sizes...)), "%v", sizes)
 	}
-	for _, sizes := range [][]int64{{100, 120}, {100, 90, 100}, {100, 100, 101}, {1, 750_000, 750_000}} {
+	for _, sizes := range [][]int64{{100, 120}, {100, 100, 101}, {1, 750_000, 750_000}, {100, 90, 80, 100}} {
 		assert.Error(t, runShape(segsOfSizes(sizes...)), "%v", sizes)
 	}
+}
+
+// A post with a stray smaller article (a resumed upload) is still honest: up to
+// one percent of the articles, and never a larger one.
+func TestSizeShape_AFewStraySmallerArticlesAreTolerated(t *testing.T) {
+	sizes := make([]int64, 300)
+	for i := range sizes {
+		sizes[i] = 750_000
+	}
+	sizes[120], sizes[200] = 700_000, 749_000 // 2 of 299: under one percent
+	assert.NoError(t, runShape(segsOfSizes(sizes...)))
+	assert.Error(t, runShape(segsOfSizes(100, 90, 100, 100, 37)), "a short table has no tolerance")
+	sizes[10], sizes[11] = 1, 2 // 4 of 299: over one percent
+	assert.Error(t, runShape(segsOfSizes(sizes...)))
+	sizes = make([]int64, 300)
+	for i := range sizes {
+		sizes[i] = 750_000
+	}
+	sizes[50] = 750_001
+	assert.Error(t, runShape(segsOfSizes(sizes...)), "a larger article is never tolerated")
 }
 
 func runShape(segs []bundle.Segment) error {

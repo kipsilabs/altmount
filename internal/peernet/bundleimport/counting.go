@@ -17,7 +17,12 @@ import (
 type countingManager struct {
 	pool.Manager
 	n atomic.Int64
+	// cache, when set, serves articles this accept already fetched and keeps
+	// the ones it fetches; what it serves is not counted.
+	cache atomic.Pointer[articleCache]
 }
+
+func (m *countingManager) setCache(c *articleCache) { m.cache.Store(c) }
 
 func newCountingManager(m pool.Manager) *countingManager { return &countingManager{Manager: m} }
 
@@ -29,12 +34,13 @@ func (m *countingManager) GetPool() (pool.NntpClient, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &countingClient{NntpClient: c, n: &m.n}, nil
+	return &countingClient{NntpClient: c, n: &m.n, m: m}, nil
 }
 
 type countingClient struct {
 	pool.NntpClient
 	n *atomic.Int64
+	m *countingManager
 }
 
 type countWriter struct {
@@ -59,27 +65,55 @@ func (c *countingClient) wrap(r nntppool.Req) (nntppool.Req, bool) {
 }
 
 func (c *countingClient) Fetch(ctx context.Context, r nntppool.Req) (*nntppool.ArticleBody, error) {
+	ac := c.m.cache.Load()
+	if a, ok := ac.get(r.MessageID); ok {
+		return serveCached(a, r)
+	}
+	streamedTo := r.Writer
+	var cw *captureWriter
+	if ac != nil {
+		cw = &captureWriter{}
+		if streamedTo != nil {
+			r.Writer = io.MultiWriter(streamedTo, cw)
+		}
+	}
 	r, streamed := c.wrap(r)
 	body, err := c.NntpClient.Fetch(ctx, r)
 	if !streamed && body != nil {
 		c.n.Add(int64(len(body.Bytes)))
 	}
+	if err == nil && body != nil && ac != nil {
+		switch {
+		case !streamed:
+			ac.put(r.MessageID, *body, append([]byte(nil), body.Bytes...))
+		case !cw.over && len(cw.buf) > 0:
+			ac.put(r.MessageID, *body, cw.buf)
+		}
+	}
 	return body, err
 }
 
-func (c *countingClient) FetchAsync(ctx context.Context, r nntppool.Req) <-chan nntppool.BodyResult {
-	r, streamed := c.wrap(r)
-	in := c.NntpClient.FetchAsync(ctx, r)
-	if streamed {
-		return in
+// serveCached answers a request from a cached article.
+func serveCached(a cachedArticle, r nntppool.Req) (*nntppool.ArticleBody, error) {
+	if r.OnMeta != nil {
+		r.OnMeta(a.head.YEnc)
 	}
+	out := a.head
+	if r.Writer != nil {
+		if _, err := r.Writer.Write(a.body); err != nil {
+			return nil, err
+		}
+		return &out, nil
+	}
+	out.Bytes = append([]byte(nil), a.body...)
+	return &out, nil
+}
+
+func (c *countingClient) FetchAsync(ctx context.Context, r nntppool.Req) <-chan nntppool.BodyResult {
 	out := make(chan nntppool.BodyResult, 1)
 	go func() {
-		res := <-in
-		if res.Body != nil {
-			c.n.Add(int64(len(res.Body.Bytes)))
-		}
-		out <- res
+		b, err := c.Fetch(ctx, r)
+		out <- nntppool.BodyResult{Body: b, Err: err}
 	}()
 	return out
 }

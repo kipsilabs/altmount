@@ -626,3 +626,68 @@ func TestDefaultFetchLimitsSuitBrowsing(t *testing.T) {
 		t.Fatalf("per publisher: burst %d, %d/hour", d.PerPublisherBurst, d.PerPublisherPerHour)
 	}
 }
+
+// A publisher that answers "busy" once (a cold cache building) is asked again
+// in the same fetch and the fetch succeeds, with no back-off at all.
+func TestFetchRetriesABusyAnswerOnce(t *testing.T) {
+	e := newFetchEnv(t, FetchLimits{BusyRetryDelay: 10 * time.Millisecond})
+	var mu sync.Mutex
+	calls := 0
+	addr, id := hostile(t, func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		calls++
+		n := calls
+		mu.Unlock()
+		if n == 1 {
+			http.Error(w, "busy", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Length", itoa(len(e.built.Wire)))
+		_, _ = w.Write(e.built.Wire)
+	})
+	e.publisher(addr, id, time.Hour)
+	if _, _, err := e.f.Fetch(context.Background(), e.rel); err != nil {
+		t.Fatalf("a busy answer must be retried once: %v", err)
+	}
+	if st := e.f.Status(); st.BackedOff != 0 || len(st.Failed) != 0 {
+		t.Fatalf("a busy answer that cleared is no failure: %+v", st)
+	}
+}
+
+// A publisher that stays busy is skipped for a short while only (not the
+// five-minute soft back-off), is not struck, and the caller is told to retry.
+func TestFetchBusyPublisherIsSkippedBrieflyNotForMinutes(t *testing.T) {
+	e := newFetchEnv(t, FetchLimits{BusyRetryDelay: 5 * time.Millisecond})
+	busy := true
+	var mu sync.Mutex
+	addr, id := hostile(t, func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		if busy {
+			http.Error(w, "busy", http.StatusTooManyRequests)
+			return
+		}
+		w.Header().Set("Content-Length", itoa(len(e.built.Wire)))
+		_, _ = w.Write(e.built.Wire)
+	})
+	e.publisher(addr, id, time.Hour)
+	now := time.Now()
+	e.f.cfg.Now = func() time.Time { return now }
+	_, _, err := e.f.Fetch(context.Background(), e.rel)
+	if !errors.Is(err, ErrPublisherBusy) || !errors.Is(err, ErrRateLimited) {
+		t.Fatalf("want ErrPublisherBusy (a rate-limit kind of error), got %v", err)
+	}
+	if st := e.f.Status(); st.BackedOff != 0 {
+		t.Fatalf("a busy publisher must not be struck: %+v", st)
+	}
+	mu.Lock()
+	busy = false
+	mu.Unlock()
+	now = now.Add(e.f.lim.BusyBackoff + time.Second)
+	if e.f.lim.BusyBackoff >= time.Minute {
+		t.Fatalf("busy back-off %v is not short", e.f.lim.BusyBackoff)
+	}
+	if _, _, err := e.f.Fetch(context.Background(), e.rel); err != nil {
+		t.Fatalf("after the short skip the publisher is asked again: %v", err)
+	}
+}

@@ -59,7 +59,16 @@ func (i *Importer) rejected(r Reason, err error) (*Result, error) {
 // media probe through the layout in a hidden staging area, and only then the
 // local write in pending state. Any rejection leaves nothing behind.
 func (i *Importer) Accept(ctx context.Context, req Request) (*Result, error) {
+	if r, blocked := i.declines.blocked(req.Origin.BundleID, i.cfg.Now()); blocked {
+		// Declined by this node a moment ago for a reason that repeats: no
+		// article is read again for the same answer.
+		res, err := i.rejected(r, errors.New("declined by this node a moment ago; not verified again for a while"))
+		return res, err
+	}
 	res, err := i.accept(ctx, req)
+	if err != nil && declinesBackOff(ReasonOf(err)) {
+		i.declines.note(req.Origin.BundleID, ReasonOf(err), i.cfg.Now())
+	}
 	if err != nil && localPolicyReason(ReasonOf(err)) && req.Origin.PublisherID != "" {
 		if rf, ok := i.cfg.Reporter.(FetchRefunder); ok {
 			rf.RefundFetch(ctx, req.Origin)
@@ -146,7 +155,9 @@ func (i *Importer) accept(ctx context.Context, req Request) (*Result, error) {
 		}
 		return i.rejected(ReasonProbeInconclusive, err)
 	}
-	stage, closeStage := i.stager()
+	ac := newArticleCache(articleCacheBytes)
+	ctx = withProgress(withArticleCache(ctx, ac), req.Progress)
+	stage, closeStage := i.stagerWith(ac)
 	defer closeStage()
 	vclass := VerifyExplicit
 	if req.Automatic {
@@ -168,8 +179,13 @@ func (i *Importer) accept(ctx context.Context, req Request) (*Result, error) {
 	}
 	res.Cost = Cost{Articles: rep.articles, Bytes: rep.bytes, ExtentsBound: rep.bound, ExtentsUnbound: rep.checked - rep.bound,
 		PartsBound: rep.partsBound, PartsUnbound: rep.partsUnbound}
-	if r, err := i.probeMedia(ctx, b, loc, stage, needsStructure(rep, b), rep.bud); err != nil {
-		return i.rejected(r, err)
+	// One lease from the first read to the last: the media probe reads through
+	// the same staging area and is part of what the node-wide budget meters.
+	defer func() { rep.lease.End(rep.bud.spent()) }()
+	probeReason, probeErr := i.probeMedia(ctx, b, loc, stage, rep)
+	res.Cost.Bytes = rep.bud.spent()
+	if probeErr != nil {
+		return i.rejected(probeReason, probeErr)
 	}
 
 	unlock := i.lockTarget(dir)
@@ -328,7 +344,11 @@ type stageFunc func() (Staging, Reason, error)
 
 // stager returns the lazily created staging area of one accept and the function
 // that removes it (a no-op when it was never created).
-func (i *Importer) stager() (stageFunc, func()) {
+func (i *Importer) stager() (stageFunc, func()) { return i.stagerWith(nil) }
+
+// stagerWith is stager with the accept's article cache shared by the staged
+// reads.
+func (i *Importer) stagerWith(ac *articleCache) (stageFunc, func()) {
 	var st Staging
 	get := func() (Staging, Reason, error) {
 		if st != nil {
@@ -340,6 +360,9 @@ func (i *Importer) stager() (stageFunc, func()) {
 		s, err := i.cfg.Stager.NewStaging()
 		if err != nil {
 			return nil, ReasonStaging, err
+		}
+		if a, ok := s.(articleCacheAware); ok && ac != nil {
+			a.SetArticleCache(ac)
 		}
 		st = s
 		return st, "", nil
@@ -355,7 +378,16 @@ func (i *Importer) stager() (stageFunc, func()) {
 // stack, in a hidden staging area that is removed on every outcome. strong
 // names the files whose archive extents could not be bound to an archive
 // header: their container must have a real structural check.
-func (i *Importer) probeMedia(ctx context.Context, b *bundle.Bundle, loc *bundle.Local, stage stageFunc, strong map[string]string, bud *costBudget) (Reason, error) {
+func (i *Importer) probeMedia(ctx context.Context, b *bundle.Bundle, loc *bundle.Local, stage stageFunc, rep extentReport) (Reason, error) {
+	bud := rep.bud
+	strong := needsStructure(rep, b)
+	sizeEq, orderRequired := map[string]bool{}, map[string]bool{}
+	for fi := range rep.sizeEquation {
+		sizeEq[b.Files[fi].Name] = true
+	}
+	for fi := range rep.orderRequired {
+		orderRequired[b.Files[fi].Name] = true
+	}
 	var media []bundle.LocalFile
 	for _, lf := range loc.Files {
 		if fileinfo.IsVerifiableMediaFile(lf.Name) {
@@ -369,6 +401,11 @@ func (i *Importer) probeMedia(ctx context.Context, b *bundle.Bundle, loc *bundle
 	if err != nil {
 		return r, err
 	}
+	defer func() {
+		if d := stagedDownloads(st); d != nil {
+			_ = bud.noteStaged(d())
+		}
+	}()
 	for _, lf := range media {
 		if err := st.WriteFileMetadata(lf.Name, lf.Meta); err != nil {
 			return ReasonStaging, err
@@ -384,13 +421,25 @@ func (i *Importer) probeMedia(ctx context.Context, b *bundle.Bundle, loc *bundle
 			return ReasonMediaInconclusive, fmt.Errorf("%s: %w", lf.Name, res.Err)
 		}
 		why, unbound := strong[lf.Name]
-		if err := verifyStructure(ctx, st.Opener(), lf.Name, lf.Meta.FileSize, unbound); err != nil {
+		mode := structLoose
+		switch {
+		case sizeEq[lf.Name]:
+			mode = structSizeEquation
+		case unbound:
+			mode = structStrong
+		}
+		var over func() bool
+		if d := stagedDownloads(st); d != nil {
+			from := d()
+			over = func() bool { return d()-from > structMaxBytesPerFile }
+		}
+		if err := verifyStructureMode(ctx, st.Opener(), lf.Name, lf.Meta.FileSize, mode, over); err != nil {
 			if unbound && errors.Is(err, errNotVerifiable) {
 				err = fmt.Errorf("%w (its archive extents could not be checked: %s)", err, why)
 			}
 			return structureReason(err), fmt.Errorf("%s: %w", lf.Name, err)
 		}
-		if r, err := i.verifyPayloadOrder(ctx, st, b, lf.Name, lf.Meta.FileSize, bud); err != nil {
+		if r, err := i.verifyPayloadOrder(ctx, st, b, lf.Name, lf.Meta.FileSize, bud, orderRequired[lf.Name]); err != nil {
 			return r, err
 		}
 	}

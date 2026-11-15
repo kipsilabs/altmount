@@ -89,6 +89,7 @@ const FETCH_FAILED_LABELS: ReadonlyMap<string, string> = new Map([
 	["verification_failed", "Bundle did not match its signed record"],
 	["scheme_mismatch", "Bundle format did not match"],
 	["membership", "Peer not a verified member"],
+	["busy", "Peer was busy building the bundle (asked again shortly)"],
 ]);
 
 const IMPORT_REJECT_LABELS: ReadonlyMap<string, string> = new Map([
@@ -121,6 +122,10 @@ const IMPORT_REJECT_LABELS: ReadonlyMap<string, string> = new Map([
 		"Archive layout could not be checked and the media format cannot stand in",
 	],
 	["part_order", "Archive volumes are not in the order their names give"],
+	[
+		"part_order_unverifiable",
+		"The order of the file's parts could not be confirmed (nothing in the release says it)",
+	],
 	["too_many_tables", "Too many archive volumes for the verification limit"],
 	[
 		"verify_budget",

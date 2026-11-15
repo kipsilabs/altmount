@@ -496,38 +496,95 @@ something different, that bullet is marked "(superseded - see Current rules)".
   multi-part file is bound to the archive's own file header (data start, packed
   size, unpacked size, continuation flags, stored name equal to the bundle's file
   name, IV of a keyed first part). A slice that cannot be bound is refused
-  (`extent_unverifiable`); the only exception is the parts of a split 7z set
-  (end header elsewhere or encoded), accepted on media structure alone. Keyed 7z
-  folders are recognised. An old-format release with a second stored file deep in
-  a volume is declined by receivers. A bundle with more parts than the budget
-  covers is refused as a whole (`too_many_tables`).
-- **Part order.** It must follow the volume numbering parsed from the articles'
-  yEnc names (`part_order`) and RAR 5 volume numbers. With names that do not parse
-  and no volume number in the format (RAR 4, split 7z), a Matroska file of at
-  least three parts is bound by its clusters: the first Cluster timecode after
-  each part boundary (at most 8 boundaries, first and last always, the rest by
-  `crypto/rand`, one 6 MiB window each, charged to the accept budget) must not
-  decrease. Order-unverifiable with obfuscated names: MP4/MOV, MPEG-TS/M2TS, AVI
-  and other containers, Matroska with clusters longer than the window, files of
-  fewer than three parts.
+  (`extent_unverifiable`). Keyed 7z folders are recognised. An old-format release
+  with a second stored file deep in a volume is declined by receivers. A bundle
+  with more parts than the budget covers is refused as a whole
+  (`too_many_tables`).
+- **Split 7z sets** (one 7z archive cut raw into `.7z.001`, `.002` ...). Every
+  part begins at the first byte of its posted file (the first part may begin
+  after the 32-byte start header); every part but the last is a whole posted file
+  (all the articles of its NZB entry, full ranges, yEnc total equal to the part);
+  only the last may stop before the end header. With a plain end header the
+  archive is read through the concatenation of the posted volumes (the articles of
+  the last entry after the last listed one, at most 4, are added and sized by
+  their yEnc headers): the stored stream must start where the first part starts,
+  be as long as all parts together, and the end header must close the
+  concatenation (a dropped tail is `extent_mismatch` when the header contradicts
+  the layout, `extent_unverifiable` otherwise). All parts are then bound. With an
+  encoded end header (or a layout without the NZB list, which does not carry the
+  articles of the end header) nothing binds the stream: the file is accepted only
+  when its container has a size equation of its own (Matroska with a Segment of
+  known size, MP4) on top of the structure check; MPEG-TS, unknown-size Matroska
+  and generic containers are refused (`extent_unverifiable`).
+- **Part order must be bound or the file is declined.** The order of the parts of
+  a multi-part file (archive slices and whole posted files alike) is bound by, in
+  turn: the RAR 5 volume numbers of all its parts; the volume names the articles
+  carry when they parse as one numbered set running consecutively in the order of
+  the parts (`part_order` when two or more parts share a set and the numbers
+  clash, a part is outside the set, or a number is missing; names that each form
+  a set of their own, as random names do, are silent, not a clash); or, for a
+  Matroska file, the payload at EVERY part boundary: the first Cluster timecode
+  after each boundary (first article of the part, already fetched and cached;
+  the window grows to 6 MiB only when no Cluster starts in it, an allowance of 8
+  articles per boundary on top of the accept budget, 4 boundaries at a time) must
+  not decrease along the parts (`part_order`). A multi-part file none of these
+  binds is declined `part_order_unverifiable` (local, never blamed, backs off like
+  other local declines). Honest shapes this declines: obfuscated multi-volume sets
+  (RAR 4, split 7z, raw splits) holding MP4/MOV, MPEG-TS/M2TS, AVI or any
+  non-Matroska file, and Matroska files whose clusters are longer than the window
+  or that carry one cluster per part. No container's structure check fails on a
+  reordering (an MP4 box chain is unchanged when the data inside `mdat` is
+  reordered), so none is an exception. This is a stated limitation.
 - **Keyed outer volumes.** A keyed outer volume must decrypt to a recognised
   archive signature; a garbled start is `extent_mismatch`, never "unverifiable"
   (a changed IV garbles only the first CBC block and would otherwise switch the
   header check off).
 - **Article sizes.** Every table (inline file, part, outer volume) is one run of
-  equal declared sizes followed by a last article that is not larger; anything
-  else is declined unread (`size_implausible`), at accept and not in
+  equal declared sizes followed by a last article that is not larger; up to one
+  percent of the non-last articles (so none in a table of fewer than a hundred)
+  may be smaller than the usual size, never larger. Anything else is declined
+  unread (`size_implausible`), at accept and not in
   `bundle.Validate` (a variable-size poster is declined locally, not blamed). The
   importer's NZB fixtures show encoded sizes within about 0.1 percent of one
   value and never two block sizes.
-- **Verification accounting.** The budget is charged with the bytes actually
-  delivered (counting writer on the header reader; counting pool wrapper under the
-  staged reader, whose excess over the declared charges is charged too). Each
-  sample is judged as it arrives; the first contradiction, or a budget spent by
-  larger-than-declared articles (a contradiction), cancels the remaining samples.
-  The pool cannot stop after the yEnc header: a failing writer leaves the body on
-  the wire (desync) and a cancelled read is drained whole (abort only above 1 MiB
+- **Verification accounting.** The meter shows bytes really read. Each header
+  read is charged as delivered; staged reads (archive header walks, order windows,
+  the media probe and its structure reads) reserve their declared sizes while they
+  run and are settled to the staging area's own download count (`spent`), so
+  neither the declared charge nor prefix reuse is charged twice. One lease on the
+  node-wide budget spans the whole accept, first read to last. One accept keeps a
+  bounded cache (32 MiB, articles up to 2 MiB) of the articles it fetched, shared
+  by the header reads and the staged reads: no article is downloaded twice while
+  it is in the cache, and a cache hit costs nothing. The structure reads of one
+  media file stop after 96 MiB downloaded. Each sample is judged as it arrives;
+  the first contradiction cancels the remaining samples. Only an article that
+  itself delivers more than its declared size is a contradiction; a budget that
+  other reads had spent is a non-attributable `verify_budget`. The pool cannot
+  stop after the yEnc header: a failing writer leaves the body on the wire
+  (desync) and a cancelled read is drained whole (abort only above 1 MiB
   remaining; articles are ~0.75 MB), so every read costs a whole article.
+- **Evidence keys.** One canonical key everywhere: the contradicting article's
+  message-ID, or `<file ID>:<part index>` when no single article is at fault;
+  never error text. The same corrupt article seen at accept and again in the
+  forced check counts once. An error that names no evidence counts as one
+  anonymous piece.
+- **Local cool-down.** A deterministic local decline (`size_implausible`,
+  `extent_unverifiable`, `part_order`, `part_order_unverifiable`,
+  `structure_invalid`, `media_invalid`, `no_media_file`, `too_many_tables`) skips
+  that Bundle ID for 10 minutes, doubling per repeat up to 6 hours, forgotten after
+  a day without a decline (1,024 Bundle IDs, in memory). It never touches the
+  publisher's standing or the failed-bundle cache.
+- **Fast-path delay.** The window follows the user's own NZB (15 s plus 250 ms
+  per entry, at most 150 s), not the bundle. Fetch and verification together add
+  at most 45 s unless the verification is making progress: each verified article
+  extends the deadline to 15 s past the latest one, never past the window.
+- **Serve builds and busy.** A publisher builds at most 360 bundles an hour
+  (burst 10); one requester at most 60 an hour with a burst of 5, so none can take
+  more than half the node's burst. A requester that is told `busy` (429/503) is
+  asked once more after 1.5 s when the caller's deadline allows; if it stays busy
+  that bundle is skipped for 20 s only (not the 5 minute soft back-off), the
+  publisher is not struck, and the caller is told to retry in 5 s
+  (`ErrPublisherBusy`). Bundles are not pre-built at start-up (not done).
 - **Node-wide verification budget.** 8 GiB per hour (token bucket) and 2
   concurrent accepts (`bundleimport.DefaultVerifyBytesPerHour`,
   `DefaultVerifyConcurrent`). Automatic attempts (the fast path, `Request.Automatic`)
@@ -543,8 +600,8 @@ something different, that bullet is marked "(superseded - see Current rules)".
   768,000-byte articles: 1 file 5 articles / 4 MB; 50 volumes 113 / 87 MB; 200
   volumes 452 / 347 MB; 600 volumes 1,357 / 1,042 MB; 1,000 volumes 2,262 /
   1,737 MB (plus 3 MB reserved for header walks beyond the first article).
-- **Fast-path window.** 15 s plus 250 ms per archive volume of the offered layout,
-  at most 150 s (`bridge.AcceptWindow`); `Policy.AcceptTimeout` 3 min and
+- **Fast-path window.** 15 s plus 250 ms per entry of the user's own NZB,
+  at most 150 s (`bridge.AcceptWindow`), at most 45 s unless progressing; `Policy.AcceptTimeout` 3 min and
   `YencTimeout` 150 s. Header reads take a token of the pool's import connection
   budget before each fetch and the sampler fans out to 16 reads, so the width that
   runs is what the import budget allows (it shrinks while streams play).
@@ -569,13 +626,37 @@ something different, that bullet is marked "(superseded - see Current rules)".
   message-ID, or by part for disagreements inside one part) within 7 days
   blacklists the Bundle ID. `media_invalid` and `structure_invalid` no longer
   blacklist.
-- **Not done.** Order from the payload for MP4, MPEG-TS and other containers; an
+- **Not done.** Order from the payload for MP4, MPEG-TS and other containers
+  (such files are declined when nothing else binds the order); pre-building
+  bundles after a publisher restart; an
   early close of an article body (impossible with the pool); accept does not
-  stream or cancel the media probe by budget; actual-byte accounting for the
-  media head probe (small, not charged); the staged-read overrun is a local
+  stream or cancel the media probe by budget; the staged-read overrun is a local
   (non-attributable) `yenc_mismatch`; sample-time relative-part disagreements are
   judged as samples arrive but cross-part checks (archive header against order)
   still run after sampling.
+
+### What a hostile peer can still make a receiver accept
+
+State after the order and split-7z rules. "Receiver" is a node verifying a
+bundle against its own providers; the articles are the user's own, so a peer can
+only choose which of them to describe and how.
+
+| Release shape | Still acceptable to a hostile peer |
+|---|---|
+| Plain file, any container | Content between sampled articles is not read: a lie confined to unsampled articles (yEnc sizes, offsets) is caught only by the forced full check's 1 percent header sample. A Matroska or MP4 file keeps its size equation; MPEG-TS has none. |
+| Stored RAR 4 / RAR 5 set, parseable names or RAR 5 volume numbers | Every part is bound to its archive header and the order to names or numbers. Mislabel among same-extension entries when the library name matches no archive entry (the name check accepts a different name of the same extension when no other entry carries the layout's name). |
+| Stored RAR 4 set, random names, Matroska with clusters | Order is bound at every boundary by cluster timecodes; a swap of parts whose first clusters are equal is the only gap. Content between sampled points. |
+| Obfuscated RAR 4 / split 7z / raw split holding MP4, TS, AVI, other | Declined (`part_order_unverifiable`): nothing orders the parts. |
+| Split 7z, plain end header | Parts bound through the 7z headers (start, length, end header closing the archive). Content between sampled points. |
+| Split 7z, encoded end header | Only a Matroska file of known Segment size or an MP4 is accepted; stream start and length are bound by the container's size equation alone. |
+| Raw split (`.001`, `.002`), parseable names | One numbered, consecutive set; unrelated posted files cannot mix into it. Content between sampled points. |
+| Keyed (encrypted) sets | As their unencrypted shape; the outer volume must decrypt to an archive signature. |
+
+The accepted residual in every row is content between sampled points (a
+hostile peer cannot make a receiver read articles it did not sample, so bytes
+that differ there are found by the forced full check or by playback) and
+mislabel among same-extension entries when the library name matches no archive
+entry.
 
 ## Phase 3: bundle format
 

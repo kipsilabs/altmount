@@ -65,7 +65,30 @@ type readerAt struct {
 	size int64
 	n    int // reads made, bounded
 	hn   int // box-header reads made, bounded
+	// over, when set, says the file's structure reads have downloaded more than
+	// they may (the cap is in bytes really fetched, not in reads, because one
+	// small read can pull a whole article).
+	over func() bool
 }
+
+// structMode says how much the container must prove.
+type structMode uint8
+
+const (
+	// structLoose: any container, generic ones by readable windows.
+	structLoose structMode = iota
+	// structStrong: the file's archive extents could not be bound to a header, so
+	// a generic container is refused.
+	structStrong
+	// structSizeEquation: nothing binds the stream but the container itself, so
+	// the container must carry a size equation (a Matroska Segment of known size,
+	// an MP4 box chain ending on the end of the file).
+	structSizeEquation
+)
+
+// structMaxBytesPerFile caps what the structure reads of one media file may
+// download (about a hundred articles); it is enforced between reads.
+const structMaxBytesPerFile int64 = 96 << 20
 
 const maxStructReads = 64
 
@@ -90,6 +113,9 @@ func (r *readerAt) readHeader(off int64) ([]byte, error) {
 }
 
 func (r *readerAt) readRaw(off int64, n int) ([]byte, error) {
+	if r.over != nil && r.over() {
+		return nil, fmt.Errorf("%w: the structure reads of this file used up their download allowance", errCost)
+	}
 	if off < 0 || off >= r.size {
 		return nil, fmt.Errorf("%w: offset %d outside the file", errStructure, off)
 	}
@@ -107,6 +133,16 @@ func (r *readerAt) readRaw(off int64, n int) ([]byte, error) {
 
 // verifyStructure runs the container check for the staged file name.
 func verifyStructure(ctx context.Context, op contentverify.Opener, name string, size int64, strong bool) error {
+	mode := structLoose
+	if strong {
+		mode = structStrong
+	}
+	return verifyStructureMode(ctx, op, name, size, mode, nil)
+}
+
+// verifyStructureMode is verifyStructure with the proof the container must give
+// and a download cap (over may be nil).
+func verifyStructureMode(ctx context.Context, op contentverify.Opener, name string, size int64, mode structMode, over func() bool) error {
 	ctx, cancel := context.WithTimeout(ctx, structReadTimeout)
 	defer cancel()
 	ctx = context.WithValue(ctx, utils.MaxPrefetchKey, 1)
@@ -116,20 +152,20 @@ func verifyStructure(ctx context.Context, op contentverify.Opener, name string, 
 		return err
 	}
 	defer func() { _ = f.Close() }()
-	r := &readerAt{ctx: ctx, f: f, size: size}
+	r := &readerAt{ctx: ctx, f: f, size: size, over: over}
 	head, err := r.read(0, 16)
 	if err != nil {
 		return err
 	}
 	switch {
 	case bytes.HasPrefix(head, []byte{0x1A, 0x45, 0xDF, 0xA3}):
-		return verifyMatroska(r)
+		return verifyMatroska(r, mode == structSizeEquation)
 	case len(head) >= 8 && string(head[4:8]) == "ftyp":
 		return verifyMP4(r)
-	case tsStride(r) != 0:
+	case tsStride(r) != 0 && mode != structSizeEquation:
 		return verifyTS(r, tsStride(r))
 	}
-	if strong {
+	if mode != structLoose {
 		return fmt.Errorf("%w: %s", errNotVerifiable, name)
 	}
 	return verifyWindows(r)
@@ -430,7 +466,7 @@ const (
 	idVoid     = 0xEC
 )
 
-func verifyMatroska(r *readerAt) error {
+func verifyMatroska(r *readerAt, needSizeEquation bool) error {
 	hdr, err := r.read(0, 64)
 	if err != nil {
 		return err
@@ -462,6 +498,8 @@ func verifyMatroska(r *readerAt) error {
 		if end < start || end > r.size || r.size-end > 1<<16 {
 			return fmt.Errorf("%w: Segment ends at %d, file is %d bytes", errStructure, end, r.size)
 		}
+	} else if needSizeEquation {
+		return fmt.Errorf("%w: the Segment has no size, so nothing ties the stream to its length", errNotVerifiable)
 	}
 	if err := verifySeekHead(r, start); err != nil {
 		return err

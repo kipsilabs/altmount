@@ -69,6 +69,8 @@ func (p stremioPeerPlayback) Play(ctx context.Context, req api.PeerPlayRequest) 
 	})
 	if err != nil {
 		switch {
+		case errors.Is(err, bundlex.ErrPublisherBusy):
+			return api.PeerPlayResult{}, &api.PeerRetryError{After: 5, Err: err}
 		case errors.Is(err, bundlex.ErrRateLimited):
 			return api.PeerPlayResult{}, &api.PeerRetryError{After: 60, Err: err}
 		case errors.Is(err, bundlex.ErrBackedOff):

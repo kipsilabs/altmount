@@ -16,6 +16,7 @@ import (
 	"github.com/kipsilabs/altmount/internal/database"
 	"github.com/kipsilabs/altmount/internal/metadata"
 	metapb "github.com/kipsilabs/altmount/internal/metadata/proto"
+	"github.com/kipsilabs/altmount/internal/peernet/archivehdr/archivetest"
 	"github.com/kipsilabs/altmount/internal/peernet/bundle"
 	"github.com/kipsilabs/altmount/internal/peernet/bundleimport"
 	"github.com/kipsilabs/altmount/internal/peernet/bundlex"
@@ -112,19 +113,141 @@ func rpReseal(t *testing.T, bd *bundle.Bundle) {
 // rpAccept is the receiver: the real importer over the same fake pool.
 func rpAccept(t *testing.T, p rpPublished, bd *bundle.Bundle) (*bundleimport.Result, error) {
 	t.Helper()
-	lib := metadata.NewMetadataService(t.TempDir())
+	libRoot := t.TempDir()
+	lib := metadata.NewMetadataService(libRoot)
 	db, err := database.NewDB(database.Config{DatabasePath: filepath.Join(t.TempDir(), "db")})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 	cfg := config.DefaultConfig()
 	pm := processorTestPoolManager{client: p.env.client}
 	stager := bundleimport.NewFSStager(bundleimport.FSStagerDeps{Pool: pm, Config: func() *config.Config { return cfg }, Root: t.TempDir()})
+	state := database.NewPeernetBundleImportRepository(db.Connection(), database.DialectSQLite)
 	imp := bundleimport.New(bundleimport.Config{
 		Library: lib, Stager: stager, Prober: rpProber{}, Headers: bundleimport.NewPoolHeaderReader(pm),
-		State: database.NewPeernetBundleImportRepository(db.Connection(), database.DialectSQLite), Announcer: rpAnnouncer{}, Reporter: rpReporter{},
+		State: state, Announcer: rpAnnouncer{}, Reporter: rpReporter{},
 		HealthEnabled: func() bool { return true },
 	})
-	return imp.Accept(context.Background(), bundleimport.Request{Bundle: bd, Target: bundleimport.Target{Dir: "movies/Release.Name.2024.1080p", Category: "movies"}})
+	res, err := imp.Accept(context.Background(), bundleimport.Request{Bundle: bd, Target: bundleimport.Target{Dir: "movies/Release.Name.2024.1080p", Category: "movies"}})
+	if err != nil {
+		// A refused bundle leaves nothing behind: no file, no state row.
+		require.Empty(t, rpVirtualPaths(t, libRoot), "a refused bundle must leave no metadata")
+		rows, lerr := state.ListAfter(context.Background(), "", 10)
+		require.NoError(t, lerr)
+		require.Empty(t, rows, "a refused bundle must leave no state row")
+	}
+	return res, err
+}
+
+// rpMutated returns a copy of the bundle with its first file changed by f, and
+// resealed as an attacker would.
+func rpMutated(t *testing.T, bd *bundle.Bundle, f func(file *bundle.File)) *bundle.Bundle {
+	t.Helper()
+	h := *bd
+	h.Files = append([]bundle.File(nil), bd.Files...)
+	file := h.Files[0]
+	file.Segments = append([]bundle.Segment(nil), file.Segments...)
+	file.Parts = append([]int(nil), file.Parts...)
+	f(&file)
+	file.Size = 0
+	for _, sg := range file.Segments {
+		file.Size += sg.End - sg.Start + 1
+	}
+	h.Files[0] = file
+	h.TotalSize = file.Size
+	rpReseal(t, &h)
+	return &h
+}
+
+// partRange returns the index range [from, to) of part k in the file's segments.
+func partRange(f *bundle.File, k int) (int, int) {
+	at := 0
+	for j := 0; j < k; j++ {
+		at += f.Parts[j]
+	}
+	return at, at + f.Parts[k]
+}
+
+// Hostile variants built from honest pipeline output: each protection is hit
+// with the specific lie it exists for, and the receiver must name the reason and
+// leave nothing behind.
+func TestRealPipelineHostile_EveryProtectionCatchesItsLie(t *testing.T) {
+	data := mediagen.MKVClusters(rpPayload, 20_000)
+	p := rpPublish(t, "hv", data, rpRar4Volumes("Movie.2024.mkv", data, 4))
+	require.Len(t, p.bd.Files[0].Parts, 4)
+	_, err := rpAccept(t, p, p.bd)
+	require.NoError(t, err, "the honest bundle is accepted")
+
+	cases := []struct {
+		name   string
+		reason bundleimport.Reason
+		mutate func(t *testing.T) *bundle.Bundle
+	}{
+		{"yEnc offset lie on the last article of a middle volume", bundleimport.ReasonYencMismatch, func(t *testing.T) *bundle.Bundle {
+			f := p.bd.Files[0]
+			_, to := partRange(&f, 1)
+			id := p.bd.Pool[f.Segments[to-1].Ref]
+			beh := p.env.client.BehaviorFor(id)
+			t.Cleanup(func() { p.env.client.SetBehavior(id, beh) })
+			lie := beh
+			lie.YEnc.PartBegin += 7
+			p.env.client.SetBehavior(id, lie)
+			return p.bd
+		}},
+		{"part offset lie (a middle part starts later than its archive header says)", bundleimport.ReasonExtentMismatch, func(t *testing.T) *bundle.Bundle {
+			return rpMutated(t, p.bd, func(f *bundle.File) {
+				from, _ := partRange(f, 1)
+				f.Segments[from].Start += 8
+			})
+		}},
+		{"part length lie (a middle part stops short of its archive header's size)", bundleimport.ReasonExtentMismatch, func(t *testing.T) *bundle.Bundle {
+			return rpMutated(t, p.bd, func(f *bundle.File) {
+				_, to := partRange(f, 1)
+				f.Segments[to-1].End -= 1000
+			})
+		}},
+		{"truncated volume tail (the last part loses its end)", bundleimport.ReasonExtentMismatch, func(t *testing.T) *bundle.Bundle {
+			return rpMutated(t, p.bd, func(f *bundle.File) {
+				_, to := partRange(f, 3)
+				f.Segments[to-1].End -= 500
+			})
+		}},
+		{"sliver first part", bundleimport.ReasonExtentMismatch, func(t *testing.T) *bundle.Bundle {
+			return rpMutated(t, p.bd, func(f *bundle.File) {
+				_, to := partRange(f, 0)
+				last := f.Segments[to-1]
+				last.Start = last.End - 999
+				f.Segments = append([]bundle.Segment{last}, f.Segments[to:]...)
+				f.Parts[0] = 1
+			})
+		}},
+		{"part swap with parseable names", bundleimport.ReasonPartOrder, func(t *testing.T) *bundle.Bundle {
+			return rpMutated(t, p.bd, func(f *bundle.File) {
+				var blocks [][]bundle.Segment
+				at := 0
+				for _, n := range f.Parts {
+					blocks = append(blocks, append([]bundle.Segment(nil), f.Segments[at:at+n]...))
+					at += n
+				}
+				blocks[1], blocks[2] = blocks[2], blocks[1]
+				f.Parts[1], f.Parts[2] = f.Parts[2], f.Parts[1]
+				f.Segments = nil
+				for _, b := range blocks {
+					f.Segments = append(f.Segments, b...)
+				}
+			})
+		}},
+		{"the file is named as another kind than its archive entry", bundleimport.ReasonExtentMismatch, func(t *testing.T) *bundle.Bundle {
+			return rpMutated(t, p.bd, func(f *bundle.File) { f.Name = "Movie.2024.mp4" })
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			bd := c.mutate(t)
+			_, err := rpAccept(t, p, bd)
+			require.Error(t, err)
+			assert.Equal(t, c.reason, bundleimport.ReasonOf(err), "%v", err)
+		})
+	}
 }
 
 // An obfuscated RAR 4 set: honest order is accepted, two swapped middle volumes
@@ -183,4 +306,52 @@ func TestRealPipelineHostile_ArticleSizesOfOneTableAreNotOneShape(t *testing.T) 
 	_, err := rpAccept(t, p, &hostile)
 	require.Error(t, err)
 	assert.Equal(t, bundleimport.ReasonSizeImplausible, bundleimport.ReasonOf(err), "%v", err)
+}
+
+// rpSevenZipVolumes posts one stored 7z archive cut raw into n volumes
+// (Release.7z.001 ...), as a split 7z release is.
+func rpSevenZipVolumes(name string, pl []byte, n int) func(func(string, []byte) nzbbuild.File) []nzbbuild.File {
+	return func(post func(string, []byte) nzbbuild.File) []nzbbuild.File {
+		a := archivetest.SevenZip(archivetest.SevenZipOpts{}, archivetest.File{Name: name, Data: pl}).Data
+		each := (len(a) + n - 1) / n
+		var out []nzbbuild.File
+		for i := 0; i < n; i++ {
+			lo, hi := i*each, min(len(a), (i+1)*each)
+			out = append(out, post(fmt.Sprintf("Release.7z.%03d", i+1), a[lo:hi]))
+		}
+		return out
+	}
+}
+
+// A split 7z set holding a media file: the honest bundle is accepted and bound
+// through the 7z headers; dropping articles from it is refused.
+func TestRealPipelineHostile_SplitSevenZipTailDrop(t *testing.T) {
+	data := mediagen.MKVClusters(rpPayload, 20_000)
+	p := rpPublish(t, "z7", data, rpSevenZipVolumes("Movie.2024.mkv", data, 4))
+	f := p.bd.Files[0]
+	require.Len(t, f.Parts, 4, "the real builder wrote a four-part layout of the split 7z set")
+	res, err := rpAccept(t, p, p.bd)
+	require.NoError(t, err, "the honest split 7z bundle is accepted: %v", err)
+	require.NotNil(t, res)
+
+	for _, c := range []struct {
+		name   string
+		part   int
+		reason bundleimport.Reason
+	}{
+		{"a middle part loses its tail", 1, bundleimport.ReasonExtentUnverifiable},
+		{"the first part loses its tail", 0, bundleimport.ReasonExtentUnverifiable},
+		{"the last part loses its tail", 3, bundleimport.ReasonExtentMismatch},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			bd := rpMutated(t, p.bd, func(f *bundle.File) {
+				_, to := partRange(f, c.part)
+				f.Segments = append(f.Segments[:to-3], f.Segments[to:]...)
+				f.Parts[c.part] -= 3
+			})
+			_, err := rpAccept(t, p, bd)
+			require.Error(t, err)
+			assert.Equal(t, c.reason, bundleimport.ReasonOf(err), "%v", err)
+		})
+	}
 }

@@ -387,6 +387,7 @@ func (i *Importer) RunHousekeeping(ctx context.Context) {
 			return
 		case <-t.C:
 			i.EscalateStale(ctx)
+			i.dropRowsWithoutFiles(ctx)
 			i.releaseOrphanHolds(ctx)
 		}
 	}

@@ -32,6 +32,9 @@ var (
 	// ErrNoOffers, so callers that do not tell them apart keep working.
 	ErrBackedOff = fmt.Errorf("%w: every offer is backed off", ErrNoOffers)
 	ErrAllFailed = errors.New("bundlex: no offered bundle could be fetched and verified")
+	// ErrPublisherBusy: every attempted publisher answered "busy" (also an
+	// ErrRateLimited, so callers answer "try again shortly").
+	ErrPublisherBusy = fmt.Errorf("%w: the publisher is busy", ErrRateLimited)
 )
 
 // Fetch failure reasons (counted in the status).
@@ -44,6 +47,7 @@ const (
 	failVerification = "verification_failed"
 	failScheme       = "scheme_mismatch"
 	failMembership   = "membership"
+	failBusy         = "busy"
 )
 
 // OfferStore finds stored release records that announce a bundle.
@@ -557,6 +561,9 @@ func (f *Fetcher) FetchWith(ctx context.Context, releaseHex string, opts FetchOp
 		}
 		return nil, FetchSource{}, ErrNoOffers
 	}
+	if allBusy(errs) {
+		return nil, FetchSource{}, ErrPublisherBusy
+	}
 	return nil, FetchSource{}, fmt.Errorf("%w: %w", ErrAllFailed, errors.Join(errs...))
 }
 
@@ -564,19 +571,56 @@ type fetchError struct{ reason string }
 
 func (e *fetchError) Error() string { return "bundlex: fetch failed: " + e.reason }
 
-func (f *Fetcher) attempt(ctx context.Context, o Offer, rid contentid.ID) (*bundle.Bundle, error) {
-	nets := f.cfg.Networks.ReceivingNetworks()
-	var info recsync.NetworkInfo
-	for _, n := range nets {
-		if n.ID == o.Network {
-			info = n
+func allBusy(errs []error) bool {
+	for _, e := range errs {
+		var fe *fetchError
+		if !errors.As(e, &fe) || fe.reason != failBusy {
+			return false
 		}
 	}
-	peer, ok, err := f.cfg.Peers.VerifiedPeer(ctx, o.Network, o.Publisher)
-	if err != nil || !ok || info.ID.IsZero() {
-		f.fail(o.Network, o.Publisher, failTransport, false)
-		return nil, &fetchError{failTransport}
+	return len(errs) > 0
+}
+
+func busyStatus(code int) bool {
+	return code == http.StatusTooManyRequests || code == http.StatusServiceUnavailable
+}
+
+// waitBusy sleeps the busy retry delay and says whether the caller's deadline
+// leaves room for another request after it.
+func (f *Fetcher) waitBusy(ctx context.Context) bool {
+	if dl, ok := ctx.Deadline(); ok && time.Until(dl) < f.lim.BusyRetryDelay+time.Second {
+		return false
 	}
+	t := time.NewTimer(f.lim.BusyRetryDelay)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// busy records that the publisher answered busy twice: the bundle is skipped
+// for BusyBackoff only, the publisher is not struck, and the caller is told to
+// try again shortly.
+func (f *Fetcher) busy(o Offer) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failed[failBusy]++
+	if f.refusedBundles == nil {
+		f.refusedBundles = map[bundle.BundleID]time.Time{}
+	}
+	if len(f.refusedBundles) >= f.lim.MaxTracked {
+		f.refusedBundles = map[bundle.BundleID]time.Time{}
+	}
+	f.refusedBundles[o.BundleID] = f.cfg.Now().Add(f.lim.BusyBackoff)
+	return &fetchError{failBusy}
+}
+
+// request sends one bundle request and returns the response once its
+// authentication passed (any status).
+func (f *Fetcher) request(ctx context.Context, o Offer, peer recsync.Peer, info recsync.NetworkInfo) (*transport.Response, *fetchError) {
 	hdr := http.Header{}
 	if err := f.cfg.Auth.DecorateOutbound(ctx, o.Network, o.Publisher, hdr); err != nil {
 		f.fail(o.Network, o.Publisher, failMembership, false)
@@ -609,14 +653,46 @@ func (f *Fetcher) attempt(ctx context.Context, o Offer, rid contentid.ID) (*bund
 		f.fail(o.Network, o.Publisher, failMembership, false)
 		return nil, &fetchError{failMembership}
 	}
+	return resp, nil
+}
+
+func (f *Fetcher) attempt(ctx context.Context, o Offer, rid contentid.ID) (*bundle.Bundle, error) {
+	nets := f.cfg.Networks.ReceivingNetworks()
+	var info recsync.NetworkInfo
+	for _, n := range nets {
+		if n.ID == o.Network {
+			info = n
+		}
+	}
+	peer, ok, err := f.cfg.Peers.VerifiedPeer(ctx, o.Network, o.Publisher)
+	if err != nil || !ok || info.ID.IsZero() {
+		f.fail(o.Network, o.Publisher, failTransport, false)
+		return nil, &fetchError{failTransport}
+	}
+	resp, ferr := f.request(ctx, o, peer, info)
+	if ferr != nil {
+		return nil, ferr
+	}
+	if busyStatus(resp.StatusCode) {
+		// A publisher that is busy building (or rate limiting) is not a failing
+		// one: wait a moment and ask once more when the caller can afford it,
+		// and otherwise skip it only briefly.
+		_ = resp.Body.Close()
+		if !f.waitBusy(ctx) {
+			return nil, f.busy(o)
+		}
+		if resp, ferr = f.request(ctx, o, peer, info); ferr != nil {
+			return nil, ferr
+		}
+		if busyStatus(resp.StatusCode) {
+			_ = resp.Body.Close()
+			return nil, f.busy(o)
+		}
+	}
 	if resp.StatusCode != http.StatusOK {
 		_ = resp.Body.Close()
-		reason := failStatus
-		if resp.StatusCode == http.StatusTooManyRequests {
-			reason = failRefused
-		}
-		f.fail(o.Network, o.Publisher, reason, false)
-		return nil, &fetchError{reason}
+		f.fail(o.Network, o.Publisher, failStatus, false)
+		return nil, &fetchError{failStatus}
 	}
 	wire, err := resp.ReadAll()
 	if err != nil {

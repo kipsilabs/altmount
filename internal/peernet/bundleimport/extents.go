@@ -228,8 +228,16 @@ type extentReport struct {
 	// unbound maps a file index to why one of its checked extents is
 	// unverifiable.
 	unbound map[int]string
-	bound   int
-	checked int
+	// sizeEquation marks the files (by index) whose stream is bound by nothing
+	// but the container's own size equation (a split 7z set with an encoded end
+	// header).
+	sizeEquation map[int]bool
+	// orderRequired marks the multi-part files (by index) whose order is bound by
+	// no volume number and no parseable name: their payload must confirm it, or
+	// the bundle is declined (part_order_unverifiable).
+	orderRequired map[int]string
+	bound         int
+	checked       int
 	// partsBound and partsUnbound count the header checks of multi-part files.
 	partsBound, partsUnbound int
 	// articles and bytes are what the shared budget was charged.
@@ -237,12 +245,15 @@ type extentReport struct {
 	bytes    int64
 	// bud is the accept's budget, for the reads that come after the sampling.
 	bud *costBudget
+	// lease is the node-wide claim of the accept, still open when verifyYenc
+	// succeeded; the accept ends it when its last read is done.
+	lease *VerifyLease
 }
 
 // verifyExtents runs the header check for the picked extents. A mismatch is
 // attributable to the publisher.
 func (i *Importer) verifyExtents(ctx context.Context, b *bundle.Bundle, st Staging, picks []extentRef, bud *costBudget) (extentReport, Reason, bool, error) {
-	rep := extentReport{unbound: map[int]string{}}
+	rep := extentReport{unbound: map[int]string{}, sizeEquation: map[int]bool{}, orderRequired: map[int]string{}}
 	if len(picks) == 0 {
 		return rep, "", false, nil
 	}
@@ -274,7 +285,7 @@ func (i *Importer) verifyExtents(ctx context.Context, b *bundle.Bundle, st Stagi
 	wg.Wait()
 	for _, w := range volumes {
 		if w.wrap.Outcome == archivehdr.Mismatch {
-			return rep, ReasonExtentMismatch, true, fmt.Errorf("%s (outer volume): %s", b.Files[w.refs[0].file].Name, w.wrap.Detail)
+			return rep, ReasonExtentMismatch, true, evidenceError{fmt.Errorf("%s (outer volume): %s", b.Files[w.refs[0].file].Name, w.wrap.Detail), partEvidence(b.Files[w.refs[0].file].FileID.String(), 1000+w.refs[0].ext, bundle.TableKey{})}
 		}
 		if len(w.outer.AESKey) > 0 && errors.Is(w.err, archivehdr.ErrUnknownFormat) {
 			// A keyed outer volume claims to hold an inner archive; decrypted
@@ -282,7 +293,7 @@ func (i *Importer) verifyExtents(ctx context.Context, b *bundle.Bundle, st Stagi
 			// only the first block under a wrong IV, so a peer could otherwise
 			// change the IV (which a RAR 4 header cannot be compared with) and
 			// leave the data area readable, switching the header check off.
-			return rep, ReasonExtentMismatch, true, fmt.Errorf("%s (outer volume): decrypted with the layout's key and IV it does not begin like an archive", b.Files[w.refs[0].file].Name)
+			return rep, ReasonExtentMismatch, true, evidenceError{fmt.Errorf("%s (outer volume): decrypted with the layout's key and IV it does not begin like an archive", b.Files[w.refs[0].file].Name), partEvidence(b.Files[w.refs[0].file].FileID.String(), 1000+w.refs[0].ext, bundle.TableKey{})}
 		}
 		for _, r := range w.refs {
 			f := &b.Files[r.file]
@@ -302,7 +313,7 @@ func (i *Importer) verifyExtents(ctx context.Context, b *bundle.Bundle, st Stagi
 			case archivehdr.Bound:
 				rep.bound++
 			case archivehdr.Mismatch:
-				return rep, ReasonExtentMismatch, true, fmt.Errorf("%s: extent %d of %d: %s", f.Name, r.ext+1, len(f.Extents), res.Detail)
+				return rep, ReasonExtentMismatch, true, evidenceError{fmt.Errorf("%s: extent %d of %d: %s", f.Name, r.ext+1, len(f.Extents), res.Detail), partEvidence(f.FileID.String(), 1000+r.ext, bundle.TableKey{})}
 			default:
 				if _, ok := rep.unbound[r.file]; !ok {
 					rep.unbound[r.file] = res.Detail

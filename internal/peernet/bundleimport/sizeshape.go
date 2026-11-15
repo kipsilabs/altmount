@@ -23,16 +23,44 @@ import (
 // breaks it is not malformed, only not worth verifying (an honest poster with
 // variable articles would be declined locally, not blamed).
 
+// A real poster is not perfectly uniform: a post can contain a handful of
+// articles cut at another size (a resumed or repaired upload). Up to one percent
+// of a table's articles (so a table of fewer than a hundred has none) may differ from the table's usual size,
+// and then only downwards. This keeps the download bound: what the node pays for
+// is the bytes really delivered (the budget is charged with them), and a layout
+// that shrinks 1 percent of its articles gains nothing from it, since the
+// mandatory samples (first and last article of every table) and the random
+// interior ones are charged as delivered whatever the layout declares.
+const shapeOutlierPercent = 1
+
 // checkRunShape applies the shape rule to one run of segments.
 func checkRunShape(name string, segs []bundle.Segment) error {
 	if len(segs) < 2 {
 		return nil
 	}
-	block := segs[0].Size
-	for i, s := range segs[:len(segs)-1] {
-		if s.Size != block {
-			return fmt.Errorf("%s: article %d declares %d bytes, the first %d (a posted file's articles are one size)", name, i, s.Size, block)
+	body := segs[:len(segs)-1]
+	count := map[int64]int{}
+	block, best := body[0].Size, 0
+	for _, s := range body {
+		count[s.Size]++
+		if c := count[s.Size]; c > best || (c == best && s.Size > block) {
+			block, best = s.Size, c
 		}
+	}
+	outliers, first := 0, -1
+	for i, s := range body {
+		if s.Size == block {
+			continue
+		}
+		if s.Size > block {
+			return fmt.Errorf("%s: article %d declares %d bytes, more than the usual %d (a posted file's articles are one size)", name, i, s.Size, block)
+		}
+		if outliers++; first < 0 {
+			first = i
+		}
+	}
+	if outliers > len(body)*shapeOutlierPercent/100 {
+		return fmt.Errorf("%s: article %d declares %d bytes and %d articles differ from the usual %d (a posted file's articles are one size)", name, first, body[first].Size, outliers, block)
 	}
 	if last := segs[len(segs)-1]; last.Size > block {
 		return fmt.Errorf("%s: the last article declares %d bytes, more than the %d of the others", name, last.Size, block)

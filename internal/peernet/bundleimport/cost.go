@@ -1,6 +1,7 @@
 package bundleimport
 
 import (
+	"context"
 	"errors"
 	"sync"
 )
@@ -27,12 +28,17 @@ type costBudget struct {
 	// excess is what those reads really downloaded beyond it (already added
 	// to used).
 	declStaged, excess int64
+	// stagedTotal is the latest total the staging area reported downloading.
+	stagedTotal int64
+	// onProgress, when set, is called on every charge.
+	onProgress func()
 }
 
 func newCostBudget(limit int64) *costBudget { return &costBudget{limit: limit} }
 
 // charge takes n bytes from the budget, or reports errCost.
 func (c *costBudget) charge(n int64) error {
+	c.progress()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if n < 0 || c.used+n > c.limit {
@@ -46,6 +52,7 @@ func (c *costBudget) charge(n int64) error {
 // chargeActual takes what a read really delivered. The bytes are always
 // recorded; errOverrun says the budget is now spent.
 func (c *costBudget) chargeActual(n int64) error {
+	c.progress()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.used += max(n, 0)
@@ -72,8 +79,10 @@ func (c *costBudget) chargeStaged(n int64) error {
 // What exceeds the declared charges of the staged reads is charged too;
 // errOverrun says that spent the budget.
 func (c *costBudget) noteStaged(total int64) error {
+	c.progress()
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.stagedTotal = max(c.stagedTotal, total)
 	if over := total - c.declStaged; over > c.excess {
 		c.used += over - c.excess
 		c.excess = over
@@ -98,9 +107,43 @@ func (c *costBudget) articles() int {
 	return c.n
 }
 
-// spent is what was charged.
+// spent is what the accept really read: the header reads as delivered plus what
+// the staging area really downloaded. The declared charges of the staged reads
+// are a reservation that bounds the work (used); they are settled here to the
+// counting reader's total, so the node-wide meter and the status show actual
+// bytes and an article served from the accept's cache costs nothing.
 func (c *costBudget) spent() int64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.used
+	return c.used - c.declStaged - c.excess + c.stagedTotal
+}
+
+// grow raises the limit by n, never beyond ceiling (the order check of a large
+// set reads more than the sampling plan reserved; what it reads is still
+// charged as really downloaded).
+func (c *costBudget) grow(n, ceiling int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.limit = min(c.limit+max(n, 0), max(ceiling, c.limit))
+}
+
+func (c *costBudget) progress() {
+	if c.onProgress != nil {
+		c.onProgress()
+	}
+}
+
+type progressKey struct{}
+
+// withProgress carries a request's progress callback to the accept's budget.
+func withProgress(ctx context.Context, f func()) context.Context {
+	if f == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, progressKey{}, f)
+}
+
+func progressFrom(ctx context.Context) func() {
+	f, _ := ctx.Value(progressKey{}).(func())
+	return f
 }

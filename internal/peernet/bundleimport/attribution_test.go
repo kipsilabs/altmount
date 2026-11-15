@@ -2,6 +2,8 @@ package bundleimport
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -108,4 +110,11 @@ func TestStrikeBook_ExpiresAndIsBounded(t *testing.T) {
 		s.add("id"+strconv.Itoa(k), "x", t0.Add(time.Duration(k)*time.Second))
 	}
 	assert.LessOrEqual(t, len(s.m), maxStrikeBundles, "bundles are bounded")
+}
+
+// Evidence is never free text: an error that names no article or part counts as
+// one anonymous piece whatever numbers its text carries.
+func TestEvidenceOf_NeverFreeText(t *testing.T) {
+	assert.Equal(t, evidenceOf(errors.New("part 3 says 4096 at 17")), evidenceOf(errors.New("part 3 says 4097 at 17")))
+	assert.Equal(t, "id@x", evidenceOf(fmt.Errorf("wrapped: %w", evidenceError{errors.New("t 1"), "id@x"})))
 }

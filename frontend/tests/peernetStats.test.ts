@@ -117,6 +117,7 @@ const BACKEND_FETCH_FAILED_KEYS = [
 	"verification_failed",
 	"scheme_mismatch",
 	"membership",
+	"busy",
 ];
 // internal/peernet/bundleimport (Reason)
 const BACKEND_IMPORT_REJECT_KEYS = [
@@ -146,6 +147,7 @@ const BACKEND_IMPORT_REJECT_KEYS = [
 	"extent_mismatch",
 	"extent_unverifiable",
 	"part_order",
+	"part_order_unverifiable",
 	"too_many_tables",
 	"verify_budget",
 ];

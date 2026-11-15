@@ -240,12 +240,13 @@ func (i *Importer) verifyParts(ctx context.Context, b *bundle.Bundle, tables []s
 	}
 	wg.Wait()
 	volumes := map[int][]*partWork{}
-	sevenZip := map[int]bool{} // files whose first part is a 7z volume
+	sevenZip := map[int]bool{} // multi-part files whose first part is a 7z volume
 	for _, w := range work {
-		if w.ref.part == 0 && w.vol != nil && w.vol.Format == archivehdr.Format7z {
+		if w.ref.part == 0 && w.vol != nil && w.vol.Format == archivehdr.Format7z && len(b.Files[w.ref.file].Parts) > 1 {
 			sevenZip[w.ref.file] = true
 		}
 	}
+	sevenPending := map[int]int{} // parts of split 7z sets the set check will bind
 	for _, w := range work {
 		f := &b.Files[w.ref.file]
 		if errors.Is(w.err, errOverrun) {
@@ -264,13 +265,17 @@ func (i *Importer) verifyParts(ctx context.Context, b *bundle.Bundle, tables []s
 				volumes[w.ref.file] = append(volumes[w.ref.file], w)
 			}
 		case archivehdr.Mismatch:
-			return ReasonExtentMismatch, true, fmt.Errorf("%s: part %d of %d: %s", f.Name, w.ref.part+1, len(f.Parts), res.Detail)
+			return ReasonExtentMismatch, true, evidenceError{fmt.Errorf("%s: part %d of %d: %s", f.Name, w.ref.part+1, len(f.Parts), res.Detail), partEvidence(f.FileID.String(), w.ref.part, bundle.TableKey{})}
 		default:
 			// A slice must be bound to an archive header, or the bundle is refused:
 			// otherwise a publisher could always pick the layout that cannot be
 			// judged. The one honest exception is a 7z volume, whose headers live
 			// at the end of the set and are often encoded.
-			if !sevenZipVolume(w, sevenZip[w.ref.file]) {
+			if sevenZip[w.ref.file] {
+				sevenPending[w.ref.file]++
+				continue
+			}
+			if !sevenZipVolume(w) {
 				return ReasonExtentUnverifiable, false, fmt.Errorf("%s: part %d of %d cannot be bound to an archive header: %s", f.Name, w.ref.part+1, len(f.Parts), res.Detail)
 			}
 			rep.partsUnbound++
@@ -279,39 +284,56 @@ func (i *Importer) verifyParts(ctx context.Context, b *bundle.Bundle, tables []s
 			}
 		}
 	}
+	for fi := range sevenZip {
+		set, reason, attributable, err := i.verifySplit7z(ctx, split7zInput{b: b, file: fi, ents: ents, rel: rel, st: st, bud: bud,
+			table: func(part int) int { return byTable[[2]int{fi, part}] }})
+		if err != nil {
+			return reason, attributable, err
+		}
+		if set.bound {
+			rep.partsBound += sevenPending[fi]
+			continue
+		}
+		rep.partsUnbound += sevenPending[fi]
+		rep.unbound[fi] = set.why
+		if set.sizeEquation {
+			rep.sizeEquation[fi] = true
+		}
+	}
 	for fi, ws := range volumes {
 		if d := volumeOrder(ws); d != "" {
-			return ReasonExtentMismatch, true, fmt.Errorf("%s: %s", b.Files[fi].Name, d)
+			return ReasonExtentMismatch, true, evidenceError{fmt.Errorf("%s: %s", b.Files[fi].Name, d), partEvidence(b.Files[fi].FileID.String(), -1, bundle.TableKey{})}
 		}
 	}
-	return orderByNames(b, tables, rel)
-}
-
-// sevenZipVolume says the part may stay unbound because it belongs to a 7z set,
-// whose end header is out of reach or encoded. The first part must itself be a
-// 7z volume (or its end header encoded); every later part of such a set is a
-// continuation of the archive stream and must begin at the first byte of its
-// posted file.
-func sevenZipVolume(w *partWork, firstIsSevenZip bool) bool {
-	switch {
-	case errors.Is(w.err, archivehdr.ErrCompressedHeader):
-		return true
-	case w.ref.part == 0:
-		return w.vol != nil && w.vol.Format == archivehdr.Format7z
+	numbered := map[int]bool{}
+	for fi, ws := range volumes {
+		if len(ws) != len(b.Files[fi].Parts) {
+			continue
+		}
+		all := true
+		for _, w := range ws {
+			all = all && w.vol.VolumeNumber >= 0
+		}
+		numbered[fi] = all
 	}
-	return firstIsSevenZip && w.skip == "" && w.offset == 0 && w.segs[0].Start == 0
+	return orderStep(b, tables, rel, numbered, rep)
 }
 
-// orderByNames binds the order of the parts of every multi-part file to the
-// volume names the articles carry (the yEnc name of each part's first article).
-func orderByNames(b *bundle.Bundle, tables []sampleTable, rel *relState) (Reason, bool, error) {
+// sevenZipVolume says a single-volume 7z part may stay unbound: its end header
+// is encoded, so nothing in the volume can be compared with the slice. (A split
+// set is judged as a whole by verifySplit7z.)
+func sevenZipVolume(w *partWork) bool {
+	return errors.Is(w.err, archivehdr.ErrCompressedHeader)
+}
+
+// orderStep requires the order of the parts of every multi-part file to be
+// bound. It is bound by the RAR 5 volume numbers of all its parts (numbered), or
+// by the volume names the articles carry. A file neither binds is left to the
+// payload check of the media probe (rep.orderRequired); a file that has no
+// payload check is declined now. Names that contradict their own numbering are
+// refused (part_order).
+func orderStep(b *bundle.Bundle, tables []sampleTable, rel *relState, numbered map[int]bool, rep *extentReport) (Reason, bool, error) {
 	byFile := map[int][]string{}
-	counts := map[int]int{}
-	for t := range tables {
-		if tables[t].part {
-			counts[tables[t].file]++
-		}
-	}
 	for t := range tables {
 		if tables[t].part {
 			if byFile[tables[t].file] == nil {
@@ -324,9 +346,16 @@ func orderByNames(b *bundle.Bundle, tables []sampleTable, rel *relState) (Reason
 		if len(names) < 2 {
 			continue
 		}
-		if d := nameOrder(names); d != "" {
+		verdict, d := nameOrder(names)
+		switch {
+		case verdict == namesClash:
 			return ReasonPartOrder, false, fmt.Errorf("%s: %s", b.Files[fi].Name, d)
+		case verdict == namesBind, numbered[fi]:
+			continue
+		case !fileinfo.IsVerifiableMediaFile(b.Files[fi].Name):
+			return ReasonPartOrderUnverifiable, false, fmt.Errorf("%s: the order of its %d parts is bound by no volume number or name and the file has no payload that could confirm it", b.Files[fi].Name, len(names))
 		}
+		rep.orderRequired[fi] = "no volume number or name binds the order of the parts"
 	}
 	return "", false, nil
 }

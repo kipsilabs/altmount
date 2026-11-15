@@ -41,12 +41,14 @@ const (
 	// serveBuildsPerHour and serveBuildBurst bound cache-missing builds for
 	// peer requests, node-wide.
 	serveBuildsPerHour = 360
-	serveBuildBurst    = 3
+	serveBuildBurst    = 10
 	// serveBuildsPerRequesterPerHour is what one requester (a node ID, or a
-	// public address) may use of that: a sixth. Its burst is one, so no
-	// requester can spend more than a third of the node-wide burst.
+	// public address) may use of that: a sixth. Its burst is five (a
+	// person opening a few releases in a minute after the publisher restarted
+	// with a cold cache), so no requester can spend more than half of the
+	// node-wide burst.
 	serveBuildsPerRequesterPerHour = serveBuildsPerHour / 6
-	serveBuildRequesterBurst       = 1
+	serveBuildRequesterBurst       = 5
 	negativeTTL                    = time.Minute
 	maxNegative                    = 256
 )

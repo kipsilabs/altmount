@@ -165,9 +165,43 @@ type peernetBundleHost struct {
 	observe func(metadata.FileObserver)
 	build   func() (*bundleimport.Importer, error)
 	getCfg  config.ConfigGetter
+	// fallbackGate stands in for the importer while it cannot be built and
+	// peer-import rows still owe their full check (nil: none).
+	fallbackGate health.PeerBundleGate
+	// retryDelay is the wait before the first retry of a failed build (zero:
+	// 30 seconds); it doubles up to retryMax (zero: 10 minutes).
+	retryDelay, retryMax time.Duration
 
-	mu  sync.Mutex
-	imp *bundleimport.Importer
+	mu      sync.Mutex
+	imp     *bundleimport.Importer
+	retry   *time.Timer
+	retries int
+}
+
+// scheduleRetry arranges another attempt to build the importer, with a growing
+// delay. Without it a failed build would only be retried on the next
+// configuration change. Call with mu held.
+func (h *peernetBundleHost) scheduleRetry() {
+	if h.retry != nil || h.getCfg == nil {
+		return
+	}
+	d, max := h.retryDelay, h.retryMax
+	if d <= 0 {
+		d = 30 * time.Second
+	}
+	if max <= 0 {
+		max = 10 * time.Minute
+	}
+	for k := 0; k < h.retries && d < max; k++ {
+		d *= 2
+	}
+	h.retries++
+	h.retry = time.AfterFunc(min(d, max), func() {
+		h.mu.Lock()
+		h.retry = nil
+		h.mu.Unlock()
+		h.apply(h.getCfg())
+	})
 }
 
 // importer returns the bundle importer, building it on first use. It returns
@@ -177,7 +211,8 @@ func (h *peernetBundleHost) importer() *bundleimport.Importer {
 	if h.imp == nil {
 		imp, err := h.build()
 		if err != nil {
-			slog.Error("Peer bundle import is not available", "error", err)
+			slog.Error("Peer bundle import is not available; will retry", "error", err)
+			h.scheduleRetry()
 			return nil
 		}
 		h.imp = imp
@@ -218,6 +253,8 @@ func (h *peernetBundleHost) apply(cfg *config.Config) {
 				h.api.SetPeerBundleLookup(h.lookup)
 				return
 			}
+			h.installFallbackGate()
+			return
 		}
 		h.health.SetPeerBundleGate(nil)
 		h.api.SetPeerBundleLookup(nil)
@@ -226,6 +263,9 @@ func (h *peernetBundleHost) apply(cfg *config.Config) {
 	imp := h.importer()
 	if imp == nil {
 		h.importerSvc.SetPeerBundleFastPath(nil)
+		if h.hasPending != nil && h.hasPending() {
+			h.installFallbackGate()
+		}
 		return
 	}
 	// Pending peer imports must be honoured even before a fetcher exists.
@@ -239,6 +279,17 @@ func (h *peernetBundleHost) apply(cfg *config.Config) {
 	} else {
 		h.importerSvc.SetPeerBundleFastPath(nil)
 	}
+}
+
+// installFallbackGate keeps pending peer imports from being treated as ordinary
+// files while the importer cannot be built: a gate that answers from the state
+// rows alone (it can neither release nor fail an import, only keep it pending).
+func (h *peernetBundleHost) installFallbackGate() {
+	if h.fallbackGate == nil {
+		return
+	}
+	h.health.SetPeerBundleGate(h.fallbackGate)
+	h.api.SetPeerBundleLookup(h.lookup)
 }
 
 // Importer returns the bundle importer (nil until the feature was first
@@ -304,6 +355,7 @@ func newPeernetBundleHost(d bundleWiringDeps, seams *peernetBundleSeams) *peerne
 			n, _, err := state.PendingCounts(context.Background(), time.Time{})
 			return err != nil || n > 0
 		},
+		fallbackGate: pendingOnlyGate{state: state},
 		build: func() (*bundleimport.Importer, error) {
 			return bundleimport.NewChecked(bundleImporterConfig(d, state, stagingRoot, seams))
 		},
@@ -394,3 +446,35 @@ func (b *peerOriginBinder) ImportStatus() service.BundleImportStatus {
 		PartsHeaderBound: int64(c.PartsHeaderBound), PartsHeaderUnbound: int64(c.PartsHeaderUnbound),
 		ExtentsHeaderBound: int64(c.ExtentsHeaderBound), ExtentsHeaderUnbound: int64(c.ExtentsHeaderUnbound)}
 }
+
+// pendingOnlyGate is the health gate while the bundle importer cannot be built:
+// it knows which files are pending peer imports (from the state rows) so they
+// are never repaired or released as ordinary files, and it fails closed (every
+// path reads as pending) when the rows cannot be read. It cannot pass or fail an
+// import; those wait for the importer.
+type pendingOnlyGate struct {
+	state *database.PeernetBundleImportRepository
+}
+
+func (g pendingOnlyGate) PendingFullCheck(ctx context.Context, paths []string) map[string]struct{} {
+	out := map[string]struct{}{}
+	rows, err := g.state.PendingAmong(ctx, paths)
+	if err != nil {
+		for _, p := range paths {
+			out[p] = struct{}{}
+		}
+		return out
+	}
+	for p := range rows {
+		out[p] = struct{}{}
+	}
+	return out
+}
+
+func (g pendingOnlyGate) IsPendingPeerImport(ctx context.Context, filePath string) bool {
+	row, ok, err := g.state.Get(ctx, filePath)
+	return err == nil && ok && row.State == "pending"
+}
+
+func (pendingOnlyGate) FullCheckPassed(context.Context, string) {}
+func (pendingOnlyGate) FullCheckFailed(context.Context, string) {}

@@ -2,8 +2,11 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/kipsilabs/altmount/internal/api"
 	"github.com/kipsilabs/altmount/internal/config"
@@ -308,3 +311,45 @@ func TestBundleHost_NeverInstallsAnImporterThatCannotBeBuilt(t *testing.T) {
 	assert.Nil(t, l.cur)
 	assert.Nil(t, h.Importer())
 }
+
+// A build that fails is retried on a timer (not only on the next configuration
+// change), and while it is missing and pending imports still owe their full
+// check a fail-closed gate stands in for the importer.
+func TestBundleHost_RetriesAFailedBuildAndKeepsAGateWhilePendingRowsExist(t *testing.T) {
+	h, fp, g, l, _ := bundleHostFixture(t)
+	cfg := enabledCfg(true)
+	h.getCfg = func() *config.Config { return cfg }
+	h.retryDelay, h.retryMax = 5*time.Millisecond, 20*time.Millisecond
+	h.hasPending = func() bool { return true }
+	h.fallbackGate = recFallbackGate{}
+	h.lookup = stubLookup{}
+	var mu sync.Mutex
+	attempts := 0
+	h.build = func() (*bundleimport.Importer, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		attempts++
+		if attempts < 3 {
+			return nil, errors.New("not ready")
+		}
+		return bundleimport.New(bundleimport.Config{}), nil
+	}
+	h.apply(cfg)
+	assert.Equal(t, recFallbackGate{}, g.cur, "no importer yet, rows pending: the fail-closed gate stands in")
+	assert.NotNil(t, l.cur)
+	assert.Nil(t, fp.cur)
+	require.Eventually(t, func() bool { return h.Importer() != nil }, 2*time.Second, 5*time.Millisecond, "the build must be retried on a timer")
+	_, isImporter := g.cur.(*bundleimport.Importer)
+	assert.True(t, isImporter, "once built, the importer is the gate")
+}
+
+type recFallbackGate struct{}
+
+func (recFallbackGate) PendingFullCheck(_ context.Context, p []string) map[string]struct{} {
+	return map[string]struct{}{}
+}
+func (recFallbackGate) IsPendingPeerImport(context.Context, string) bool { return true }
+func (recFallbackGate) FullCheckPassed(context.Context, string)          {}
+func (recFallbackGate) FullCheckFailed(context.Context, string)          {}
+
+type stubLookup struct{ api.PeerBundleLookup }

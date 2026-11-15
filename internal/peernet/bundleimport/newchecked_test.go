@@ -3,6 +3,7 @@ package bundleimport
 import (
 	"testing"
 
+	"github.com/kipsilabs/altmount/internal/metadata"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -21,4 +22,17 @@ func TestNewCheckedRefusesAMissingRequiredCollaborator(t *testing.T) {
 	cfg.Prober = e.prober
 	_, err = NewChecked(cfg)
 	require.NoError(t, err, "optional collaborators (Index, Fetcher, Recorder) may be nil")
+}
+
+// A typed nil behind an interface (a nil *MetadataService passed as the
+// Library) is as missing as a nil interface.
+func TestNewCheckedRefusesATypedNilCollaborator(t *testing.T) {
+	e := newEnv(t)
+	cfg := e.imp.cfg
+	cfg.Prober = e.prober
+	var lib *metadata.MetadataService
+	cfg.Library = lib
+	_, err := NewChecked(cfg)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "Library")
 }

@@ -170,3 +170,19 @@ func TestServeCacheHitsCostNoBudget(t *testing.T) {
 		}
 	}
 }
+
+// A person browsing opens a handful of releases within a minute; a cold cache
+// (the publisher just restarted) must not turn that into "busy".
+func TestServeBuildBurstSuitsAPersonBrowsing(t *testing.T) {
+	lib, _ := nzbRelease()
+	b := newTestBuilder(t, lib, NoPatches{})
+	one := WithRequester(context.Background(), "node-browser", "198.51.100.40")
+	for i := 0; i < 5; i++ {
+		if _, err := b.BuildForServe(one, distinctRelease(200+i), "T", posted); errors.Is(err, ErrBusy) {
+			t.Fatalf("build %d of a browsing requester was refused", i+1)
+		}
+	}
+	if _, err := b.BuildForServe(one, distinctRelease(210), "T", posted); !errors.Is(err, ErrBusy) {
+		t.Fatal("the burst must still end: one requester may not take more than half of the node-wide burst")
+	}
+}

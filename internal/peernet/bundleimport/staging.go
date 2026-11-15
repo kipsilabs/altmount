@@ -87,4 +87,7 @@ func (s *fsStaging) Opener() contentverify.Opener { return s.fs }
 // Downloaded is how many decoded bytes the staged reads have really fetched.
 func (s *fsStaging) Downloaded() int64 { return s.cnt.Downloaded() }
 
+// SetArticleCache makes the staged reads share the accept's article cache.
+func (s *fsStaging) SetArticleCache(c *articleCache) { s.cnt.setCache(c) }
+
 func (s *fsStaging) Close() error { return os.RemoveAll(s.dir) }

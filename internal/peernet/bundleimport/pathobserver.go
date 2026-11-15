@@ -70,8 +70,21 @@ func (o *PathObserver) FileWritten(ctx context.Context, path string) {
 		o.i.releaseOrphanHolds(ctx)
 		return
 	}
+	// A row already at the new path belongs to an import that wrote this very
+	// content there (the same release imported again under another category
+	// before the grace passed). That row is authoritative: the stale one goes,
+	// never the fresh import's hold or state.
+	if _, found, err := o.i.cfg.State.Get(ctx, path); err == nil && found {
+		_ = o.i.cfg.State.Delete(ctx, []string{s.path})
+		o.i.releaseOrphanHolds(ctx)
+		return
+	}
 	if _, err := o.i.cfg.State.MoveFile(ctx, s.path, path); err != nil {
-		slog.WarnContext(ctx, "peer bundle state could not follow a renamed file", "error", err)
+		// The row could not follow (another row took the path meanwhile): drop
+		// the stale one rather than leave it behind for good.
+		slog.WarnContext(ctx, "peer bundle state could not follow a renamed file; dropping the old row", "error", err)
+		_ = o.i.cfg.State.Delete(ctx, []string{s.path})
+		o.i.releaseOrphanHolds(ctx)
 	}
 }
 
