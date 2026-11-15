@@ -4,11 +4,14 @@ import { ExposureLevelSelect } from "./ExposureLevelSelect";
 import type { NodeState } from "./nodeState";
 import { PeerAddressList } from "./PeerAddressList";
 import { PeerTable } from "./PeerTable";
+import { openNetworkProxyNote } from "./peernetStats";
 import { SharedDataBlock } from "./SharedDataBlock";
 
 interface OpenNetworkCardProps {
 	form: PeernetConfig;
 	openNetwork: PeernetNetworkStatus | undefined;
+	/** Set when peers are reached through the outbound proxy. */
+	outboundProxy?: boolean;
 	nodeState: NodeState;
 	onChange: (patch: Partial<PeernetConfig>) => void;
 	disabled?: boolean;
@@ -17,6 +20,7 @@ interface OpenNetworkCardProps {
 export function OpenNetworkCard({
 	form,
 	openNetwork,
+	outboundProxy = false,
 	nodeState,
 	onChange,
 	disabled = false,
@@ -66,6 +70,11 @@ export function OpenNetworkCard({
 							NZB. The result is verified by sampling, not by full analysis.
 						</span>
 					</label>
+					{openNetworkProxyNote({ outbound_proxy: outboundProxy }) && (
+						<p className="text-warning text-xs">
+							{openNetworkProxyNote({ outbound_proxy: outboundProxy })}
+						</p>
+					)}
 				</fieldset>
 
 				<fieldset className="fieldset">

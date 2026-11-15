@@ -40,3 +40,37 @@ func TestPeerFastPath_SkippedOnceForARequeuedItem(t *testing.T) {
 		t.Fatal("the skip applies once only")
 	}
 }
+
+// fakeSkipStore stands for the persisted mark on the queue row; it outlives the
+// processor, as the database does a restart.
+type fakeSkipStore map[int64]bool
+
+func (s fakeSkipStore) ClaimSkipFastPath(_ context.Context, id int64) (bool, error) {
+	was := s[id]
+	delete(s, id)
+	return was, nil
+}
+
+// The skip survives a restart: a new processor reads it from the queue row, and
+// consumes it once.
+func TestPeerFastPath_SkipSurvivesARestart(t *testing.T) {
+	e := newBatteryEnv(t)
+	store := fakeSkipStore{5: true}
+	fp := &fakeFastPath{take: true, env: e}
+	e.proc.SetPeerBundleFastPath(fp)
+	e.proc.SetPeerSkipStore(store) // a fresh processor: nothing in memory
+	nzbPath := cleanNZB(e)
+	n := parseTestNzb(t, nzbPath)
+
+	_, _, taken, _ := e.proc.tryPeerBundle(context.Background(), n, nzbPath, 5, "/", nil, nil, nil)
+	if taken || len(fp.reqs) != 0 {
+		t.Fatal("the persisted mark must keep the fast path off for the requeued item")
+	}
+	if len(store) != 0 {
+		t.Fatal("the mark is consumed")
+	}
+	_, _, taken, _ = e.proc.tryPeerBundle(context.Background(), n, nzbPath, 5, "/", nil, nil, nil)
+	if !taken {
+		t.Fatal("the skip applies once only")
+	}
+}

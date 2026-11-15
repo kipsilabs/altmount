@@ -37,6 +37,9 @@ type Config struct {
 	WillBeChecked func(path string) bool
 	Policy        Policy
 	Now           func() time.Time
+	// Verify is the node-wide verification budget shared by every accept (nil:
+	// a limiter with the defaults is created).
+	Verify *VerifyLimiter
 }
 
 // Missing lists the required collaborators that are nil. Without one the
@@ -67,8 +70,11 @@ type Importer struct {
 	// reportedMu guards reported.
 	reportedMu sync.Mutex
 	flight     singleflight.Group
-	// mismatched holds the paths whose header sample contradicted the layout.
+	// mismatched holds the paths whose header sample contradicted the layout,
+	// with the detail naming the contradicting article.
 	mismatched sync.Map
+	// strikes counts the distinct contradicting articles per Bundle ID.
+	strikes strikeBook
 
 	// writeMu: a write holds it shared from its first state row to its commit;
 	// Reconcile takes it exclusively, so it can never roll back a live write.
@@ -115,6 +121,9 @@ func New(cfg Config) *Importer {
 	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
+	}
+	if cfg.Verify == nil {
+		cfg.Verify = NewVerifyLimiter(VerifyLimits{}, cfg.Now)
 	}
 	return &Importer{cfg: cfg, cnt: counters{rejected: map[Reason]uint64{}}, targets: map[string]*targetLock{}}
 }

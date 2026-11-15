@@ -27,6 +27,38 @@ func MKV(size int) []byte {
 	return append(out, append(append([]byte{}, cues...), 0x84, 0, 0, 0, 0)...)
 }
 
+// MKVClusters is MKV with the body cut into Clusters of about clusterBytes,
+// each starting with a Timecode element (5000 ticks apart, increasing), so a
+// reader can tell where in the stream any part of the file sits.
+func MKVClusters(size, clusterBytes int) []byte {
+	head := MKV(size)
+	// The fixed part: everything before the Cluster and the 9-byte Cues.
+	const clusterHdr = 12
+	bodyAt := len(head) - 9
+	for i := 0; i+4 <= len(head); i++ {
+		if head[i] == 0x1F && head[i+1] == 0x43 && head[i+2] == 0xB6 && head[i+3] == 0x75 {
+			bodyAt = i
+			break
+		}
+	}
+	cues := head[len(head)-9:]
+	out := append([]byte{}, head[:bodyAt]...)
+	remaining := len(head) - 9 - bodyAt
+	for k := 0; remaining > 0; k++ {
+		n := min(clusterBytes, remaining)
+		if remaining-n < clusterHdr+6+7 { // never leave a tail too small for a cluster
+			n = remaining
+		}
+		inner := n - clusterHdr
+		out = append(out, 0x1F, 0x43, 0xB6, 0x75, 0x01, 0, byte(inner>>40), byte(inner>>32), byte(inner>>24), byte(inner>>16), byte(inner>>8), byte(inner))
+		tc := (k + 1) * 5000
+		out = append(out, 0xE7, 0x84, byte(tc>>24), byte(tc>>16), byte(tc>>8), byte(tc))
+		out = append(out, SimpleBlocks(inner-6)...)
+		remaining -= n
+	}
+	return append(out, cues...)
+}
+
 // AVI returns a RIFF/AVI container of size bytes: the container signature and
 // header list followed by filler.
 func AVI(size int) []byte {

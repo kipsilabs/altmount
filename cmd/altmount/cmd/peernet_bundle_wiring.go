@@ -387,7 +387,8 @@ func (b *peerOriginBinder) ImportStatus() service.BundleImportStatus {
 		rej[string(k)] = int64(v)
 	}
 	pending, stale := h.Importer().PendingStatus(context.Background())
-	return service.BundleImportStatus{Pending: int64(pending), Stale: int64(stale), Accepted: int64(c.Accepted), AlreadyImported: int64(c.AlreadyImported), Rejected: rej,
+	vu := h.Importer().VerifyUsage()
+	return service.BundleImportStatus{VerifyBytesUsed: vu.UsedBytes, VerifyBytesLimit: vu.LimitBytes, VerifyActive: int64(vu.Active), VerifyDeclined: int64(vu.Declined), Pending: int64(pending), Stale: int64(stale), Accepted: int64(c.Accepted), AlreadyImported: int64(c.AlreadyImported), Rejected: rej,
 		FullCheckPassed: int64(c.FullCheckPassed), FullCheckFailed: int64(c.FullCheckFailed),
 		Announced: int64(c.Announced), BadBundleReports: int64(c.BadBundleReports),
 		PartsHeaderBound: int64(c.PartsHeaderBound), PartsHeaderUnbound: int64(c.PartsHeaderUnbound),

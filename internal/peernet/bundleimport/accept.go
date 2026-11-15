@@ -114,6 +114,9 @@ func (i *Importer) accept(ctx context.Context, req Request) (*Result, error) {
 		return i.rejected(r, err)
 	}
 	b, loc = subset(b, loc, keep)
+	if err := checkSizeShape(b); err != nil {
+		return i.rejected(ReasonSizeImplausible, err)
+	}
 
 	paths := make([]string, len(loc.Files))
 	for n, lf := range loc.Files {
@@ -145,25 +148,27 @@ func (i *Importer) accept(ctx context.Context, req Request) (*Result, error) {
 	}
 	stage, closeStage := i.stager()
 	defer closeStage()
-	rep, r, attributable, err := i.verifyYenc(ctx, b, req.ExpectedNZBNames, stage)
+	vclass := VerifyExplicit
+	if req.Automatic {
+		vclass = VerifyAutomatic
+	}
+	rep, r, attributable, err := i.verifyYenc(WithVerifyClass(ctx, vclass), b, req.ExpectedNZBNames, stage)
 	if err != nil {
-		if attributable && i.cfg.Reporter != nil {
+		d := i.decide(ctx, req.Origin.BundleID, rejection{Reason: r, Bytes: attributable, Evidence: evidenceOf(err)})
+		if d.Attributable && i.cfg.Reporter != nil {
 			// The layout contradicts the articles themselves: the publisher
-			// served a bad bundle, which is attributable (fetch domain only).
+			// served a bad bundle, a mild strike (fetch domain only).
 			i.cfg.Reporter.ReportBadBundle(ctx, req.Origin, b.ReleaseID.String())
 			i.cnt.add(func(c *counters) { c.reports++ })
 		}
-		if attributable {
+		if d.Blacklist {
 			i.noteFailedBundle(ctx, req.Origin.BundleID, b.ReleaseID.String())
 		}
 		return i.rejected(r, err)
 	}
 	res.Cost = Cost{Articles: rep.articles, Bytes: rep.bytes, ExtentsBound: rep.bound, ExtentsUnbound: rep.checked - rep.bound,
 		PartsBound: rep.partsBound, PartsUnbound: rep.partsUnbound}
-	if r, err := i.probeMedia(ctx, loc, stage, needsStructure(rep, b)); err != nil {
-		if r == ReasonMediaInvalid || r == ReasonStructureInvalid {
-			i.noteFailedBundle(ctx, req.Origin.BundleID, b.ReleaseID.String())
-		}
+	if r, err := i.probeMedia(ctx, b, loc, stage, needsStructure(rep, b), rep.bud); err != nil {
 		return i.rejected(r, err)
 	}
 
@@ -350,7 +355,7 @@ func (i *Importer) stager() (stageFunc, func()) {
 // stack, in a hidden staging area that is removed on every outcome. strong
 // names the files whose archive extents could not be bound to an archive
 // header: their container must have a real structural check.
-func (i *Importer) probeMedia(ctx context.Context, loc *bundle.Local, stage stageFunc, strong map[string]string) (Reason, error) {
+func (i *Importer) probeMedia(ctx context.Context, b *bundle.Bundle, loc *bundle.Local, stage stageFunc, strong map[string]string, bud *costBudget) (Reason, error) {
 	var media []bundle.LocalFile
 	for _, lf := range loc.Files {
 		if fileinfo.IsVerifiableMediaFile(lf.Name) {
@@ -384,6 +389,9 @@ func (i *Importer) probeMedia(ctx context.Context, loc *bundle.Local, stage stag
 				err = fmt.Errorf("%w (its archive extents could not be checked: %s)", err, why)
 			}
 			return structureReason(err), fmt.Errorf("%s: %w", lf.Name, err)
+		}
+		if r, err := i.verifyPayloadOrder(ctx, st, b, lf.Name, lf.Meta.FileSize, bud); err != nil {
+			return r, err
 		}
 	}
 	return "", nil
@@ -432,6 +440,11 @@ func (i *Importer) write(ctx context.Context, b *bundle.Bundle, loc *bundle.Loca
 	}
 	if req.Origin.BundleID != "" {
 		if err := i.cfg.State.SetBundleID(ctx, res.Paths, req.Origin.BundleID); err != nil {
+			return err
+		}
+	}
+	for n := range b.Files { // the exact boundaries verified above, for the forced full check
+		if err := i.cfg.State.SetParts(ctx, res.Paths[n], b.Files[n].Parts); err != nil {
 			return err
 		}
 	}

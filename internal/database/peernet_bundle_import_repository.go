@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -79,7 +80,7 @@ func (r *PeernetBundleImportRepository) Upsert(ctx context.Context, rows []Peern
 			ON CONFLICT(file_path) DO UPDATE SET file_id = excluded.file_id, release_id = excluded.release_id,
 			  network_id = excluded.network_id, publisher_id = excluded.publisher_id, queue_id = excluded.queue_id,
 			  state = 'pending', arr_owed = excluded.arr_owed, arr_notified = 0, category = excluded.category,
-			  target_path = excluded.target_path, resulting_path = excluded.resulting_path, committed = 0, updated_at = excluded.updated_at`,
+			  target_path = excluded.target_path, resulting_path = excluded.resulting_path, committed = 0, parts = NULL, updated_at = excluded.updated_at`,
 			p, row.FileID, row.ReleaseID, row.NetworkID, row.PublisherID, row.QueueID, b2i(row.ArrOwed),
 			row.Category, row.TargetPath, row.ResultingPath, now, now)
 		if err != nil {
@@ -587,6 +588,48 @@ func (r *PeernetBundleImportRepository) BundleIDOf(ctx context.Context, filePath
 		return "", fmt.Errorf("peernet bundle import: bundle id: %w", err)
 	}
 	return id, nil
+}
+
+// SetParts records the exact part list verified at accept for one file: the
+// segment count of each part. nil or empty means one posted file (no parts).
+func (r *PeernetBundleImportRepository) SetParts(ctx context.Context, filePath string, parts []int) error {
+	strs := make([]string, len(parts))
+	for i, n := range parts {
+		strs[i] = strconv.Itoa(n)
+	}
+	if _, err := r.db.ExecContext(ctx, `UPDATE peernet_bundle_imports SET parts = ? WHERE file_path = ?`,
+		strings.Join(strs, ","), normalizeHealthPath(filePath)); err != nil {
+		return fmt.Errorf("peernet bundle import: set parts: %w", err)
+	}
+	return nil
+}
+
+// PartsOf returns the part list recorded for a file. known is false when no
+// part list was recorded (a row from before the column existed, or no row); an
+// empty list with known true means one posted file.
+func (r *PeernetBundleImportRepository) PartsOf(ctx context.Context, filePath string) (parts []int, known bool, err error) {
+	var raw sql.NullString
+	err = r.db.QueryRowContext(ctx, `SELECT parts FROM peernet_bundle_imports WHERE file_path = ?`, normalizeHealthPath(filePath)).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("peernet bundle import: parts: %w", err)
+	}
+	if !raw.Valid {
+		return nil, false, nil
+	}
+	if raw.String == "" {
+		return nil, true, nil
+	}
+	for _, f := range strings.Split(raw.String, ",") {
+		n, perr := strconv.Atoi(f)
+		if perr != nil || n < 1 {
+			return nil, false, nil // damaged: no boundary knowledge
+		}
+		parts = append(parts, n)
+	}
+	return parts, true, nil
 }
 
 // maxFailedBundles bounds the negative cache: the oldest entries go first.

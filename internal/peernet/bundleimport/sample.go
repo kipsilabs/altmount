@@ -31,15 +31,23 @@ type YencHeader struct {
 	// part reads its volume's first article from here instead of fetching it a
 	// second time.
 	Prefix []byte
+	// Bytes is how many decoded bytes the read really delivered (what the
+	// download cost), whatever the headers claim; 0 when the reader did not
+	// count.
+	Bytes int64
 }
 
 // headerPrefixCap is how much of an article the header reader keeps.
 const headerPrefixCap = 64 << 10
 
 // prefixWriter keeps the first headerPrefixCap bytes written and drops the rest.
-type prefixWriter struct{ buf []byte }
+type prefixWriter struct {
+	buf []byte
+	n   int64
+}
 
 func (w *prefixWriter) Write(p []byte) (int, error) {
+	w.n += int64(len(p))
 	if room := headerPrefixCap - len(w.buf); room > 0 {
 		w.buf = append(w.buf, p[:min(room, len(p))]...)
 	}
@@ -55,8 +63,12 @@ type SegmentHeaders interface {
 type poolHeaders struct{ p pool.Manager }
 
 // NewPoolHeaderReader reads headers through the connection pool. The pool
-// cannot stop after the headers, so a read costs the whole article (about
-// 0.75 MB); the sample count and bytes are therefore bounded by Policy.
+// cannot stop after the headers: a writer that fails early leaves the rest of the
+// body on the wire (the next reply on that connection then desynchronises), and
+// cancelling the request makes the connection drain the whole body anyway (it
+// only drops the connection when more than 1 MiB remains, which an article of
+// about 0.75 MB never does). A read therefore costs the whole article; the sample
+// count and bytes are bounded by Policy and charged as actually delivered.
 func NewPoolHeaderReader(p pool.Manager) SegmentHeaders { return poolHeaders{p: p} }
 
 func (h poolHeaders) SegmentHeader(ctx context.Context, id string) (YencHeader, error) {
@@ -64,12 +76,20 @@ func (h poolHeaders) SegmentHeader(ctx context.Context, id string) (YencHeader, 
 	if err != nil {
 		return YencHeader{}, err
 	}
+	// A token of the pool-wide import budget first, as the importer does for every
+	// body it fetches, so reading headers never takes more connections than an
+	// import would and shrinks while streams are being played.
+	release, err := h.p.AcquireImportConnection(ctx)
+	if err != nil {
+		return YencHeader{}, err
+	}
+	defer release()
 	w := &prefixWriter{}
 	body, err := cli.Fetch(ctx, nntppool.Req{MessageID: id, Writer: w})
 	if err != nil {
 		return YencHeader{}, err
 	}
-	return YencHeader{Name: body.YEnc.FileName, PartBegin: body.YEnc.PartBegin, PartSize: body.YEnc.PartSize, FileSize: body.YEnc.FileSize, Prefix: w.buf}, nil
+	return YencHeader{Name: body.YEnc.FileName, PartBegin: body.YEnc.PartBegin, PartSize: body.YEnc.PartSize, FileSize: body.YEnc.FileSize, Prefix: w.buf, Bytes: w.n}, nil
 }
 
 // sampleTable is one segment table read as a whole file or archive volume.
@@ -208,6 +228,12 @@ func shuffle[T any](s []T) {
 		s[i], s[j] = s[j], s[i]
 	}
 }
+
+// sampleConcurrency is how many article reads of one sampling run may be in
+// flight. The pool reader takes a token of the import connection budget for each,
+// so the width that really runs is what that budget allows (it shrinks while
+// streams play), never more than the importer itself would use.
+const sampleConcurrency = 16
 
 // errTooManyTables means the mandatory samples do not fit the absolute ceiling.
 var errTooManyTables = errors.New("more segment tables than the sampling budget covers")
@@ -414,12 +440,16 @@ func (i *Importer) verifyYenc(ctx context.Context, b *bundle.Bundle, names []str
 			errTooManyTables, len(tables), len(must), mustBytes, reserve, limit, ceiling)
 	}
 	bud := newCostBudget(max(yencCap(releaseBytes(tables), ceiling), mustBytes+reserve))
-	_ = bud.chargeMany(mustBytes, len(must))
-	defer func() { rep.articles, rep.bytes = bud.articles(), bud.spent() }()
+	defer func() { rep.articles, rep.bytes, rep.bud = bud.articles(), bud.spent(), bud }()
+	lease, lerr := i.cfg.Verify.Begin(verifyClassOf(ctx), bud.limit)
+	if lerr != nil {
+		return rep, ReasonVerifyBudget, false, lerr
+	}
+	defer func() { lease.End(bud.spent()) }()
 	ctx, cancel := context.WithTimeout(ctx, i.cfg.Policy.YencTimeoutOrDefault())
 	defer cancel()
 	rel := newRelState()
-	if reason, attributable, err := judge(i.runSamples(ctx, tables, must, rel)); err != nil {
+	if reason, attributable, err := judge(i.runSamplesBudget(ctx, tables, must, rel, bud)); err != nil {
 		return rep, reason, attributable, err
 	}
 	if len(picks) > 0 || len(partPicks) > 0 {
@@ -437,10 +467,7 @@ func (i *Importer) verifyYenc(ctx context.Context, b *bundle.Bundle, names []str
 		}
 	}
 	optional := planOptional(tables, must, limit-len(must), bud.left())
-	for _, s := range optional {
-		_ = bud.charge(tables[s.table].sizes[s.pos])
-	}
-	reason, attributable, err = judge(i.runSamples(ctx, tables, optional, rel))
+	reason, attributable, err = judge(i.runSamplesBudget(ctx, tables, optional, rel, bud))
 	return rep, reason, attributable, err
 }
 
@@ -477,6 +504,7 @@ type sampleVerdict struct {
 // first article begins in the posted file (every sample implies it) and the
 // posted file's total size. Every sample of one part must agree.
 type relState struct {
+	mu    sync.Mutex
 	base  map[int]int64
 	total map[int]int64
 	// first is the 0-based offset of article 0 of a table, when it was sampled.
@@ -492,73 +520,131 @@ func newRelState() *relState {
 		name: map[int]string{}, prefix: map[int][]byte{}}
 }
 
-// judgeRelative compares the samples of every relative part with each other.
-func (st *relState) judge(tables []sampleTable, plan []sample, res []sampleVerdict) {
-	for k, s := range plan {
-		t := &tables[s.table]
-		if !res[k].ok || res[k].reason != "" {
-			continue
-		}
-		h := res[k].hdr
-		if s.pos == 0 {
-			st.first[s.table] = h.PartBegin
-			if t.part {
-				st.name[s.table], st.prefix[s.table] = h.Name, h.Prefix
-			}
-		}
-		if !t.rel {
-			continue
-		}
-		base := h.PartBegin - t.prefix[s.pos]
-		bad := base < 0 || base+t.total > h.FileSize
-		if b0, ok := st.base[s.table]; ok && (b0 != base || st.total[s.table] != h.FileSize) {
-			bad = true
-		}
-		if bad {
-			res[k] = sampleVerdict{reason: ReasonYencMismatch, attributable: true, err: fmt.Errorf("%s: article %d begins at %d of %d, which does not fit the other articles of the part (%d bytes in the layout)",
-				t.name, s.pos, h.PartBegin, h.FileSize, t.total)}
-			continue
-		}
-		st.base[s.table], st.total[s.table] = base, h.FileSize
+// judgeOne compares one sample with what the earlier samples of its part said.
+func (st *relState) judgeOne(t *sampleTable, s sample, v *sampleVerdict) {
+	if !v.ok || v.reason != "" {
+		return
 	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	h := v.hdr
+	if s.pos == 0 {
+		st.first[s.table] = h.PartBegin
+		if t.part {
+			st.name[s.table], st.prefix[s.table] = h.Name, h.Prefix
+		}
+	}
+	if !t.rel {
+		return
+	}
+	base := h.PartBegin - t.prefix[s.pos]
+	bad := base < 0 || base+t.total > h.FileSize
+	if b0, ok := st.base[s.table]; ok && (b0 != base || st.total[s.table] != h.FileSize) {
+		bad = true
+	}
+	if bad {
+		*v = sampleVerdict{reason: ReasonYencMismatch, attributable: true, err: evidenceError{fmt.Errorf("%s: article %d begins at %d of %d, which does not fit the other articles of the part (%d bytes in the layout)",
+			t.name, s.pos, h.PartBegin, h.FileSize, t.total), fmt.Sprintf("part:%x", t.key[:8])}}
+		return
+	}
+	st.base[s.table], st.total[s.table] = base, h.FileSize
 }
 
-// runSamples reads the planned articles' headers (four at a time) and compares
-// each with the layout of its table.
+// runSamples reads the planned articles' headers with a budget of its own (the
+// forced full check's sample: fullCheckHeaderBytes of really delivered bytes).
 func (i *Importer) runSamples(ctx context.Context, tables []sampleTable, plan []sample, rel *relState) []sampleVerdict {
+	bud := newCostBudget(fullCheckHeaderBytes)
+	defer func() { i.verifyDebit(bud.spent()) }()
+	return i.runSamplesBudget(ctx, tables, plan, rel, bud)
+}
+
+// runSamplesBudget reads the planned articles' headers (sampleConcurrency at a
+// time) and compares each with the layout of its table as soon as it arrives.
+// What each read really delivered is charged to bud. The first contradiction, or
+// a budget spent by articles larger than declared (which contradicts the
+// layout's sizes), ends the run: samples not yet started are never fetched.
+func (i *Importer) runSamplesBudget(ctx context.Context, tables []sampleTable, plan []sample, rel *relState, bud *costBudget) []sampleVerdict {
 	results := make([]sampleVerdict, len(plan))
+	ctx, stop := context.WithCancel(ctx)
+	defer stop()
+	if rel == nil {
+		rel = newRelState()
+	}
+	ran := make([]bool, len(plan))
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, 4)
+	sem := make(chan struct{}, sampleConcurrency)
 	for k, s := range plan {
-		wg.Add(1)
 		sem <- struct{}{}
+		if ctx.Err() != nil {
+			<-sem
+			break
+		}
+		ran[k] = true
+		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			t := tables[s.table]
-			h, err := i.cfg.Headers.SegmentHeader(ctx, t.ids[s.pos])
-			switch {
-			case errors.Is(err, nntppool.ErrArticleNotFound):
-				results[k] = sampleVerdict{reason: ReasonProbeMissing, err: fmt.Errorf("%s: article %d is missing", t.name, s.pos)}
-			case err != nil && !s.must && (errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)):
-				// An optional sample that ran out of time is dropped, not a failure.
-			case err != nil:
-				results[k] = sampleVerdict{reason: ReasonProbeInconclusive, err: fmt.Errorf("%s: %w", t.name, err)}
-			case t.rel && h.PartSize != t.sizes[s.pos]:
-				results[k] = sampleVerdict{reason: ReasonYencMismatch, attributable: true, err: fmt.Errorf("%s: article %d says part %d, layout says %d", t.name, s.pos, h.PartSize, t.sizes[s.pos])}
-			case !t.rel && (h.PartSize != t.sizes[s.pos] || h.PartBegin != t.prefix[s.pos] || h.FileSize != t.total):
-				results[k] = sampleVerdict{reason: ReasonYencMismatch, attributable: true, err: fmt.Errorf("%s: article %d says part %d at %d of %d, layout says %d at %d of %d",
-					t.name, s.pos, h.PartSize, h.PartBegin, h.FileSize, t.sizes[s.pos], t.prefix[s.pos], t.total)}
-			case s.pos == 0 && t.nzbName != "" && h.Name != "" && !strings.EqualFold(h.Name, t.nzbName):
-				results[k] = sampleVerdict{reason: ReasonYencMismatch, err: fmt.Errorf("%s: first article is named %q, your NZB names this entry %q", t.name, h.Name, t.nzbName)}
-			default:
-				results[k] = sampleVerdict{hdr: h, ok: true}
+			results[k] = i.readSample(ctx, tables[s.table], s, bud)
+			rel.judgeOne(&tables[s.table], s, &results[k])
+			if results[k].reason == ReasonYencMismatch {
+				stop()
 			}
 		}()
 	}
 	wg.Wait()
-	if rel != nil {
-		rel.judge(tables, plan, results)
+	for k, s := range plan {
+		if !ran[k] && s.must {
+			// Never started: the run was cut (the contradiction that cut it
+			// outranks this) or its time ran out, which a mandatory sample must
+			// not pass as an answer.
+			results[k] = sampleVerdict{reason: ReasonProbeInconclusive, err: fmt.Errorf("%s: article %d was not read: %w", tables[s.table].name, s.pos, context.Cause(ctx))}
+		}
 	}
 	return results
+}
+
+// evidenceError marks an error with what identifies the contradicting piece of
+// evidence (an article's message-ID, or a part's table for a disagreement among
+// its articles, so one corrupt article is never counted as two).
+type evidenceError struct {
+	error
+	id string
+}
+
+func (e evidenceError) Unwrap() error { return e.error }
+
+// evidenceOf returns the evidence key of err, falling back to its text.
+func evidenceOf(err error) string {
+	var ee evidenceError
+	if errors.As(err, &ee) {
+		return ee.id
+	}
+	return err.Error()
+}
+
+// readSample reads one article's header and judges it against its table.
+func (i *Importer) readSample(ctx context.Context, t sampleTable, s sample, bud *costBudget) sampleVerdict {
+	h, err := i.cfg.Headers.SegmentHeader(ctx, t.ids[s.pos])
+	if err == nil {
+		if cerr := bud.chargeActual(h.Bytes); cerr != nil {
+			return sampleVerdict{reason: ReasonYencMismatch, attributable: true, err: evidenceError{fmt.Errorf("%s: article %d delivered %d bytes, the layout declares %d, and the reads so far used up the verification budget", t.name, s.pos, h.Bytes, t.sizes[s.pos]), t.ids[s.pos]}}
+		}
+	}
+	switch {
+	case errors.Is(err, nntppool.ErrArticleNotFound):
+		return sampleVerdict{reason: ReasonProbeMissing, err: fmt.Errorf("%s: article %d is missing", t.name, s.pos)}
+	case err != nil && !s.must && (errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)):
+		// An optional sample that ran out of time is dropped, not a failure.
+		return sampleVerdict{}
+	case err != nil:
+		return sampleVerdict{reason: ReasonProbeInconclusive, err: fmt.Errorf("%s: %w", t.name, err)}
+	case t.rel && h.PartSize != t.sizes[s.pos]:
+		return sampleVerdict{reason: ReasonYencMismatch, attributable: true, err: evidenceError{fmt.Errorf("%s: article %d says part %d, layout says %d", t.name, s.pos, h.PartSize, t.sizes[s.pos]), t.ids[s.pos]}}
+	case !t.rel && (h.PartSize != t.sizes[s.pos] || h.PartBegin != t.prefix[s.pos] || h.FileSize != t.total):
+		return sampleVerdict{reason: ReasonYencMismatch, attributable: true, err: evidenceError{fmt.Errorf("%s: article %d says part %d at %d of %d, layout says %d at %d of %d",
+			t.name, s.pos, h.PartSize, h.PartBegin, h.FileSize, t.sizes[s.pos], t.prefix[s.pos], t.total), t.ids[s.pos]}}
+	case s.pos == 0 && t.nzbName != "" && h.Name != "" && !strings.EqualFold(h.Name, t.nzbName):
+		return sampleVerdict{reason: ReasonYencMismatch, err: fmt.Errorf("%s: first article is named %q, your NZB names this entry %q", t.name, h.Name, t.nzbName)}
+	}
+	return sampleVerdict{hdr: h, ok: true}
 }

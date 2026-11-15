@@ -107,7 +107,19 @@ func TestNegativeCache_AcceptTimeContradictionAndFullCheckMismatchAreReported(t 
 	req.Origin.BundleID = bid
 	_, err := e.imp.Accept(context.Background(), req)
 	require.Error(t, err)
-	assert.Equal(t, []string{bid + "/" + b.ReleaseID.String()}, e.rep.failedBundles)
+	assert.Len(t, e.rep.got, 1, "the publisher takes the mild strike")
+	assert.Empty(t, e.rep.failedBundles, "one contradicting article is not enough to blacklist the layout")
+	// A second, different contradicting article blacklists it.
+	beh2 := e.fp.BehaviorFor(b.Pool[2])
+	beh2.YEnc.PartSize++
+	e.fp.SetBehavior(b.Pool[2], beh2)
+	e.fp.SetBehavior(b.Pool[1], e.fp.BehaviorFor(b.Pool[1]))
+	beh = e.fp.BehaviorFor(b.Pool[1])
+	beh.YEnc.PartSize--
+	e.fp.SetBehavior(b.Pool[1], beh)
+	_, err = e.imp.Accept(context.Background(), req)
+	require.Error(t, err)
+	assert.Equal(t, []string{bid + "/" + b.ReleaseID.String()}, e.rep.failedBundles, "two different articles contradict it")
 
 	e2 := newEnv(t)
 	b2, res := e2.accept("nc2", mkvSpec("a.mkv"))
@@ -118,7 +130,8 @@ func TestNegativeCache_AcceptTimeContradictionAndFullCheckMismatchAreReported(t 
 	e2.fp.SetBehavior(b2.Pool[2], beh)
 	require.Error(t, e2.imp.VerifyPeerHeaders(context.Background(), res.Paths[0]))
 	e2.imp.FullCheckFailed(context.Background(), res.Paths[0])
-	assert.Equal(t, []string{bid + "/" + b2.ReleaseID.String()}, e2.rep.failedBundles)
+	assert.Len(t, e2.rep.got, 1, "the publisher takes the mild strike")
+	assert.Empty(t, e2.rep.failedBundles, "one contradicting article does not blacklist the layout")
 
 	// A missing-only failure does not blacklist the layout.
 	e3 := newEnv(t)

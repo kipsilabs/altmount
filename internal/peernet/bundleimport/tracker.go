@@ -181,10 +181,13 @@ func (i *Importer) FullCheckFailed(ctx context.Context, filePath string) {
 	// (VerifyPeerHeaders) is the publisher's doing. A missing article shortly
 	// after posting can be propagation, and a degraded or unreadable file says
 	// nothing about the publisher, so none of those is reported.
-	if i.cfg.Reporter == nil || !i.takeMismatch(row.FilePath) {
+	detail, mismatched := i.takeMismatch(row.FilePath)
+	if i.cfg.Reporter == nil || !mismatched {
 		return
 	}
-	i.noteFailedBundle(ctx, bundleID, row.ReleaseID)
+	if i.decide(ctx, bundleID, rejection{Reason: ReasonYencMismatch, Bytes: true, Evidence: detail}).Blacklist {
+		i.noteFailedBundle(ctx, bundleID, row.ReleaseID)
+	}
 	i.reportedMu.Lock()
 	first := i.reported == nil || !i.reported[row.ReleaseID+"/"+row.PublisherID]
 	if i.reported == nil || len(i.reported) >= maxReported {

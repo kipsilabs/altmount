@@ -11,6 +11,7 @@ import {
 	levelNeedsConfirmation,
 	libraryShareLine,
 	notShareableLabel,
+	openNetworkProxyNote,
 	peerBadge,
 	publishedTotal,
 	rejectionLabel,
@@ -21,6 +22,7 @@ import {
 	showPublishingDetails,
 	showSharedData,
 	skipLabel,
+	verifyBudgetLine,
 } from "../src/components/config/peernet/peernetStats";
 import {
 	EXPOSURE_LEVELS,
@@ -145,6 +147,7 @@ const BACKEND_IMPORT_REJECT_KEYS = [
 	"extent_unverifiable",
 	"part_order",
 	"too_many_tables",
+	"verify_budget",
 ];
 
 describe("bundle reason coverage", () => {
@@ -458,5 +461,45 @@ describe("headerBindingLine", () => {
 		).toBe(
 			"Archive header checks: 3 parts tied to their archive header, 1 not tied; 2 nested extents tied, 0 not tied.",
 		);
+	});
+});
+
+describe("verifyBudgetLine", () => {
+	test("says nothing while the backend reports no limit", () => {
+		expect(verifyBudgetLine(undefined)).toBeNull();
+		expect(verifyBudgetLine({ verify_bytes_used: 5 })).toBeNull();
+	});
+
+	test("reports the bytes read this hour against the limit", () => {
+		expect(
+			verifyBudgetLine({ verify_bytes_used: 1.5 * 1024 ** 3, verify_bytes_limit: 8 * 1024 ** 3 }),
+		).toBe("Peer layout checks this hour: 1.5 GiB of 8.0 GiB read.");
+		expect(
+			verifyBudgetLine({
+				verify_bytes_used: 300 * 1024 ** 2,
+				verify_bytes_limit: 8 * 1024 ** 3,
+				verify_declined: 2,
+			}),
+		).toBe("Peer layout checks this hour: 300 MiB of 8.0 GiB read. 2 skipped for lack of budget.");
+	});
+
+	test("never shows more used than the limit", () => {
+		expect(
+			verifyBudgetLine({ verify_bytes_used: 9 * 1024 ** 3, verify_bytes_limit: 8 * 1024 ** 3 }),
+		).toBe("Peer layout checks this hour: 8.0 GiB of 8.0 GiB read.");
+	});
+});
+
+describe("openNetworkProxyNote", () => {
+	test("says nothing without a proxy", () => {
+		expect(openNetworkProxyNote(undefined)).toBeNull();
+		expect(openNetworkProxyNote({})).toBeNull();
+		expect(openNetworkProxyNote({ outbound_proxy: false })).toBeNull();
+	});
+
+	test("explains that open-network layouts cannot be used behind a proxy", () => {
+		const note = openNetworkProxyNote({ outbound_proxy: true });
+		expect(note).toContain("outbound proxy");
+		expect(note).toContain("will not be used");
 	});
 });

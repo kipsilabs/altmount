@@ -61,6 +61,7 @@ type Processor struct {
 	pwRecorder        atomic.Pointer[nzbPasswordHolder]  // optional; nil unless the peer network is on
 	peerItems         sync.Map                           // queue id -> peerItemInfo
 	peerSkipOnce      sync.Map                           // queue id -> {}: skip the peer fast path once
+	peerSkipStore     atomic.Pointer[PeerSkipStore]      // the persisted form of that mark
 
 	// Pre-compiled regex patterns for RAR file sorting
 	rarPartPattern  *regexp.Regexp // pattern.part###.rar

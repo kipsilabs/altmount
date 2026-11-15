@@ -21,9 +21,39 @@ import (
 // import.
 const DefaultFastPathFetchTimeout = 5 * time.Second
 
-// DefaultFastPathAcceptTimeout is how long verifying a fetched layout may take
-// before the fast path gives up and the NZB is imported normally.
+// DefaultFastPathAcceptTimeout is how long verifying a fetched layout of a plain
+// file may take before the fast path gives up and the NZB is imported normally.
+// A layout of many archive volumes gets more (AcceptWindow).
 const DefaultFastPathAcceptTimeout = 15 * time.Second
+
+const (
+	// FastPathPerPartAllowance is the time added for every archive volume (part
+	// or nested volume) of the offered layout. Verifying a volume reads about
+	// two articles of it (its first and its last), the same order of work as the
+	// normal import's archive analysis, which reads the first articles of every
+	// volume; 250 ms a volume is several times what that costs at the pool's
+	// import width, so the fast path stays a saving and does not become a
+	// slower second import.
+	FastPathPerPartAllowance = 250 * time.Millisecond
+	// MaxFastPathAcceptTimeout is the hard ceiling of the window.
+	MaxFastPathAcceptTimeout = 150 * time.Second
+)
+
+// AcceptWindow is the time the fast path gives the verification of a layout of
+// the given number of archive volumes: the base window plus an allowance per
+// volume, up to the ceiling.
+func AcceptWindow(volumes int) time.Duration {
+	return min(DefaultFastPathAcceptTimeout+time.Duration(max(volumes, 0))*FastPathPerPartAllowance, MaxFastPathAcceptTimeout)
+}
+
+// volumesOf counts the archive volumes a layout reads through.
+func volumesOf(b *bundle.Bundle) int {
+	n := 0
+	for i := range b.Files {
+		n += len(b.Files[i].Parts) + len(b.Files[i].Outer)
+	}
+	return n
+}
 
 // minOpenCorroborators is how many distinct network ranges must announce the
 // same Bundle ID before an open-network layout may replace archive analysis.
@@ -55,8 +85,8 @@ type FastPathConfig struct {
 	AnyOffers func(ctx context.Context) bool
 	// AcceptTimeout bounds the accept pipeline of the fast path (release probe,
 	// sampled header reads, media structure check). A layout that cannot be
-	// verified in time is declined and the normal import runs (zero:
-	// DefaultFastPathAcceptTimeout).
+	// verified in time is declined and the normal import runs. Zero: the window
+	// grows with the volumes of the offered layout (AcceptWindow).
 	AcceptTimeout time.Duration
 	// FetchTimeout bounds the fetch (zero: DefaultFastPathFetchTimeout).
 	FetchTimeout time.Duration
@@ -72,9 +102,6 @@ func NewPeerBundleFastPath(cfg FastPathConfig) importer.PeerBundleFastPath {
 	}
 	if cfg.FetchTimeout <= 0 {
 		cfg.FetchTimeout = DefaultFastPathFetchTimeout
-	}
-	if cfg.AcceptTimeout <= 0 {
-		cfg.AcceptTimeout = DefaultFastPathAcceptTimeout
 	}
 	return &fastPath{cfg: cfg}
 }
@@ -146,10 +173,14 @@ func (f *fastPath) TryBundle(ctx context.Context, req importer.PeerBundleRequest
 	if origin.Open && (f.cfg.OpenFastPath == nil || !f.cfg.OpenFastPath() || origin.Corroborators < minOpenCorroborators) {
 		return importer.PeerBundleOutcome{}, false
 	}
-	acceptCtx, cancelAccept := context.WithTimeout(ctx, f.cfg.AcceptTimeout)
+	window := f.cfg.AcceptTimeout
+	if window <= 0 {
+		window = AcceptWindow(volumesOf(b))
+	}
+	acceptCtx, cancelAccept := context.WithTimeout(ctx, window)
 	defer cancelAccept()
 	res, err := f.cfg.Acceptor.Accept(acceptCtx, bundleimport.Request{
-		Bundle: b, Origin: origin, ExpectedNZB: canonicalIDs(req.NZB), ExpectedNZBSizes: encodedSizes(req.NZB), ExpectedNZBNames: subjectNames(req.NZB),
+		Bundle: b, Origin: origin, ExpectedNZB: canonicalIDs(req.NZB), ExpectedNZBSizes: encodedSizes(req.NZB), ExpectedNZBNames: subjectNames(req.NZB), Automatic: true,
 		Target: bundleimport.Target{Dir: req.TargetDir, Category: req.Category, QueueID: int64(req.QueueID),
 			TargetPath: req.TargetPath, SkipArr: req.SkipArr},
 	})

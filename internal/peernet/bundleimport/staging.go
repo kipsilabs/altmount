@@ -53,6 +53,7 @@ type fsStaging struct {
 	dir string
 	ms  *metadata.MetadataService
 	fs  *nzbfilesystem.NzbFilesystem
+	cnt *countingManager
 }
 
 // NewStaging creates a fresh, empty staging area.
@@ -72,8 +73,9 @@ func (s *FSStager) NewStaging() (Staging, error) {
 		return nil, fmt.Errorf("bundleimport: create staging area: %w", err)
 	}
 	ms := metadata.NewMetadataService(dir)
-	remote := nzbfilesystem.NewMetadataRemoteFile(ms, nil, nil, nil, s.deps.Pool, s.deps.Config, noopTracker{}, s.deps.Cache)
-	return &fsStaging{dir: dir, ms: ms, fs: nzbfilesystem.NewNzbFilesystem(remote)}, nil
+	cnt := newCountingManager(s.deps.Pool)
+	remote := nzbfilesystem.NewMetadataRemoteFile(ms, nil, nil, nil, cnt, s.deps.Config, noopTracker{}, s.deps.Cache)
+	return &fsStaging{dir: dir, ms: ms, fs: nzbfilesystem.NewNzbFilesystem(remote), cnt: cnt}, nil
 }
 
 func (s *fsStaging) WriteFileMetadata(virtualPath string, m *metapb.FileMetadata) error {
@@ -81,5 +83,8 @@ func (s *fsStaging) WriteFileMetadata(virtualPath string, m *metapb.FileMetadata
 }
 
 func (s *fsStaging) Opener() contentverify.Opener { return s.fs }
+
+// Downloaded is how many decoded bytes the staged reads have really fetched.
+func (s *fsStaging) Downloaded() int64 { return s.cnt.Downloaded() }
 
 func (s *fsStaging) Close() error { return os.RemoveAll(s.dir) }

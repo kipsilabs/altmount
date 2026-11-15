@@ -170,6 +170,8 @@ type State interface {
 	OrphanedHolds(ctx context.Context) ([]int64, error)
 	SetBundleID(ctx context.Context, paths []string, bundleID string) error
 	BundleIDOf(ctx context.Context, filePath string) (string, error)
+	SetParts(ctx context.Context, filePath string, parts []int) error
+	PartsOf(ctx context.Context, filePath string) (parts []int, known bool, err error)
 	SettledHolds(ctx context.Context) ([]int64, error)
 }
 
@@ -275,6 +277,10 @@ const (
 	// ReasonTooManyTables: the layout has more segment tables than the yEnc
 	// sampling budget can cover at the minimum rate.
 	ReasonTooManyTables Reason = "too_many_tables"
+	// ReasonVerifyBudget: the node-wide verification budget (bytes per hour,
+	// concurrent accepts) has no room. Local and not attributable: the bundle
+	// was not looked at.
+	ReasonVerifyBudget Reason = "verify_budget"
 )
 
 // RejectError is the typed rejection Accept returns.
@@ -340,10 +346,10 @@ func DefaultPolicy() Policy {
 		MaxFiles:          2_000,
 		MaxMediaProbes:    4,
 		MediaProbeTimeout: 30 * time.Second,
-		AcceptTimeout:     2 * time.Minute,
-		MaxYencSamples:    2000,
-		MaxYencBytes:      1 << 30,
-		YencTimeout:       90 * time.Second,
+		AcceptTimeout:     3 * time.Minute,
+		MaxYencSamples:    3000,
+		MaxYencBytes:      2 << 30,
+		YencTimeout:       150 * time.Second,
 		MaxMediaFiles:     40,
 		MaxSidecars:       50,
 		MaxSubtitleBytes:  16 << 20,
@@ -407,6 +413,10 @@ type Request struct {
 	// article of a table must carry the same yEnc name as its NZB entry, which
 	// binds the table to that entry.
 	ExpectedNZBNames []string
+	// Automatic marks an attempt the importer makes on its own (the fast path,
+	// which falls back to a normal import when declined). It draws on a smaller
+	// share of the node-wide verification budget than an explicit request.
+	Automatic bool
 }
 
 // Result describes an accepted bundle.
@@ -525,7 +535,7 @@ type FetchRefunder interface {
 func localPolicyReason(r Reason) bool {
 	switch r {
 	case ReasonTooLarge, ReasonTooManyFiles, ReasonForbiddenFile, ReasonSidecarTooLarge, ReasonNoMediaFile,
-		ReasonHealthDisabled, ReasonBadTarget, ReasonCollision, ReasonNZBMismatch:
+		ReasonHealthDisabled, ReasonBadTarget, ReasonCollision, ReasonNZBMismatch, ReasonVerifyBudget:
 		return true
 	}
 	return false

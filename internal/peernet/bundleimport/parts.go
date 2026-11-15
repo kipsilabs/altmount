@@ -134,16 +134,21 @@ func pickParts(b *bundle.Bundle) []partRef {
 }
 
 // partReserve is what the header checks of the picked parts may cost beyond the
-// samples: one article each, for a header reader that did not keep the first
-// article (the common case costs nothing: the sampled article is reused).
+// samples. The first article of every part is a mandatory sample whose decoded
+// prefix the header walk reuses, so the walk costs nothing extra in the common
+// case (headers inside the first 64 KiB); the reservation is a few articles, for
+// a header that runs past the prefix, not one per part.
 func partReserve(b *bundle.Bundle, picks []partRef) int64 {
-	var n int64
+	var biggest int64
 	for _, r := range picks {
-		first := partsOfSliced(&b.Files[r.file])[r.part][0]
-		n += first.Size
+		biggest = max(biggest, partsOfSliced(&b.Files[r.file])[r.part][0].Size)
 	}
-	return n
+	return partWalkReserveArticles * biggest
 }
+
+// partWalkReserveArticles is how many articles of the largest first-article
+// size the header walks of all parts together may read beyond the samples.
+const partWalkReserveArticles = 4
 
 // markNeed0 makes the first article of every part a mandatory sample: the
 // header binding needs where it begins and the order binding needs its name.
@@ -243,6 +248,9 @@ func (i *Importer) verifyParts(ctx context.Context, b *bundle.Bundle, tables []s
 	}
 	for _, w := range work {
 		f := &b.Files[w.ref.file]
+		if errors.Is(w.err, errOverrun) {
+			return ReasonYencMismatch, false, fmt.Errorf("%s (part %d): %w", f.Name, w.ref.part+1, w.err)
+		}
 		if w.err != nil {
 			if reason, hard := readFailure(w.err); hard {
 				return reason, false, fmt.Errorf("%s (part %d): %w", f.Name, w.ref.part+1, w.err)
@@ -357,7 +365,7 @@ func (i *Importer) placePart(ctx context.Context, b *bundle.Bundle, ents *entryI
 	case h.PartBegin != 0 || h.PartSize < 1 || before*h.PartSize != first:
 		w.skip = "the articles before the part are not as long as the first one"
 		return
-	case bud.charge(h.PartSize) != nil:
+	case bud.chargeActual(max(h.Bytes, h.PartSize)) != nil:
 		w.skip = "the verification budget is spent"
 		return
 	}

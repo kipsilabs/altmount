@@ -87,6 +87,12 @@ type BundleImportStatus struct {
 	// an archive header at accept time and how many could not be.
 	PartsHeaderBound, PartsHeaderUnbound     int64
 	ExtentsHeaderBound, ExtentsHeaderUnbound int64
+	// VerifyBytesUsed and VerifyBytesLimit are the node-wide budget for
+	// verifying peer layouts against the providers (bytes read in the last
+	// hour, the hourly limit); VerifyActive the verifications running now and
+	// VerifyDeclined the attempts refused for lack of budget since start.
+	VerifyBytesUsed, VerifyBytesLimit int64
+	VerifyActive, VerifyDeclined      int64
 	// Pending files still owe their full check; Stale are pending past the
 	// maximum age (they are failed, never announced).
 	Pending, Stale int64

@@ -258,20 +258,28 @@ func (p *poolBuilder) entryOf(pos int64) int {
 // multi-part layout, and a layout in which an entry supplies two runs (a
 // repeated article from a local patch, a skipped article) is refused.
 //
-// Files scheme: no entries are known. A boundary is a segment that starts
-// inside its article (every volume of a RAR set begins with a header, so this is
-// exact for RAR 4 and 5), a segment that ends before its article does, or a
-// segment longer than the one before it (a posted file's last article is its
-// shortest, which marks the volume boundary of a split 7z set that leaves both
-// sides whole). It cannot see a boundary between two volumes that are both whole
-// and have equal article sizes; such a file is then built as one posted file,
-// which a receiver will not accept.
+// Files scheme: no entries are known. A boundary exists between segment i-1 and
+// i exactly when i-1 ends inside its article or i starts inside its article
+// (every volume of a RAR set begins with a header, so this is exact for RAR 4
+// and 5); article sizes are never compared. A boundary between two whole
+// articles (a split 7z set, a second file stored after the first) is invisible:
+// such a file is built as one table, which a receiver refuses when the bytes
+// contradict it. A layout whose recovered parts break the part shape rules
+// (a sliver of a large article) is part_layout_unrecoverable.
 func (p *poolBuilder) partsOf(name string, segs []Segment) ([]int, error) {
 	if len(segs) < 2 {
 		return nil, nil
 	}
 	if !p.nzb {
-		return rangeParts(segs), nil
+		lens := rangeParts(segs)
+		at := 0
+		for pi, n := range lens {
+			if checkPartSlack(segs[at:at+n], pi, len(lens)) != nil {
+				return nil, &NotShareableError{File: name, Reason: ReasonPartLayout}
+			}
+			at += n
+		}
+		return lens, nil
 	}
 	var lens []int
 	var entries []int
@@ -298,7 +306,7 @@ func rangeParts(segs []Segment) []int {
 	var lens []int
 	start := 0
 	for i := 1; i < len(segs); i++ {
-		if segs[i].Start > 0 || segs[i-1].End < segs[i-1].Size-1 || segs[i].Size > segs[i-1].Size {
+		if segs[i].Start > 0 || segs[i-1].End < segs[i-1].Size-1 {
 			lens = append(lens, i-start)
 			start = i
 		}

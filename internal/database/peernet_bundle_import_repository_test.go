@@ -273,3 +273,34 @@ func TestPeerBundleImport_BundleIDAndFailedBundleCache(t *testing.T) {
 		assert.False(t, bad, "pruned")
 	})
 }
+
+func TestPeerBundleImport_PartsRoundTripAndLegacyRowsAreUnknown(t *testing.T) {
+	forEachBundleImportBackend(t, func(t *testing.T, r *PeernetBundleImportRepository) {
+		ctx := context.Background()
+		require.NoError(t, r.Upsert(ctx, []PeernetBundleImport{bundleRow("m/a.mkv", 5), bundleRow("m/b.mkv", 5), bundleRow("m/c.mkv", 5)}))
+
+		_, known, err := r.PartsOf(ctx, "m/a.mkv")
+		require.NoError(t, err)
+		assert.False(t, known, "a row with no recorded parts carries no boundary knowledge")
+
+		require.NoError(t, r.SetParts(ctx, "m/a.mkv", []int{3, 12, 4}))
+		require.NoError(t, r.SetParts(ctx, "m/b.mkv", nil))
+		parts, known, err := r.PartsOf(ctx, "/m/a.mkv")
+		require.NoError(t, err)
+		assert.True(t, known)
+		assert.Equal(t, []int{3, 12, 4}, parts)
+		parts, known, err = r.PartsOf(ctx, "m/b.mkv")
+		require.NoError(t, err)
+		assert.True(t, known, "one posted file is known, not unknown")
+		assert.Empty(t, parts)
+		_, known, _ = r.PartsOf(ctx, "m/c.mkv")
+		assert.False(t, known)
+		_, known, err = r.PartsOf(ctx, "m/none.mkv")
+		require.NoError(t, err)
+		assert.False(t, known)
+
+		require.NoError(t, r.Upsert(ctx, []PeernetBundleImport{bundleRow("m/a.mkv", 5)}))
+		_, known, _ = r.PartsOf(ctx, "m/a.mkv")
+		assert.False(t, known, "a replaced row forgets the old parts")
+	})
+}

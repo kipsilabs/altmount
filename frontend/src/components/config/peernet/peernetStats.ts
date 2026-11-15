@@ -122,6 +122,10 @@ const IMPORT_REJECT_LABELS: ReadonlyMap<string, string> = new Map([
 	],
 	["part_order", "Archive volumes are not in the order their names give"],
 	["too_many_tables", "Too many archive volumes for the verification limit"],
+	[
+		"verify_budget",
+		"Not verified: this node's hourly limit for checking peer layouts is used up (the normal import runs)",
+	],
 ]);
 
 export function notShareableLabel(key: string): string {
@@ -360,4 +364,38 @@ export function headerBindingLine(imp: PeernetBundleImportStatus | undefined): s
 	const parts = `${pb} ${pb === 1 ? "part" : "parts"} tied to their archive header, ${pu} not tied`;
 	if (eb + eu === 0) return `Archive header checks: ${parts}.`;
 	return `Archive header checks: ${parts}; ${eb} nested ${eb === 1 ? "extent" : "extents"} tied, ${eu} not tied.`;
+}
+
+/**
+ * A one-line note for the open-network layout toggle when peers are reached
+ * through the outbound proxy: every peer then shows the proxy's address, so an
+ * offer can never be announced from enough distinct network ranges and open-network
+ * layouts are never used. Null when no proxy is in use.
+ */
+export function openNetworkProxyNote(
+	status: { outbound_proxy?: boolean } | undefined,
+): string | null {
+	if (status?.outbound_proxy !== true) return null;
+	return "Peers are reached through your outbound proxy, so offers cannot be corroborated by distinct networks and open-network layouts will not be used.";
+}
+
+const GIB = 1024 ** 3;
+const MIB = 1024 ** 2;
+
+function formatVerifyBytes(n: number): string {
+	return n >= GIB ? `${(n / GIB).toFixed(1)} GiB` : `${Math.round(n / MIB)} MiB`;
+}
+
+/**
+ * One line on the node-wide budget for checking peer layouts against the
+ * providers (bytes read this hour against the hourly limit), or null when the
+ * backend reports no limit.
+ */
+export function verifyBudgetLine(imp: PeernetBundleImportStatus | undefined): string | null {
+	const limit = count(imp?.verify_bytes_limit);
+	if (!imp || limit <= 0) return null;
+	const used = Math.min(count(imp.verify_bytes_used), limit);
+	const declined = count(imp.verify_declined);
+	const line = `Peer layout checks this hour: ${formatVerifyBytes(used)} of ${formatVerifyBytes(limit)} read.`;
+	return declined > 0 ? `${line} ${declined} skipped for lack of budget.` : line;
 }

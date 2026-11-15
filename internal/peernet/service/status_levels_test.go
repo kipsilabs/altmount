@@ -33,3 +33,22 @@ func TestStatusReportsEachNetworksOwnLevel(t *testing.T) {
 		t.Fatalf("levels by kind = %v", levels)
 	}
 }
+
+// Through an outbound proxy every peer's connected address is the proxy's, so an
+// offer on the open network can never be corroborated by distinct ranges: the
+// status says so.
+func TestStatusReportsAnOutboundProxy(t *testing.T) {
+	s := enabledSettings()
+	s.AcceptIncoming = true
+	i := newInstance(t, s)
+	i.start(t)
+	if i.statusOf(t).OutboundProxy {
+		t.Fatal("no proxy is configured")
+	}
+	s.HTTPSProxy = "http://proxy.example:3128"
+	j := newInstance(t, s)
+	j.start(t)
+	if !j.statusOf(t).OutboundProxy {
+		t.Fatal("a configured proxy must be reported")
+	}
+}

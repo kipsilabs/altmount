@@ -211,7 +211,7 @@ func TestExtents_MismatchIsRejectedAndReported(t *testing.T) {
 				require.Error(t, err)
 				assert.Equal(t, ReasonExtentMismatch, ReasonOf(err), "%v", err)
 				assert.Len(t, e.rep.got, 1, "the publisher is reported")
-				assert.Equal(t, []string{strings.Repeat("e", 64) + "/" + b.ReleaseID.String()}, e.rep.failedBundles, "the Bundle ID goes on the negative cache")
+				assert.Empty(t, e.rep.failedBundles, "one contradiction is not enough to blacklist the Bundle ID")
 				e.assertNothingBehind()
 			})
 		}
@@ -280,7 +280,7 @@ func TestExtents_WrongKeyIsRejectedByTheMediaCheck(t *testing.T) {
 		[]bundle.Extent{ext1(0, a.DataOffsets[0], int64(len(mkv)))})
 	_, err := e.imp.Accept(context.Background(), e.openReq(b))
 	require.Error(t, err)
-	assert.Contains(t, []Reason{ReasonMediaInvalid, ReasonExtentUnverifiable, ReasonStructureInvalid}, ReasonOf(err), "%v", err)
+	assert.Contains(t, []Reason{ReasonExtentMismatch, ReasonMediaInvalid, ReasonExtentUnverifiable, ReasonStructureInvalid}, ReasonOf(err), "%v", err)
 	e.assertNothingBehind()
 }
 

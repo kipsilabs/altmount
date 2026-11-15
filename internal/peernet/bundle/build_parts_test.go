@@ -174,35 +174,77 @@ func TestFromLocal_FilesSchemeBoundariesFromRanges(t *testing.T) {
 	}
 }
 
-// A split 7z set continues across volumes with no header: the boundary leaves
-// full ranges on both sides and is only visible when the last article of a
-// posted file is shorter than the rest.
-func TestFromLocal_FilesSchemeSplitSevenZip(t *testing.T) {
+// An honest single posted file whose articles differ in size is one table:
+// sizes are never evidence of a part boundary.
+func TestFromLocal_FilesSchemeVariableArticleSizesAreOnePart(t *testing.T) {
+	sizes := []int64{1000, 1200, 900, 1100, 1300, 800, 1000, 1500}
 	var segs []specSeg
-	var truth []int
+	for i, z := range sizes {
+		s := full(fmt.Sprintf("var-%d@s.test", i), z)
+		if i == 0 {
+			s.start = 24
+		}
+		if i == len(sizes)-1 {
+			s.end = 700
+		}
+		segs = append(segs, s)
+	}
+	f := specFile{name: "movie.mkv", segs: segs}
+	f.size = f.fileSize()
+	bd, err := FromLocal(buildInput(SchemeFiles, nil, f))
+	require.NoError(t, err)
+	assert.Nil(t, bd.Files[0].Parts)
+	wire, id, err := Pack(bd)
+	require.NoError(t, err)
+	got, err := Verify(wire, id, bd.ReleaseID)
+	require.NoError(t, err)
+	loc, err := ToLocal(got, testNow)
+	require.NoError(t, err)
+	assert.Equal(t, f.size, loc.Files[0].Meta.FileSize)
+	assert.Len(t, loc.Files[0].Meta.SegmentData, len(sizes))
+}
+
+// A split 7z set continues across volumes with no header: the boundary leaves
+// full ranges on both sides and is invisible in the files scheme. The file is
+// built as one table (no parts); it is not recoverable as a multi-part file.
+func TestFromLocal_FilesSchemeSplitSevenZipHasNoDetectableBoundary(t *testing.T) {
+	var segs []specSeg
 	for v := 0; v < 3; v++ {
-		n := 4
-		for j := 0; j < n; j++ {
+		for j := 0; j < 4; j++ {
 			size := int64(1000)
-			if j == n-1 {
+			if j == 3 {
 				size = 640
 			}
 			s := full(fmt.Sprintf("z%d-%d@s.test", v, j), size)
 			if v == 0 && j == 0 {
 				s.start = 32
 			}
-			if v == 2 && j == n-1 {
+			if v == 2 && j == 3 {
 				s.end = 400
 			}
 			segs = append(segs, s)
 		}
-		truth = append(truth, n)
 	}
 	f := specFile{name: "movie.mkv", segs: segs}
 	f.size = f.fileSize()
 	bd, err := FromLocal(buildInput(SchemeFiles, nil, f))
 	require.NoError(t, err)
-	assert.Equal(t, truth, bd.Files[0].Parts)
+	assert.Nil(t, bd.Files[0].Parts)
+}
+
+// A partial range that is partial on both sides in the middle of the list
+// cannot be a volume boundary the receiver would accept: not shareable.
+func TestFromLocal_FilesSchemeInteriorSliverIsNotShareable(t *testing.T) {
+	segs := []specSeg{full("s0@s.test", 100000), full("s1@s.test", 100000),
+		{id: "s2@s.test", size: 100000, start: 70000, end: 80000},
+		full("s3@s.test", 100000), full("s4@s.test", 100000)}
+	f := specFile{name: "movie.mkv", segs: segs}
+	f.size = f.fileSize()
+	_, err := FromLocal(buildInput(SchemeFiles, nil, f))
+	require.ErrorIs(t, err, ErrNotShareable)
+	var ns *NotShareableError
+	require.True(t, errors.As(err, &ns))
+	assert.Equal(t, ReasonPartLayout, ns.Reason)
 }
 
 // ToLocal returns the flat list with partial ranges the readers expect, equal

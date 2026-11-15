@@ -139,6 +139,11 @@ export interface PeernetBundleImportStatus {
 	parts_header_unbound?: number;
 	extents_header_bound?: number;
 	extents_header_unbound?: number;
+	/** Node-wide budget for checking peer layouts: bytes read this hour (the hourly bucket drained), the hourly limit, runs in progress and the attempts declined for lack of budget since start. */
+	verify_bytes_used?: number;
+	verify_bytes_limit?: number;
+	verify_active?: number;
+	verify_declined?: number;
 }
 
 export interface PeernetBundlesStatus {
@@ -169,6 +174,8 @@ export interface PeernetStatus {
 	listen_error: string;
 	error: string;
 	accept_incoming: boolean;
+	/** Peers connect through the outbound proxy, so every peer shares one connected address. Optional for an older backend. */
+	outbound_proxy?: boolean;
 	/** Why the advertise address is not used; empty when it is fine. */
 	advertise_warning: string;
 	networks: PeernetNetworkStatus[];

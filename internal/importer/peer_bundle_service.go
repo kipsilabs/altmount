@@ -24,6 +24,9 @@ func (s *Service) SetPeerBundleFastPath(h PeerBundleFastPath) {
 		s.peerBundle = h
 	}
 	s.mu.Unlock()
+	if h != nil {
+		s.processor.SetPeerSkipStore(s.bundleState())
+	}
 	s.processor.SetPeerBundleFastPath(h)
 }
 
@@ -119,10 +122,14 @@ func (s *Service) RequeueNormalImport(ctx context.Context, queueID int64) (bool,
 	if _, err := os.Stat(item.NzbPath); err != nil {
 		return false, nil
 	}
-	s.processor.SkipPeerFastPathOnce(int(queueID))
+	// The mark goes on the row before the requeue and comes off again if the
+	// requeue does not happen: a restart in between then cannot loop.
+	if err := s.bundleState().SetSkipFastPath(ctx, queueID, true); err != nil {
+		return false, err
+	}
 	changed, err := s.bundleState().RequeueHeldQueueItem(ctx, queueID)
 	if err != nil || !changed {
-		s.processor.ClearSkipPeerFastPath(int(queueID))
+		_ = s.bundleState().SetSkipFastPath(context.WithoutCancel(ctx), queueID, false)
 		return false, err
 	}
 	if s.broadcaster != nil {

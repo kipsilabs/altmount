@@ -86,6 +86,28 @@ func (proc *Processor) SkipPeerFastPathOnce(queueID int) {
 	proc.peerSkipOnce.Store(queueID, struct{}{})
 }
 
+// PeerSkipStore keeps the "skip the peer fast path once" mark of a requeued
+// queue item on its row, so a restart cannot lose or repeat it.
+type PeerSkipStore interface {
+	// ClaimSkipFastPath reports whether the item is marked and clears the mark.
+	ClaimSkipFastPath(ctx context.Context, queueID int64) (bool, error)
+}
+
+// SetPeerSkipStore installs the persisted mark's store (nil: in-memory only).
+func (proc *Processor) SetPeerSkipStore(s PeerSkipStore) { proc.peerSkipStore.Store(&s) }
+
+func (proc *Processor) claimPersistedSkip(ctx context.Context, queueID int) bool {
+	sp := proc.peerSkipStore.Load()
+	if sp == nil || *sp == nil {
+		return false
+	}
+	ok, err := (*sp).ClaimSkipFastPath(ctx, int64(queueID))
+	if err != nil {
+		proc.log.WarnContext(ctx, "Could not read the peer fast path skip mark", "queue_id", queueID, "error", err)
+	}
+	return ok
+}
+
 // ClearSkipPeerFastPath undoes SkipPeerFastPathOnce.
 func (proc *Processor) ClearSkipPeerFastPath(queueID int) { proc.peerSkipOnce.Delete(queueID) }
 
@@ -110,7 +132,9 @@ func (proc *Processor) tryPeerBundle(ctx context.Context, n *nzbparser.Nzb, file
 			result, written, taken = "", nil, false
 		}
 	}()
-	if _, skip := proc.peerSkipOnce.LoadAndDelete(queueID); skip {
+	// Both marks are consumed together, so neither can fire a second time.
+	_, skipMem := proc.peerSkipOnce.LoadAndDelete(queueID)
+	if skipMem || proc.claimPersistedSkip(ctx, queueID) {
 		return "", nil, false, nil
 	}
 	// The common case: no peer offers anything. Nothing is hashed or built.

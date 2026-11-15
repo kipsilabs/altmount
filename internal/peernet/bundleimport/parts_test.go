@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/kipsilabs/altmount/internal/database"
 	metapb "github.com/kipsilabs/altmount/internal/metadata/proto"
 	"github.com/kipsilabs/altmount/internal/peernet/archivehdr"
 	"github.com/kipsilabs/altmount/internal/peernet/archivehdr/archivetest"
@@ -43,6 +44,9 @@ type setSpec struct {
 	// junk bytes are written before the signature of volume junkVol-1 (0 = none):
 	// a volume that does not start like an archive, with every offset moved.
 	junk, junkVol int
+	// obfuscate gives every posted volume a random yEnc file name, as an
+	// obfuscated release does (no volume number can be read from a name).
+	obfuscate bool
 }
 
 type builtSet struct {
@@ -129,6 +133,9 @@ func (e *env) mkStoredSet(sp setSpec) builtSet {
 			id := fmt.Sprintf("%s-v%d-%03d@test", sp.tag, v, i)
 			beh := fakepoolBehavior(posted[from:end], from, len(posted))
 			beh.YEnc.FileName = volumeName(sp.tag, v)
+			if sp.obfuscate {
+				beh.YEnc.FileName = fmt.Sprintf("%x%x", 0xa1b2c3d4+v*7919, 0x5e6f7081*(v+3))
+			}
 			e.fp.SetBehavior(id, beh)
 			ids = append(ids, id)
 		}
@@ -466,7 +473,7 @@ func TestParts_HostileLayoutsAreRejectedWithTheRightReason(t *testing.T) {
 					assert.Contains(t, err.Error(), c.detail)
 					if c.report {
 						assert.Len(t, e.rep.got, 1, "the publisher is reported")
-						assert.Len(t, e.rep.failedBundles, 1, "the Bundle ID goes on the negative cache")
+						assert.Empty(t, e.rep.failedBundles, "one contradiction is not enough to blacklist the Bundle ID")
 					}
 					e.assertNothingBehind()
 				})
@@ -835,4 +842,63 @@ func TestParts_RealArchiverVolumesAreBoundAndReadBack(t *testing.T) {
 			assert.Equal(t, payload, got)
 		})
 	}
+}
+
+// Parts that are whole NZB entries of one article size leave no trace in the
+// flat metadata (no partial range, no size change). The forced full check must
+// use the part list verified at Accept, not guess boundaries from the ranges.
+func evenSevenZipSet(e *env, tag string) builtSet {
+	payload := mkvPlain(1500)
+	total := len(archivetest.SevenZip(archivetest.SevenZipOpts{}, archivetest.File{Name: "movie.mkv", Data: payload}).Data)
+	const seg = 128
+	each := (total / 4 / seg) * seg
+	cuts := []int{each, each, each, total - 3*each}
+	return e.mkStoredSet(setSpec{tag: tag, kind: "7z", payload: payload, cuts: cuts, scheme: bundle.SchemeNZB, extraVol: -1})
+}
+
+func TestVerifyPeerHeaders_WholeEntryPartsOfEqualArticleSizePass(t *testing.T) {
+	e := newEnv(t)
+	s := evenSevenZipSet(e, "we")
+	res, err := e.imp.Accept(context.Background(), e.openReq(s.b))
+	require.NoError(t, err)
+	require.NoError(t, e.imp.VerifyPeerHeaders(context.Background(), res.Paths[0]))
+}
+
+func TestVerifyPeerHeaders_WholeEntryPartsStillCatchALie(t *testing.T) {
+	e := newEnv(t)
+	s := evenSevenZipSet(e, "wl")
+	res, err := e.imp.Accept(context.Background(), e.openReq(s.b))
+	require.NoError(t, err)
+	id := s.ids[1][2]
+	beh := e.fp.BehaviorFor(id)
+	beh.YEnc.PartBegin += 5
+	e.fp.SetBehavior(id, beh)
+	var lm *LayoutMismatchError
+	require.ErrorAs(t, e.imp.VerifyPeerHeaders(context.Background(), res.Paths[0]), &lm)
+}
+
+// A row with no recorded part list (written before it was persisted) has no
+// boundary knowledge: an honest file passes, a per-article size lie is caught.
+func TestVerifyPeerHeaders_RowWithoutRecordedPartsRunsOnlyBoundaryFreeChecks(t *testing.T) {
+	e := newEnv(t)
+	s := evenSevenZipSet(e, "lg")
+	ctx := context.Background()
+	res, err := e.imp.Accept(ctx, e.openReq(s.b))
+	require.NoError(t, err)
+	row, ok, err := e.imp.cfg.State.Get(ctx, res.Paths[0])
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.NoError(t, e.imp.cfg.State.Upsert(ctx, []database.PeernetBundleImport{row})) // forgets the parts
+	_, known, err := e.imp.cfg.State.PartsOf(ctx, res.Paths[0])
+	require.NoError(t, err)
+	require.False(t, known)
+
+	require.NoError(t, e.imp.VerifyPeerHeaders(ctx, res.Paths[0]), "no whole-table check without boundaries")
+
+	id := s.ids[1][2]
+	beh := e.fp.BehaviorFor(id)
+	beh.YEnc.PartSize += 7
+	e.fp.SetBehavior(id, beh)
+	var lm *LayoutMismatchError
+	require.ErrorAs(t, e.imp.VerifyPeerHeaders(ctx, res.Paths[0]), &lm)
 }

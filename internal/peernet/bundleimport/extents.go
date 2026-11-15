@@ -171,6 +171,9 @@ type chargedReader struct {
 	sizes  []int64
 	seen   map[int]struct{}
 	bud    *costBudget
+	// downloaded, when set, reports the bytes the staging area has really
+	// fetched; what exceeds the declared charges is charged too.
+	downloaded func() int64
 }
 
 func newChargedReader(r io.ReaderAt, o *bundle.OuterSource, bud *costBudget) *chargedReader {
@@ -197,12 +200,26 @@ func (c *chargedReader) ReadAt(p []byte, off int64) (int, error) {
 		if len(c.seen) >= maxVolumeArticles {
 			return 0, fmt.Errorf("%w: volume walk touched %d articles", errCost, maxVolumeArticles)
 		}
-		if err := c.bud.charge(c.sizes[k]); err != nil {
+		if err := c.bud.chargeStaged(c.sizes[k]); err != nil {
 			return 0, err
 		}
 		c.seen[k] = struct{}{}
 	}
-	return c.r.ReadAt(p, off)
+	n, err := c.r.ReadAt(p, off)
+	if c.downloaded != nil {
+		if oerr := c.bud.noteStaged(c.downloaded()); oerr != nil {
+			return n, fmt.Errorf("%w: %w", oerr, errCost)
+		}
+	}
+	return n, err
+}
+
+// stagedDownloads returns the byte counter of a staging area, or nil.
+func stagedDownloads(st Staging) func() int64 {
+	if d, ok := st.(interface{ Downloaded() int64 }); ok {
+		return d.Downloaded
+	}
+	return nil
 }
 
 // extentReport says which files of the bundle have extents that were checked
@@ -218,6 +235,8 @@ type extentReport struct {
 	// articles and bytes are what the shared budget was charged.
 	articles int
 	bytes    int64
+	// bud is the accept's budget, for the reads that come after the sampling.
+	bud *costBudget
 }
 
 // verifyExtents runs the header check for the picked extents. A mismatch is
@@ -257,9 +276,20 @@ func (i *Importer) verifyExtents(ctx context.Context, b *bundle.Bundle, st Stagi
 		if w.wrap.Outcome == archivehdr.Mismatch {
 			return rep, ReasonExtentMismatch, true, fmt.Errorf("%s (outer volume): %s", b.Files[w.refs[0].file].Name, w.wrap.Detail)
 		}
+		if len(w.outer.AESKey) > 0 && errors.Is(w.err, archivehdr.ErrUnknownFormat) {
+			// A keyed outer volume claims to hold an inner archive; decrypted
+			// with the layout's key and IV it must begin like one. CBC garbles
+			// only the first block under a wrong IV, so a peer could otherwise
+			// change the IV (which a RAR 4 header cannot be compared with) and
+			// leave the data area readable, switching the header check off.
+			return rep, ReasonExtentMismatch, true, fmt.Errorf("%s (outer volume): decrypted with the layout's key and IV it does not begin like an archive", b.Files[w.refs[0].file].Name)
+		}
 		for _, r := range w.refs {
 			f := &b.Files[r.file]
 			e := f.Extents[r.ext]
+			if errors.Is(w.err, errOverrun) {
+				return rep, ReasonYencMismatch, false, fmt.Errorf("%s (volume %d): %w", f.Name, e.Outer+1, w.err)
+			}
 			if w.err != nil {
 				if reason, hard := readFailure(w.err); hard {
 					return rep, reason, false, fmt.Errorf("%s (volume %d): %w", f.Name, e.Outer+1, w.err)
@@ -306,7 +336,9 @@ func scanVolume(ctx context.Context, st Staging, w *volumeWork, bud *costBudget)
 	}
 	defer func() { _ = f.Close() }()
 	size := volumeBytes(w.outer)
-	var r io.ReaderAt = newChargedReader(f, w.outer, bud)
+	cr := newChargedReader(f, w.outer, bud)
+	cr.downloaded = stagedDownloads(st)
+	var r io.ReaderAt = cr
 	if len(w.prefix) > 0 {
 		r = &prefixReader{prefix: w.prefix, next: r}
 	}
@@ -385,7 +417,9 @@ func checkWrapper(ctx context.Context, st Staging, w *volumeWork, bud *costBudge
 		return archivehdr.Result{Outcome: archivehdr.Unverifiable, Detail: err.Error()}
 	}
 	defer func() { _ = f.Close() }()
-	v, err := archivehdr.Scan(newChargedReader(f, raw, bud), volumeBytes(raw), first.Start, archivehdr.DefaultLimits())
+	cr := newChargedReader(f, raw, bud)
+	cr.downloaded = stagedDownloads(st)
+	v, err := archivehdr.Scan(cr, volumeBytes(raw), first.Start, archivehdr.DefaultLimits())
 	if v == nil || v.Format == archivehdr.Format7z {
 		return archivehdr.Result{Outcome: archivehdr.Unverifiable, Detail: errString(err)}
 	}

@@ -492,10 +492,90 @@ something different, that bullet is marked "(superseded - see Current rules)".
   bundles were bound to an archive header and how many were not.
 - **Full check:** missing articles are retried on the health schedule before
   the import fails; a header contradiction fails it at once.
-- **Still sampling-based (not done in this round):** accept reads at most 64
-  header checks, part order is bound only for RAR 5 volume numbers, verification
-  is charged by declared sizes, the fast-path window is fixed, and the forced
-  full check re-derives part boundaries from flat metadata.
+- **Every part is header-checked.** There is no sample of parts. Each slice of a
+  multi-part file is bound to the archive's own file header (data start, packed
+  size, unpacked size, continuation flags, stored name equal to the bundle's file
+  name, IV of a keyed first part). A slice that cannot be bound is refused
+  (`extent_unverifiable`); the only exception is the parts of a split 7z set
+  (end header elsewhere or encoded), accepted on media structure alone. Keyed 7z
+  folders are recognised. An old-format release with a second stored file deep in
+  a volume is declined by receivers. A bundle with more parts than the budget
+  covers is refused as a whole (`too_many_tables`).
+- **Part order.** It must follow the volume numbering parsed from the articles'
+  yEnc names (`part_order`) and RAR 5 volume numbers. With names that do not parse
+  and no volume number in the format (RAR 4, split 7z), a Matroska file of at
+  least three parts is bound by its clusters: the first Cluster timecode after
+  each part boundary (at most 8 boundaries, first and last always, the rest by
+  `crypto/rand`, one 6 MiB window each, charged to the accept budget) must not
+  decrease. Order-unverifiable with obfuscated names: MP4/MOV, MPEG-TS/M2TS, AVI
+  and other containers, Matroska with clusters longer than the window, files of
+  fewer than three parts.
+- **Keyed outer volumes.** A keyed outer volume must decrypt to a recognised
+  archive signature; a garbled start is `extent_mismatch`, never "unverifiable"
+  (a changed IV garbles only the first CBC block and would otherwise switch the
+  header check off).
+- **Article sizes.** Every table (inline file, part, outer volume) is one run of
+  equal declared sizes followed by a last article that is not larger; anything
+  else is declined unread (`size_implausible`), at accept and not in
+  `bundle.Validate` (a variable-size poster is declined locally, not blamed). The
+  importer's NZB fixtures show encoded sizes within about 0.1 percent of one
+  value and never two block sizes.
+- **Verification accounting.** The budget is charged with the bytes actually
+  delivered (counting writer on the header reader; counting pool wrapper under the
+  staged reader, whose excess over the declared charges is charged too). Each
+  sample is judged as it arrives; the first contradiction, or a budget spent by
+  larger-than-declared articles (a contradiction), cancels the remaining samples.
+  The pool cannot stop after the yEnc header: a failing writer leaves the body on
+  the wire (desync) and a cancelled read is drained whole (abort only above 1 MiB
+  remaining; articles are ~0.75 MB), so every read costs a whole article.
+- **Node-wide verification budget.** 8 GiB per hour (token bucket) and 2
+  concurrent accepts (`bundleimport.DefaultVerifyBytesPerHour`,
+  `DefaultVerifyConcurrent`). Automatic attempts (the fast path, `Request.Automatic`)
+  may not take the last quarter of the bytes or the last slot; explicit requests
+  can. Exhaustion declines with `verify_budget` (local, not attributable, the
+  publisher's fetch is refunded) and the importer falls back to the normal
+  import. The forced full check's sampling is debited, never declined. Status:
+  `verify_bytes_used`, `verify_bytes_limit`, `verify_active`, `verify_declined`
+  in `bundles.import`.
+- **Sampling cost.** Mandatory per part: first article (yEnc and archive header
+  prefix, fetched once) and last article; a one-article part is one fetch. Ceiling
+  2 GiB and 3,000 articles per accept (was 1 GiB and 2,000). For 100 MB volumes of
+  768,000-byte articles: 1 file 5 articles / 4 MB; 50 volumes 113 / 87 MB; 200
+  volumes 452 / 347 MB; 600 volumes 1,357 / 1,042 MB; 1,000 volumes 2,262 /
+  1,737 MB (plus 3 MB reserved for header walks beyond the first article).
+- **Fast-path window.** 15 s plus 250 ms per archive volume of the offered layout,
+  at most 150 s (`bridge.AcceptWindow`); `Policy.AcceptTimeout` 3 min and
+  `YencTimeout` 150 s. Header reads take a token of the pool's import connection
+  budget before each fetch and the sampler fans out to 16 reads, so the width that
+  runs is what the import budget allows (it shrinks while streams play).
+- **Persisted skip-once.** The flag that skips the peer fast path once for a
+  degraded import redone from its NZB is the `import_queue.peer_skip_fast_path`
+  column (migration 065), set before the requeue and consumed at the next attempt.
+- **Outbound proxy.** Through a proxy every peer's connected address is the
+  proxy's, so open-network corroboration cannot be met; `GET /peernet/status`
+  reports `outbound_proxy` and the settings page notes it beside the open-network
+  fast-path toggle.
+- **Forced full check and boundaries.** The part list verified at accept is stored
+  (migration 064, `peernet_bundle_imports.parts`) and the forced full check cuts
+  exactly there (rows from before it get per-article size checks only). In the
+  files scheme a boundary exists only where a segment starts or ends inside its
+  article; article sizes are never compared; a boundary between two whole articles
+  is invisible and the file is built as one table, which a receiver refuses if
+  bytes contradict it; recovered parts that break the shape rules count as
+  `part_layout_unrecoverable`.
+- **Attribution.** Only `yenc_mismatch` and `extent_mismatch` with contradicting
+  article bytes are attributable. The first contradiction rejects the attempt and
+  mildly strikes the publisher; a second, different contradicting article (by
+  message-ID, or by part for disagreements inside one part) within 7 days
+  blacklists the Bundle ID. `media_invalid` and `structure_invalid` no longer
+  blacklist.
+- **Not done.** Order from the payload for MP4, MPEG-TS and other containers; an
+  early close of an article body (impossible with the pool); accept does not
+  stream or cancel the media probe by budget; actual-byte accounting for the
+  media head probe (small, not charged); the staged-read overrun is a local
+  (non-attributable) `yenc_mismatch`; sample-time relative-part disagreements are
+  judged as samples arrive but cross-part checks (archive header against order)
+  still run after sampling.
 
 ## Phase 3: bundle format
 
@@ -1056,6 +1136,8 @@ Owner decision: every kind of release is accepted on every network. The second r
 **Activity card.** On a node with the open network at level 0 and a private network at level 3 the status carries `level: 0` for the open network (from the configuration) and `level: 3` for the private one (from its row), both under the same field name, and the card's rules (`some(level >= 1)`, `some(level >= 3)`) evaluate correctly on that shape; a test pins it in the service and in the frontend. No defect in the derivation was found; the non-zero-counter fallback stays, because the serving counters are since-start counters and stay non-zero after a level is lowered.
 
 ## Phase 3: multi-part inline layout
+
+(Superseded - see Current rules: the 64-slice sample, the unverifiable-slice acceptance, the "swap of RAR 4 or 7z volumes is not detectable" statement, the forced-check boundary heuristic based on article sizes, and the yEnc-sample budget numbers below no longer hold.)
 
 Owner requirement: every kind of release is shareable and accepted. The third hardening round left one gap: a stored multi-volume archive set (RAR 4, RAR 5 or split 7z, no outer encryption) is flattened by the importer into one inline table with partial ranges at every volume boundary, which the interior-range rule refused and the one-NZB-entry coverage rule could not express. This section adds the layout that expresses it exactly, without relaxing either protection.
 

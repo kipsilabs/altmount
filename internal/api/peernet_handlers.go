@@ -158,6 +158,9 @@ type peernetStatusDTO struct {
 	ListenError    string `json:"listen_error"`
 	Error          string `json:"error"`
 	AcceptIncoming bool   `json:"accept_incoming"`
+	// OutboundProxy: peers connect through the outbound proxy, so open-network
+	// corroboration by distinct ranges can never be met.
+	OutboundProxy bool `json:"outbound_proxy"`
 	// AdvertiseWarning explains why the advertise address is not used; empty
 	// when it is fine. It never contains the address.
 	AdvertiseWarning string              `json:"advertise_warning"`
@@ -206,6 +209,11 @@ type peernetImportDTO struct {
 	PartsHeaderUnbound   int64 `json:"parts_header_unbound"`
 	ExtentsHeaderBound   int64 `json:"extents_header_bound"`
 	ExtentsHeaderUnbound int64 `json:"extents_header_unbound"`
+
+	VerifyBytesUsed  int64 `json:"verify_bytes_used"`
+	VerifyBytesLimit int64 `json:"verify_bytes_limit"`
+	VerifyActive     int64 `json:"verify_active"`
+	VerifyDeclined   int64 `json:"verify_declined"`
 }
 
 func copyCounts(m map[string]int64) map[string]int64 {
@@ -228,7 +236,9 @@ func toBundlesDTO(b service.BundleStatus) peernetBundlesDTO {
 			FullCheckFailed: b.Import.FullCheckFailed, Announced: b.Import.Announced, BadBundleReports: b.Import.BadBundleReports,
 			Pending: b.Import.Pending, Stale: b.Import.Stale,
 			PartsHeaderBound: b.Import.PartsHeaderBound, PartsHeaderUnbound: b.Import.PartsHeaderUnbound,
-			ExtentsHeaderBound: b.Import.ExtentsHeaderBound, ExtentsHeaderUnbound: b.Import.ExtentsHeaderUnbound},
+			ExtentsHeaderBound: b.Import.ExtentsHeaderBound, ExtentsHeaderUnbound: b.Import.ExtentsHeaderUnbound,
+			VerifyBytesUsed: b.Import.VerifyBytesUsed, VerifyBytesLimit: b.Import.VerifyBytesLimit,
+			VerifyActive: b.Import.VerifyActive, VerifyDeclined: b.Import.VerifyDeclined},
 	}
 }
 
@@ -449,7 +459,7 @@ func (s *Server) handlePeernetStatus(c *fiber.Ctx) error {
 	}
 	out := peernetStatusDTO{
 		Enabled: st.Enabled, NodeID: st.NodeID, Listening: st.Listening, ListenPort: st.ListenPort,
-		ListenError: st.ListenError, Error: st.Error, AcceptIncoming: st.AcceptIncoming,
+		ListenError: st.ListenError, Error: st.Error, AcceptIncoming: st.AcceptIncoming, OutboundProxy: st.OutboundProxy,
 		AdvertiseWarning: st.AdvertiseWarning,
 		Networks:         make([]peernetNetworkDTO, 0, len(st.Networks)),
 		Backfill: peernetBackfillDTO{Running: st.Backfill.Running, Scanned: st.Backfill.Scanned,

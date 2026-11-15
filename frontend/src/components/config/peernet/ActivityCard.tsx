@@ -15,6 +15,7 @@ import {
 	showBundlesBlock,
 	showPublishingDetails,
 	skipLabel,
+	verifyBudgetLine,
 } from "./peernetStats";
 
 interface ActivityCardProps {
@@ -125,6 +126,7 @@ function BundlesBlock({ status }: { status: PeernetStatus }) {
 					{count(imp?.full_check_failed)} failed
 				</p>
 				{headerBindingLine(imp) && <p>{headerBindingLine(imp)}</p>}
+				{verifyBudgetLine(imp) && <p>{verifyBudgetLine(imp)}</p>}
 				{(imp?.pending ?? 0) > 0 && (
 					<p className="text-warning">
 						Waiting for a full check: {count(imp?.pending)}
