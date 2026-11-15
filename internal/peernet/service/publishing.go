@@ -567,6 +567,8 @@ func (p *pipeline) reannounceOne(ctx context.Context, t publish.Tracked, relHex 
 	p.stats.mu.Lock()
 	p.stats.reannounced++
 	p.stats.mu.Unlock()
+	// A re-announce and a catch-up publish are records sent: count them as such.
+	p.stats.add(p.stats.published, kindName(records.KindRelease))
 	return true
 }
 

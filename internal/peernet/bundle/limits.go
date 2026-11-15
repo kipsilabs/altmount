@@ -22,6 +22,20 @@ const (
 	// segment table (main files, shared outer sources and PAR2 files), and
 	// separately the message-ID pool.
 	MaxSegments = 500_000
+	// HeaderSlack is the most a part after the first may start into its first
+	// article. What precedes a continuation volume's data is the archive
+	// signature, the main header and one file header: a few hundred bytes for
+	// RAR 4, RAR 5 and 7z, a few KiB with a 2 KiB name and the extra records
+	// (times, hash, encryption). 64 KiB leaves a wide margin and still makes a
+	// 700 KB article give up at most about 9 percent to headers.
+	HeaderSlack = 64 << 10
+	// TrailerSlack is the most a part before the last may stop short of the end
+	// of its last article. A volume ends with an end-of-archive block (tens of
+	// bytes); a RAR recovery record (-rr) stored in the volume can be larger,
+	// up to about ten percent of it, so the bound is the larger of TrailerSlack
+	// and 1/TrailerShareDivisor of the part's articles (12.5 percent).
+	TrailerSlack        = 64 << 10
+	TrailerShareDivisor = 8
 	// MaxFiles caps the files of one bundle.
 	MaxFiles = 10_000
 	// MaxReleaseFiles caps the NZB file entries of the "nzb" scheme release

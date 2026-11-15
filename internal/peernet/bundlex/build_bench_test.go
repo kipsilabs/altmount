@@ -17,8 +17,8 @@ func BenchmarkBuild75kSegments(b *testing.B) {
 	for i := range video {
 		video[i] = fmt.Sprintf("part%d-%05dof75000.%x@news.example.net", i, i, uint64(i)*2654435761)
 	}
-	lib := &fakeLib{scheme: database.PeernetSchemeNZB, paths: []string{"p"},
-		files: map[string]*metapb.FileMetadata{"p": plainFile("big.mkv", video)}, nzb: [][]string{video}}
+	lib := &fakeLib{scheme: database.PeernetSchemeNZB, paths: []string{"p/big.mkv"},
+		files: map[string]*metapb.FileMetadata{"p/big.mkv": plainFile("big.mkv", video)}, nzb: [][]string{video}}
 	rel := releaseHexOfNZB(lib.nzb)
 	bl := NewBuilder(BuilderConfig{Source: lib, Library: lib, Patches: NoPatches{}})
 	b.ResetTimer()

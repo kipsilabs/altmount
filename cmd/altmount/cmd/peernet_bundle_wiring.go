@@ -163,16 +163,24 @@ type peernetBundleHost struct {
 	hasPending func() bool
 	// observe installs the importer's path observer on the metadata service.
 	observe func(metadata.FileObserver)
-	build   func() *bundleimport.Importer
+	build   func() (*bundleimport.Importer, error)
 	getCfg  config.ConfigGetter
 
 	mu  sync.Mutex
 	imp *bundleimport.Importer
 }
 
+// importer returns the bundle importer, building it on first use. It returns
+// nil (and logs why) when a required collaborator is missing: such an importer
+// is never installed, so callers must treat nil as "feature unavailable".
 func (h *peernetBundleHost) importer() *bundleimport.Importer {
 	if h.imp == nil {
-		h.imp = h.build()
+		imp, err := h.build()
+		if err != nil {
+			slog.Error("Peer bundle import is not available", "error", err)
+			return nil
+		}
+		h.imp = imp
 		if h.observe != nil {
 			h.observe(h.imp.PathObserver())
 		}
@@ -205,15 +213,21 @@ func (h *peernetBundleHost) apply(cfg *config.Config) {
 	if !cfg.PeernetEnabled() {
 		h.importerSvc.SetPeerBundleFastPath(nil)
 		if h.hasPending != nil && h.hasPending() {
-			h.health.SetPeerBundleGate(h.importer())
-			h.api.SetPeerBundleLookup(h.lookup)
-			return
+			if imp := h.importer(); imp != nil {
+				h.health.SetPeerBundleGate(imp)
+				h.api.SetPeerBundleLookup(h.lookup)
+				return
+			}
 		}
 		h.health.SetPeerBundleGate(nil)
 		h.api.SetPeerBundleLookup(nil)
 		return
 	}
 	imp := h.importer()
+	if imp == nil {
+		h.importerSvc.SetPeerBundleFastPath(nil)
+		return
+	}
 	// Pending peer imports must be honoured even before a fetcher exists.
 	h.health.SetPeerBundleGate(imp)
 	h.api.SetPeerBundleLookup(h.lookup)
@@ -290,14 +304,8 @@ func newPeernetBundleHost(d bundleWiringDeps, seams *peernetBundleSeams) *peerne
 			n, _, err := state.PendingCounts(context.Background(), time.Time{})
 			return err != nil || n > 0
 		},
-		build: func() *bundleimport.Importer {
-			cfg := bundleImporterConfig(d, state, stagingRoot, seams)
-			if missing := cfg.Missing(); len(missing) > 0 {
-				// A programming error: the accept pipeline would reject every
-				// bundle at runtime. Say so loudly instead of failing quietly.
-				slog.Error("Peer bundle import is wired without required collaborators", "missing", missing)
-			}
-			return bundleimport.New(cfg)
+		build: func() (*bundleimport.Importer, error) {
+			return bundleimport.NewChecked(bundleImporterConfig(d, state, stagingRoot, seams))
 		},
 	}
 }
@@ -381,5 +389,7 @@ func (b *peerOriginBinder) ImportStatus() service.BundleImportStatus {
 	pending, stale := h.Importer().PendingStatus(context.Background())
 	return service.BundleImportStatus{Pending: int64(pending), Stale: int64(stale), Accepted: int64(c.Accepted), AlreadyImported: int64(c.AlreadyImported), Rejected: rej,
 		FullCheckPassed: int64(c.FullCheckPassed), FullCheckFailed: int64(c.FullCheckFailed),
-		Announced: int64(c.Announced), BadBundleReports: int64(c.BadBundleReports)}
+		Announced: int64(c.Announced), BadBundleReports: int64(c.BadBundleReports),
+		PartsHeaderBound: int64(c.PartsHeaderBound), PartsHeaderUnbound: int64(c.PartsHeaderUnbound),
+		ExtentsHeaderBound: int64(c.ExtentsHeaderBound), ExtentsHeaderUnbound: int64(c.ExtentsHeaderUnbound)}
 }

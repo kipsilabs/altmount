@@ -11,7 +11,7 @@ import (
 
 // renameGrace is how long a deleted file's row waits for the matching write
 // (the metadata service reports a rename as a delete followed by a write).
-const renameGrace = 3 * time.Second
+var renameGrace = 3 * time.Second
 
 // PathObserver keeps the peer-bundle state consistent with the library when
 // the user deletes, moves or renames a file or folder: a deleted file loses its

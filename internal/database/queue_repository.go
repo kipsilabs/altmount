@@ -232,10 +232,21 @@ func (r *QueueRepository) AddToQueue(ctx context.Context, item *ImportQueueItem)
 		if err != nil {
 			return fmt.Errorf("failed to add queue item: %w", err)
 		}
-		item.ID, err = result.LastInsertId()
-		if err != nil {
+		// LastInsertId is the connection's previous insert when the upsert
+		// updated an existing row, so it never identifies that row.
+		if _, err = result.LastInsertId(); err != nil {
 			return fmt.Errorf("failed to get last insert ID: %w", err)
 		}
+		item.ID = 0
+	}
+	if item.ID == 0 {
+		// The upsert updated (or, on PostgreSQL, left alone) an existing row:
+		// the row is the one with this path.
+		var id int64
+		if err := r.db.QueryRowContext(ctx, `SELECT id FROM import_queue WHERE nzb_path = ?`, item.NzbPath).Scan(&id); err != nil {
+			return fmt.Errorf("failed to resolve queue item %q after upsert: %w", item.NzbPath, err)
+		}
+		item.ID = id
 	}
 
 	item.CreatedAt = time.Now()

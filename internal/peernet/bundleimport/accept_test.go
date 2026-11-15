@@ -49,7 +49,11 @@ func (a *fakeAnnouncer) AnnounceVerifiedImport(_ context.Context, an Announcemen
 	return nil
 }
 
-type fakeReporter struct{ got, verified, failedBundles []string }
+type fakeReporter struct{ got, verified, failedBundles, refunds []string }
+
+func (r *fakeReporter) RefundFetch(_ context.Context, o Origin) {
+	r.refunds = append(r.refunds, o.PublisherID)
+}
 
 func (r *fakeReporter) ReportFailedBundle(_ context.Context, bundleID, release string) {
 	r.failedBundles = append(r.failedBundles, bundleID+"/"+release)

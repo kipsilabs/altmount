@@ -133,8 +133,8 @@ func TestFetchVerifiesAndReportsSource(t *testing.T) {
 
 func TestFetchRejectsSubstitutedGarbageOversizedAndStrikes(t *testing.T) {
 	// A valid bundle of another release, served under the announced IDs.
-	lib2 := &fakeLib{scheme: database.PeernetSchemeNZB, paths: []string{"x"}, nzb: [][]string{ids("z", 4)}}
-	lib2.files = map[string]*metapb.FileMetadata{"x": plainFile("z.mkv", ids("z", 4))}
+	lib2 := &fakeLib{scheme: database.PeernetSchemeNZB, paths: []string{"x/z.mkv"}, nzb: [][]string{ids("z", 4)}}
+	lib2.files = map[string]*metapb.FileMetadata{"x/z.mkv": plainFile("z.mkv", ids("z", 4))}
 	other, err := newTestBuilder(t, lib2, NoPatches{}).Build(context.Background(), releaseHexOfNZB(lib2.nzb), "T", posted)
 	if err != nil {
 		t.Fatal(err)
@@ -600,5 +600,29 @@ func TestFetchReportsPublisherLimitAndBackOffAsTheirOwnErrors(t *testing.T) {
 	_, _, err = e2.f.Fetch(context.Background(), e2.rel)
 	if !errors.Is(err, ErrBackedOff) || !errors.Is(err, ErrNoOffers) {
 		t.Fatalf("a backed-off publisher is ErrBackedOff (still an ErrNoOffers): %v", err)
+	}
+}
+
+// A bundle the local policy refused before any article was read does not use
+// up the publisher's budget.
+func TestRefundFetchGivesThePublisherBudgetBack(t *testing.T) {
+	e := newFetchEnv(t, FetchLimits{PerPublisherPerHour: 1, PerPublisherBurst: 1})
+	addr, id := honest(t, e)
+	e.publisher(addr, id, time.Hour)
+	if _, _, err := e.f.Fetch(context.Background(), e.rel); err != nil {
+		t.Fatal(err)
+	}
+	e.f.RefundFetch(nwA, id)
+	if _, _, err := e.f.Fetch(context.Background(), e.rel); err != nil {
+		t.Fatalf("a refunded attempt must leave the budget intact: %v", err)
+	}
+}
+
+// The defaults must let a user browse and play: a burst of ten and a minute
+// per attempt sustained, per publisher.
+func TestDefaultFetchLimitsSuitBrowsing(t *testing.T) {
+	d := DefaultFetchLimits()
+	if d.PerPublisherBurst < 10 || d.PerPublisherPerHour < 60 {
+		t.Fatalf("per publisher: burst %d, %d/hour", d.PerPublisherBurst, d.PerPublisherPerHour)
 	}
 }

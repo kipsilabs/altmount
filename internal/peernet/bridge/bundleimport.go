@@ -313,6 +313,15 @@ func (r bundleReporter) ReportBadBundle(_ context.Context, o bundleimport.Origin
 	r.s.NoteBundleFullCheck(o.NetworkID, o.PublisherID, false)
 }
 
+// RefundFetch gives the publisher's fetch budget back when the service can.
+func (r bundleReporter) RefundFetch(_ context.Context, o bundleimport.Origin) {
+	if rf, ok := r.s.(interface {
+		RefundBundleFetch(networkID, publisherID string)
+	}); ok {
+		rf.RefundBundleFetch(o.NetworkID, o.PublisherID)
+	}
+}
+
 // ReportFailedBundle puts a layout that failed local verification on the
 // negative cache when the service keeps one.
 func (r bundleReporter) ReportFailedBundle(_ context.Context, bundleID, releaseID string) {

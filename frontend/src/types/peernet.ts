@@ -134,6 +134,11 @@ export interface PeernetBundleImportStatus {
 	pending?: number;
 	/** Pending past the maximum age: failed, never announced. */
 	stale?: number;
+	/** Parts (and nested-layout extents) of accepted bundles bound to an archive header, and those that could not be. */
+	parts_header_bound?: number;
+	parts_header_unbound?: number;
+	extents_header_bound?: number;
+	extents_header_unbound?: number;
 }
 
 export interface PeernetBundlesStatus {

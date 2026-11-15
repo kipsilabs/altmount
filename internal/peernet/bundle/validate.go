@@ -488,7 +488,10 @@ func (v *validator) checkSlicedTable(f *File) (int64, error) {
 	seen := make(map[int64]struct{}, len(segs))
 	var covered int64
 	at := 0
-	for _, n := range f.Parts {
+	for pi, n := range f.Parts {
+		if err := checkPartSlack(segs[at:at+n], pi, len(f.Parts)); err != nil {
+			return 0, err
+		}
 		for k := 0; k < n; k++ {
 			i, s := at+k, segs[at+k]
 			first, last := k == 0, k == n-1
@@ -507,6 +510,36 @@ func (v *validator) checkSlicedTable(f *File) (int64, error) {
 		at += n
 	}
 	return covered, nil
+}
+
+// checkPartSlack applies the deterministic part rules: a part of an archive
+// volume set is read from just after the volume's headers to just before its
+// end block, so, apart from the two ends of the file, no part may begin deep
+// inside its first article or stop long before the end of its last one. A
+// part that did could be a sliver of a large article, which no header check
+// can be required to notice. The first part may begin deep (a file stored
+// after another one in the same volume) and the last may end deep (another
+// file follows it); every other boundary is bounded by HeaderSlack and
+// TrailerSlack (see their documentation).
+func checkPartSlack(part []Segment, pi, nParts int) error {
+	if nParts < 2 {
+		return nil
+	}
+	first, last := part[0], part[len(part)-1]
+	if pi > 0 && first.Start > HeaderSlack {
+		return fmt.Errorf("%w: part %d starts %d bytes into its first article", ErrPartialRange, pi, first.Start)
+	}
+	if pi < nParts-1 {
+		var articles int64
+		for _, s := range part {
+			articles += s.Size
+		}
+		tail := last.Size - 1 - last.End
+		if tail > max(TrailerSlack, articles/TrailerShareDivisor) {
+			return fmt.Errorf("%w: part %d stops %d bytes before the end of its last article", ErrPartialRange, pi, tail)
+		}
+	}
+	return nil
 }
 
 // shareArticle records the use of a pool entry by a segment of a part and

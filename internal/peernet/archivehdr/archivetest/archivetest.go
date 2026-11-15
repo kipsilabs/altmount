@@ -129,7 +129,16 @@ func rar5(volume int, files []File) Built {
 }
 
 // RAR4 builds a RAR 4 archive.
-func RAR4(files ...File) Built {
+func RAR4(files ...File) Built { return rar4(-1, false, files) }
+
+// RAR4Volume builds volume (0-based) of a multi-volume RAR 4 set, one that a
+// real RAR reader follows: the main header carries the volume and
+// new-numbering flags (and first-volume on volume 0), and the end-of-archive
+// block says whether more volumes follow. A file continued into the next
+// volume must set SplitAfter, one continued from the previous SplitBefore.
+func RAR4Volume(volume int, last bool, files ...File) Built { return rar4(volume, last, files) }
+
+func rar4(volume int, last bool, files []File) Built {
 	var buf bytes.Buffer
 	buf.Write([]byte{'R', 'a', 'r', '!', 0x1A, 0x07, 0x00})
 	header := func(kind byte, flags uint16, body []byte) {
@@ -141,7 +150,14 @@ func RAR4(files ...File) Built {
 		binary.LittleEndian.PutUint16(data[:2], uint16(crc32.ChecksumIEEE(data[2:])))
 		buf.Write(data)
 	}
-	header(0x73, 0, make([]byte, 6))
+	mainFlags := uint16(0)
+	if volume >= 0 {
+		mainFlags = 0x0001 | 0x0010
+		if volume == 0 {
+			mainFlags |= 0x0100
+		}
+	}
+	header(0x73, mainFlags, make([]byte, 6))
 	var offsets []int64
 	for _, f := range files {
 		body := make([]byte, 25)
@@ -173,7 +189,11 @@ func RAR4(files ...File) Built {
 		offsets = append(offsets, int64(buf.Len()))
 		buf.Write(f.Data)
 	}
-	header(0x7B, 0, nil)
+	endFlags := uint16(0)
+	if volume >= 0 && !last {
+		endFlags = 0x0001
+	}
+	header(0x7B, endFlags, nil)
 	return Built{Data: buf.Bytes(), DataOffsets: offsets}
 }
 

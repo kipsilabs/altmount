@@ -4,6 +4,7 @@ import {
 	backboneHint,
 	describeBreakdown,
 	fetchFailLabel,
+	headerBindingLine,
 	importRejectLabel,
 	libraryShareLine,
 	notShareableLabel,
@@ -123,6 +124,7 @@ function BundlesBlock({ status }: { status: PeernetStatus }) {
 					Awaiting full check: {count(imp?.full_check_passed)} passed,{" "}
 					{count(imp?.full_check_failed)} failed
 				</p>
+				{headerBindingLine(imp) && <p>{headerBindingLine(imp)}</p>}
 				{(imp?.pending ?? 0) > 0 && (
 					<p className="text-warning">
 						Waiting for a full check: {count(imp?.pending)}

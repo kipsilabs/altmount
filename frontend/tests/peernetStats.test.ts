@@ -6,6 +6,7 @@ import {
 	fetchFailLabel,
 	formatRelativeTime,
 	hasAnyPublishingLevel,
+	headerBindingLine,
 	importRejectLabel,
 	levelNeedsConfirmation,
 	libraryShareLine,
@@ -85,6 +86,7 @@ const BACKEND_NOT_SHAREABLE_KEYS = [
 	"too_large",
 	"no_post_date",
 	"no_files",
+	"no_media_file",
 	"self_check_failed",
 	"other",
 ];
@@ -432,5 +434,28 @@ describe("backbone hint", () => {
 		expect(backboneHint({ no_recognised_backbone: 0 })).toBeNull();
 		expect(backboneHint({ not_due: 4 })).toBeNull();
 		expect(backboneHint(undefined)).toBeNull();
+	});
+});
+
+describe("headerBindingLine", () => {
+	test("says nothing before any part or extent was checked", () => {
+		expect(headerBindingLine(undefined)).toBeNull();
+		expect(headerBindingLine({ parts_header_bound: 0, parts_header_unbound: 0 })).toBeNull();
+	});
+
+	test("reports bound and unbound parts and extents", () => {
+		expect(headerBindingLine({ parts_header_bound: 12, parts_header_unbound: 0 })).toBe(
+			"Archive header checks: 12 parts tied to their archive header, 0 not tied.",
+		);
+		expect(
+			headerBindingLine({
+				parts_header_bound: 3,
+				parts_header_unbound: 1,
+				extents_header_bound: 2,
+				extents_header_unbound: 0,
+			}),
+		).toBe(
+			"Archive header checks: 3 parts tied to their archive header, 1 not tied; 2 nested extents tied, 0 not tied.",
+		);
 	});
 });

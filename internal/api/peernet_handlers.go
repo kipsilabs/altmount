@@ -201,6 +201,11 @@ type peernetImportDTO struct {
 	BadBundleReports int64            `json:"bad_bundle_reports"`
 	Pending          int64            `json:"pending"`
 	Stale            int64            `json:"stale"`
+
+	PartsHeaderBound     int64 `json:"parts_header_bound"`
+	PartsHeaderUnbound   int64 `json:"parts_header_unbound"`
+	ExtentsHeaderBound   int64 `json:"extents_header_bound"`
+	ExtentsHeaderUnbound int64 `json:"extents_header_unbound"`
 }
 
 func copyCounts(m map[string]int64) map[string]int64 {
@@ -221,7 +226,9 @@ func toBundlesDTO(b service.BundleStatus) peernetBundlesDTO {
 		Import: peernetImportDTO{Accepted: b.Import.Accepted, AlreadyImported: b.Import.AlreadyImported,
 			Rejected: copyCounts(b.Import.Rejected), FullCheckPassed: b.Import.FullCheckPassed,
 			FullCheckFailed: b.Import.FullCheckFailed, Announced: b.Import.Announced, BadBundleReports: b.Import.BadBundleReports,
-			Pending: b.Import.Pending, Stale: b.Import.Stale},
+			Pending: b.Import.Pending, Stale: b.Import.Stale,
+			PartsHeaderBound: b.Import.PartsHeaderBound, PartsHeaderUnbound: b.Import.PartsHeaderUnbound,
+			ExtentsHeaderBound: b.Import.ExtentsHeaderBound, ExtentsHeaderUnbound: b.Import.ExtentsHeaderUnbound},
 	}
 }
 

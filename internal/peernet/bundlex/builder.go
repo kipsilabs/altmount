@@ -5,6 +5,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"path"
+	"strings"
 	"sync"
 	"time"
 
@@ -13,6 +15,7 @@ import (
 	metapb "github.com/kipsilabs/altmount/internal/metadata/proto"
 	"github.com/kipsilabs/altmount/internal/nzbname"
 	"github.com/kipsilabs/altmount/internal/peernet/bundle"
+	"github.com/kipsilabs/altmount/internal/peernet/bundleimport"
 	"github.com/kipsilabs/altmount/internal/peernet/contentid"
 	"github.com/kipsilabs/altmount/internal/peernet/records"
 )
@@ -30,6 +33,7 @@ const (
 	ReasonNoPostDate      = "no_post_date"
 	ReasonNoFiles         = "no_files"
 	ReasonSelfCheckFailed = "self_check_failed"
+	ReasonNoMediaFile     = "no_media_file"
 	maxBuiltCacheBytes    = 32 << 20
 	builtTTL              = 10 * time.Minute
 	defaultBuildWait      = 30 * time.Second
@@ -415,7 +419,7 @@ func (b *Builder) build(ctx context.Context, releaseHex, title string, posted ti
 		if len(m.KnownHoles) > 0 {
 			return nil, notShareable(ReasonKnownHoles)
 		}
-		fi := bundle.FileInput{Meta: m, PatchedLocally: b.anyPatched(m)}
+		fi := bundle.FileInput{Meta: m, Name: path.Base(strings.ReplaceAll(p, "\\", "/")), PatchedLocally: b.anyPatched(m)}
 		pw, fromNZB := b.cfg.Source.NZBPassword(p, m)
 		fi.PasswordFromNZB = fromNZB
 		if fromNZB && in.NZBPassword == "" {
@@ -446,6 +450,10 @@ func (b *Builder) build(ctx context.Context, releaseHex, title string, posted ti
 	}
 	if bd.ReleaseID != rid {
 		return nil, notShareable(ReasonReleaseMismatch)
+	}
+	if _, reason, perr := bundleimport.SelectFiles(bd, nil, bundleimport.Policy{}); perr != nil {
+		// A receiver applies this same policy before reading any article.
+		return nil, notShareable(string(reason))
 	}
 	wire, id, err := bundle.Pack(bd)
 	if err != nil {

@@ -67,7 +67,7 @@ func TestBuildFilesSchemeNeverFallsBackFromNZB(t *testing.T) {
 	f := plainFile("a.mkv", ids("a", 5))
 	fid, _ := contentid.FileID(f)
 	frid, _ := contentid.ReleaseIDFromFiles([]contentid.ID{fid})
-	lib2 := &fakeLib{scheme: database.PeernetSchemeFiles, paths: []string{"p"}, files: map[string]*metapb.FileMetadata{"p": f}}
+	lib2 := &fakeLib{scheme: database.PeernetSchemeFiles, paths: []string{"p/a.mkv"}, files: map[string]*metapb.FileMetadata{"p/a.mkv": f}}
 	got, err := newTestBuilder(t, lib2, NoPatches{}).Build(context.Background(), frid.String(), "T", posted)
 	if err != nil || got.Scheme != bundle.SchemeFiles {
 		t.Fatalf("files scheme: %v %v", got, err)
@@ -290,5 +290,37 @@ func TestBuildUnrecoverablePartLayoutIsCountedNotShareable(t *testing.T) {
 	}
 	if b.Status().NotShareable[string(bundle.ReasonPartLayout)] != 1 {
 		t.Fatalf("not counted: %v", b.Status().NotShareable)
+	}
+}
+
+// An archive-stored file has no OriginalFilename in its metadata; the bundle
+// must carry the file's virtual file name instead.
+func TestBuildNamesFilesByVirtualPath(t *testing.T) {
+	vid := ids("vid", 20)
+	lib := &fakeLib{scheme: database.PeernetSchemeNZB, paths: []string{"movies/R/Movie.2020.mkv"},
+		files: map[string]*metapb.FileMetadata{"movies/R/Movie.2020.mkv": plainFile("", vid)}, nzb: [][]string{vid}}
+	rel := releaseHexOfNZB(lib.nzb)
+	got, err := newTestBuilder(t, lib, NoPatches{}).Build(context.Background(), rel, "T", posted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rid, _ := contentid.ParseID(rel)
+	bd, err := bundle.Verify(got.Wire, got.ID, rid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bd.Files[0].Name != "Movie.2020.mkv" {
+		t.Fatalf("file name = %q, want the virtual file name", bd.Files[0].Name)
+	}
+}
+
+// A release the receiver's file policy would certainly refuse is not announced.
+func TestBuildRefusesReleaseWithoutMediaFile(t *testing.T) {
+	d := ids("d", 20)
+	lib := &fakeLib{scheme: database.PeernetSchemeNZB, paths: []string{"movies/R/payload.bin"},
+		files: map[string]*metapb.FileMetadata{"movies/R/payload.bin": plainFile("", d)}, nzb: [][]string{d}}
+	_, err := newTestBuilder(t, lib, NoPatches{}).Build(context.Background(), releaseHexOfNZB(lib.nzb), "T", posted)
+	if r := notShareableReason(t, err); r != ReasonNoMediaFile {
+		t.Fatalf("reason = %s", r)
 	}
 }

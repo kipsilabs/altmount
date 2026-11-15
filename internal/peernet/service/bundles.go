@@ -82,6 +82,11 @@ type BundleImportStatus struct {
 	Rejected                         map[string]int64
 	FullCheckPassed, FullCheckFailed int64
 	Announced, BadBundleReports      int64
+	// PartsHeaderBound and PartsHeaderUnbound (and the extent pair) say how
+	// many parts and nested-layout extents of accepted bundles were bound to
+	// an archive header at accept time and how many could not be.
+	PartsHeaderBound, PartsHeaderUnbound     int64
+	ExtentsHeaderBound, ExtentsHeaderUnbound int64
 	// Pending files still owe their full check; Stale are pending past the
 	// maximum age (they are failed, never announced).
 	Pending, Stale int64
@@ -312,6 +317,25 @@ func (s *Service) FetchBundleWith(ctx context.Context, releaseID string, opts bu
 		return nil, FetchSource{}, ErrBundlesUnavailable
 	}
 	return n.fetcher.FetchWith(ctx, releaseID, opts)
+}
+
+// RefundBundleFetch gives one attempt back to the per-publisher fetch budget
+// (a bundle refused by the local file policy before any article was read).
+// Unparseable identifiers are ignored.
+func (s *Service) RefundBundleFetch(networkID, publisherID string) {
+	n := s.currentNode()
+	if n == nil || n.fetcher == nil {
+		return
+	}
+	nw, err := netid.ParseNetworkID(networkID)
+	if err != nil {
+		return
+	}
+	pub, err := identity.ParseNodeID(publisherID)
+	if err != nil {
+		return
+	}
+	n.fetcher.RefundFetch(nw, pub)
 }
 
 // NoteBundleFullCheck tells the fetcher how the full local check of a release

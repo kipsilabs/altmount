@@ -215,7 +215,11 @@ func (i *Importer) verifyParts(ctx context.Context, b *bundle.Bundle, tables []s
 	for n, r := range picks {
 		f := &b.Files[r.file]
 		ps := partsOfSliced(f)[r.part]
-		w := &partWork{ref: r, segs: ps, raw: rawView(ps), name: fmt.Sprintf("part-%d.bin", n), upTo: ps[0].Start, offset: ps[0].Start, table: byTable[[2]int{r.file, r.part}]}
+		tbl, ok := byTable[[2]int{r.file, r.part}]
+		if !ok {
+			return ReasonInvalid, false, fmt.Errorf("part %d of file %d has no sample table", r.part, r.file)
+		}
+		w := &partWork{ref: r, segs: ps, raw: rawView(ps), name: fmt.Sprintf("part-%d.bin", n), upTo: ps[0].Start, offset: ps[0].Start, table: tbl}
 		if r.kind == partRaw {
 			w.upTo = 0
 		} else {

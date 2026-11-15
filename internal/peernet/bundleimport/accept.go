@@ -59,6 +59,16 @@ func (i *Importer) rejected(r Reason, err error) (*Result, error) {
 // media probe through the layout in a hidden staging area, and only then the
 // local write in pending state. Any rejection leaves nothing behind.
 func (i *Importer) Accept(ctx context.Context, req Request) (*Result, error) {
+	res, err := i.accept(ctx, req)
+	if err != nil && localPolicyReason(ReasonOf(err)) && req.Origin.PublisherID != "" {
+		if rf, ok := i.cfg.Reporter.(FetchRefunder); ok {
+			rf.RefundFetch(ctx, req.Origin)
+		}
+	}
+	return res, err
+}
+
+func (i *Importer) accept(ctx context.Context, req Request) (*Result, error) {
 	ctx, cancel := context.WithTimeout(ctx, i.cfg.Policy.AcceptTimeout)
 	defer cancel()
 	b := req.Bundle
@@ -175,7 +185,13 @@ func (i *Importer) Accept(ctx context.Context, req Request) (*Result, error) {
 	if err != nil {
 		return i.rejected(ReasonWriteFailed, err)
 	}
-	i.cnt.add(func(c *counters) { c.accepted++ })
+	i.cnt.add(func(c *counters) {
+		c.accepted++
+		c.partsBound += uint64(res.Cost.PartsBound)
+		c.partsUnbound += uint64(res.Cost.PartsUnbound)
+		c.extBound += uint64(res.Cost.ExtentsBound)
+		c.extUnbound += uint64(res.Cost.ExtentsUnbound)
+	})
 	return res, nil
 }
 

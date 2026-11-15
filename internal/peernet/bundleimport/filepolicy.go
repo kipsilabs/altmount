@@ -55,7 +55,13 @@ func (i *Importer) selectFiles(b *bundle.Bundle) ([]int, Reason, error) {
 	if i.cfg.AllowedExtensions != nil {
 		allowed = i.cfg.AllowedExtensions()
 	}
-	pol := i.cfg.Policy
+	return SelectFiles(b, allowed, i.cfg.Policy)
+}
+
+// SelectFiles is the receiver's pure file policy: it needs no network or
+// state, so a publisher can run it before announcing a bundle that every
+// receiver would certainly refuse.
+func SelectFiles(b *bundle.Bundle, allowed []string, pol Policy) ([]int, Reason, error) {
 	var keep []int
 	media, sidecars := 0, 0
 	for n := range b.Files {

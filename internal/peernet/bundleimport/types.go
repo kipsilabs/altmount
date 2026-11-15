@@ -445,17 +445,24 @@ type Counters struct {
 	FullCheckFailed  uint64
 	Announced        uint64
 	BadBundleReports uint64
+	// PartsHeaderBound and PartsHeaderUnbound (ExtentsHeaderBound and
+	// ExtentsHeaderUnbound for nested-layout extents) add up, over the
+	// accepted bundles, the parts bound to an archive header and those that
+	// could not be.
+	PartsHeaderBound, PartsHeaderUnbound     uint64
+	ExtentsHeaderBound, ExtentsHeaderUnbound uint64
 }
 
 type counters struct {
-	mu       sync.Mutex
-	accepted uint64
-	already  uint64
-	rejected map[Reason]uint64
-	passed   uint64
-	failed   uint64
-	announce uint64
-	reports  uint64
+	partsBound, partsUnbound, extBound, extUnbound uint64
+	mu                                             sync.Mutex
+	accepted                                       uint64
+	already                                        uint64
+	rejected                                       map[Reason]uint64
+	passed                                         uint64
+	failed                                         uint64
+	announce                                       uint64
+	reports                                        uint64
 }
 
 func (c *counters) add(f func(*counters)) {
@@ -472,7 +479,8 @@ func (c *counters) snapshot() Counters {
 		rej[k] = v
 	}
 	return Counters{Accepted: c.accepted, AlreadyImported: c.already, Rejected: rej, FullCheckPassed: c.passed,
-		FullCheckFailed: c.failed, Announced: c.announce, BadBundleReports: c.reports}
+		FullCheckFailed: c.failed, Announced: c.announce, BadBundleReports: c.reports,
+		PartsHeaderBound: c.partsBound, PartsHeaderUnbound: c.partsUnbound, ExtentsHeaderBound: c.extBound, ExtentsHeaderUnbound: c.extUnbound}
 }
 
 // YencSamples returns the sampling bound with its default.
@@ -498,4 +506,23 @@ func (p Policy) YencTimeoutOrDefault() time.Duration {
 		return DefaultPolicy().YencTimeout
 	}
 	return p.YencTimeout
+}
+
+// FetchRefunder is an optional capability of the Reporter: it gives the
+// per-publisher fetch budget back for a bundle the local policy refused
+// before any article was read (see localPolicyReason).
+type FetchRefunder interface {
+	RefundFetch(ctx context.Context, o Origin)
+}
+
+// localPolicyReason says a rejection came from the local rules alone: it cost
+// the network nothing beyond the bundle itself and says nothing about the
+// publisher, so it must not use up the publisher's fetch budget.
+func localPolicyReason(r Reason) bool {
+	switch r {
+	case ReasonTooLarge, ReasonTooManyFiles, ReasonForbiddenFile, ReasonSidecarTooLarge, ReasonNoMediaFile,
+		ReasonHealthDisabled, ReasonBadTarget, ReasonCollision, ReasonNZBMismatch:
+		return true
+	}
+	return false
 }

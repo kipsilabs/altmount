@@ -2,14 +2,18 @@ package bundleimport
 
 import (
 	"errors"
+	"fmt"
 	"golang.org/x/sync/singleflight"
+	"strings"
 	"sync"
 	"time"
 )
 
-// Config holds the collaborators of an Importer. Fetcher, Recorder, Announcer
-// and Reporter may be nil: the matching step is then skipped (no fetch, no
-// direct import, nothing announced, nothing reported).
+// Config holds the collaborators of an Importer. Library, Stager, Prober,
+// State, Headers and HealthEnabled are required (see Missing; NewChecked
+// refuses a Config without them). Index, Fetcher, Recorder, Announcer and
+// Reporter may be nil: the matching step is then skipped (nothing indexed, no
+// fetch, no direct import, nothing announced, nothing reported).
 type Config struct {
 	Library Library
 	Stager  Stager
@@ -35,11 +39,10 @@ type Config struct {
 	Now           func() time.Time
 }
 
-// Missing lists the collaborators the accept pipeline cannot work without and
-// that are nil. A production wiring must call it and refuse to run with any
-// missing (a nil Headers, for example, rejects every bundle at the first
-// sample): optional pieces are only Config.AllowedExtensions and
-// Config.WillBeChecked (nil means "no restriction" and "every path").
+// Missing lists the required collaborators that are nil. Without one the
+// accept pipeline cannot work (a nil State or Library panics at first use, a
+// nil Headers rejects every bundle at its first sample). The optional ones are
+// listed on Config.
 func (c Config) Missing() []string {
 	var out []string
 	add := func(nilDep bool, name string) {
@@ -51,12 +54,7 @@ func (c Config) Missing() []string {
 	add(c.Stager == nil, "Stager")
 	add(c.Prober == nil, "Prober")
 	add(c.State == nil, "State")
-	add(c.Index == nil, "Index")
-	add(c.Fetcher == nil, "Fetcher")
 	add(c.Headers == nil, "Headers")
-	add(c.Recorder == nil, "Recorder")
-	add(c.Announcer == nil, "Announcer")
-	add(c.Reporter == nil, "Reporter")
 	add(c.HealthEnabled == nil, "HealthEnabled")
 	return out
 }
@@ -98,6 +96,16 @@ func (i *Importer) crashAt(step string) bool {
 type targetLock struct {
 	mu   sync.Mutex
 	refs int
+}
+
+// NewChecked is New that refuses a Config with a required collaborator
+// missing: an importer built without one would panic or reject everything at
+// first use.
+func NewChecked(cfg Config) (*Importer, error) {
+	if missing := cfg.Missing(); len(missing) > 0 {
+		return nil, fmt.Errorf("bundleimport: required collaborators missing: %s", strings.Join(missing, ", "))
+	}
+	return New(cfg), nil
 }
 
 // New builds an Importer. A zero Policy means DefaultPolicy.

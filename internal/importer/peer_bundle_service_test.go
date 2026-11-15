@@ -238,3 +238,26 @@ func TestPeerImportDirRefusesTitlesThatEscapeTheCategoryFolder(t *testing.T) {
 	}
 	assert.Equal(t, catDir+"/Some Movie", s.PeerImportDir("Movies", "Some Movie.mkv"))
 }
+
+// A second direct import of the same release finds its queue row completed,
+// so the upsert changes nothing; the import must still be tied to that row
+// (not to a stale or zero id) and its history entry must be written.
+func TestRecordPeerImportTwiceKeepsTheQueueReferenceValid(t *testing.T) {
+	ctx := context.Background()
+	s := newPeerService(t)
+	rec := PeerImportRecord{Title: "My Release", Category: "movies", ResultingPath: "movies/My Release",
+		WrittenPaths: []string{"movies/My Release/a.mkv"}, TotalSize: 99, ReleaseID: "abcdef0123456789abcdef"}
+	first, err := s.RecordPeerImport(ctx, rec)
+	require.NoError(t, err)
+	// Unrelated inserts on the connection make a stale last-insert id differ.
+	for i := 0; i < 3; i++ {
+		addItem(t, s, false)
+	}
+	second, err := s.RecordPeerImport(ctx, rec)
+	require.NoError(t, err)
+	assert.Equal(t, first, second, "the same release resolves to the same queue row")
+	var n int
+	require.NoError(t, s.database.Connection().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM import_history WHERE nzb_id = ?`, first).Scan(&n))
+	assert.GreaterOrEqual(t, n, 1, "history written against the queue row")
+}

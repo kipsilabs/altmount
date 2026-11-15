@@ -690,3 +690,11 @@ func (f *Fetcher) ReportVerifiedBundle(nw netid.NetworkID, p identity.NodeID) {
 	defer f.mu.Unlock()
 	delete(f.fcStrikes, strikeKey(nw, p))
 }
+
+// RefundFetch gives one attempt back to the per-publisher budget of p. The
+// caller uses it when the bundle was refused by the local file policy alone,
+// before any article was read: such an attempt must not eat into the budget of
+// later, legitimate plays. The node-wide budget is not refunded.
+func (f *Fetcher) RefundFetch(nw netid.NetworkID, p identity.NodeID) {
+	f.pub.give(strikeKey(nw, p), 1)
+}

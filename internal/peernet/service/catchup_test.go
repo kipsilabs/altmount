@@ -29,6 +29,9 @@ func TestCatchUpPublishesHealthyIndexedReleasesNeverPublished(t *testing.T) {
 	if _, ok, _ := f.state.Get(ctx, nw, database.PeernetRecordKindRelease, pubRelease, ""); !ok {
 		t.Fatal("the healthy indexed release must be published by the catch-up pass")
 	}
+	if f.status(t).Publish.Published["release"] == 0 {
+		t.Fatalf("a catch-up publish must be counted as published: %+v", f.status(t).Publish.Published)
+	}
 	if _, ok, _ := f.state.Get(ctx, nw, database.PeernetRecordKindAttestation, pubRelease, pubFile); ok {
 		t.Fatal("an attestation is never published without a new check")
 	}

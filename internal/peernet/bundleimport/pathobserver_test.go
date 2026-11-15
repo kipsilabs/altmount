@@ -3,6 +3,7 @@ package bundleimport
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -66,4 +67,33 @@ func TestPathObserver_RenamedFolderMovesRows(t *testing.T) {
 
 	obs.DirectoryDeleted(ctx, "movies/Other")
 	assert.Zero(t, e.stateRows())
+}
+
+// The library reports deletes under whatever spelling the caller used (the
+// HTTP API passes a leading slash); the row is keyed by the clean path.
+func TestPathObserver_DeleteWithLeadingSlashRemovesTheRow(t *testing.T) {
+	e, res := newObserved(t)
+	ctx := context.Background()
+	obs := e.imp.PathObserver()
+	require.NoError(t, e.lib.DeleteFileMetadata(ctx, res.Paths[0]))
+	obs.FileDeleted(ctx, "/"+res.Paths[0])
+	obs.Flush()
+	_, ok, _ := e.repo.Get(ctx, res.Paths[0])
+	assert.False(t, ok, "the deleted file's row is gone")
+}
+
+// Through the real metadata service: a user deleting the file ends its state
+// row once the rename grace has passed, with no further attempt needed.
+func TestPathObserver_UserDeleteThroughTheLibraryEndsTheStateRow(t *testing.T) {
+	old := renameGrace
+	renameGrace = 50 * time.Millisecond
+	t.Cleanup(func() { renameGrace = old })
+	e, res := newObserved(t)
+	ctx := context.Background()
+	e.lib.SetSecondaryFileObserver(e.imp.PathObserver())
+	require.NoError(t, e.lib.DeleteFileMetadata(ctx, res.Paths[0]))
+	require.Eventually(t, func() bool {
+		_, ok, _ := e.repo.Get(ctx, res.Paths[0])
+		return !ok
+	}, 2*time.Second, 20*time.Millisecond, "the row of a deleted file must not outlive it")
 }

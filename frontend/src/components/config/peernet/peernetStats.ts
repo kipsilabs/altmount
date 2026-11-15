@@ -1,4 +1,4 @@
-import type { PeernetLibraryStatus } from "../../../types/peernet";
+import type { PeernetBundleImportStatus, PeernetLibraryStatus } from "../../../types/peernet";
 
 // Plain-language labels for the machine keys the status endpoint reports. The
 // lookups use Maps so a key such as "__proto__" can never reach a prototype;
@@ -60,6 +60,7 @@ const NOT_SHAREABLE_LABELS: ReadonlyMap<string, string> = new Map([
 	["too_large", "Too large to bundle"],
 	["no_post_date", "No post date known"],
 	["no_files", "No files in the release"],
+	["no_media_file", "No media file a receiver would accept"],
 	["self_check_failed", "The built bundle failed its own check"],
 	["other", "Other reasons"],
 ]);
@@ -340,4 +341,22 @@ export function backboneHint(
 	const n = skipped?.[NO_BACKBONE_SKIP_KEY];
 	if (typeof n !== "number" || !Number.isFinite(n) || n <= 0) return null;
 	return "Health records are not shared because no provider backbone is recognised. Set a backbone (storage group) on your providers, or use a provider host that is in the known list.";
+}
+
+/**
+ * One line on how well the files of accepted bundles were tied to their
+ * archive headers at accept time, or null when nothing was checked yet. "Not
+ * tied" parts were accepted on structure alone; they are the ones a full check
+ * matters most for.
+ */
+export function headerBindingLine(imp: PeernetBundleImportStatus | undefined): string | null {
+	if (!imp) return null;
+	const pb = count(imp.parts_header_bound);
+	const pu = count(imp.parts_header_unbound);
+	const eb = count(imp.extents_header_bound);
+	const eu = count(imp.extents_header_unbound);
+	if (pb + pu + eb + eu === 0) return null;
+	const parts = `${pb} ${pb === 1 ? "part" : "parts"} tied to their archive header, ${pu} not tied`;
+	if (eb + eu === 0) return `Archive header checks: ${parts}.`;
+	return `Archive header checks: ${parts}; ${eb} nested ${eb === 1 ? "extent" : "extents"} tied, ${eu} not tied.`;
 }

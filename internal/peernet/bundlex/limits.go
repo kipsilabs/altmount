@@ -101,7 +101,7 @@ type FetchLimits struct {
 // DefaultFetchLimits returns the defaults.
 func DefaultFetchLimits() FetchLimits {
 	return FetchLimits{
-		MaxAttempts: 3, GlobalPerHour: 60, GlobalBurst: 10, PerPublisherPerHour: 12, PerPublisherBurst: 3,
+		MaxAttempts: 3, GlobalPerHour: 60, GlobalBurst: 10, PerPublisherPerHour: 60, PerPublisherBurst: 10,
 		MaxConcurrent: 2, Timeout: 60 * time.Second,
 		BackoffBase: 10 * time.Minute, BackoffMax: 2 * time.Hour, SoftBackoff: 5 * time.Minute,
 		FullCheckBackoffBase: 30 * time.Minute, FullCheckBackoffMax: 6 * time.Hour, FullCheckDecay: 24 * time.Hour,

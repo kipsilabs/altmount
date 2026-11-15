@@ -41,7 +41,7 @@ func bundleHostFixture(t *testing.T) (*peernetBundleHost, *recFastPath, *recGate
 	fp, g, l, built := &recFastPath{}, &recGate{}, &recLookup{}, new(int)
 	h := &peernetBundleHost{
 		importerSvc: fp, health: g, api: l, seams: &peernetBundleSeams{}, receiving: func() bool { return true },
-		build: func() *bundleimport.Importer { *built++; return bundleimport.New(bundleimport.Config{}) },
+		build: func() (*bundleimport.Importer, error) { *built++; return bundleimport.New(bundleimport.Config{}), nil },
 	}
 	return h, fp, g, l, built
 }
@@ -136,7 +136,9 @@ func TestPeerOriginBinder_FailsClosedUntilTheImporterExists(t *testing.T) {
 	require.Error(t, err, "unbound")
 
 	h, _, _, _, _ := bundleHostFixture(t)
-	h.build = func() *bundleimport.Importer { return bundleimport.New(bundleimport.Config{State: stubBundleState{}}) }
+	h.build = func() (*bundleimport.Importer, error) {
+		return bundleimport.New(bundleimport.Config{State: stubBundleState{}}), nil
+	}
 	b.Bind(h)
 	_, _, err = b.PeerBundleStatus(context.Background(), "peer.mkv")
 	require.Error(t, err, "importer not built yet (feature not applied)")
@@ -294,3 +296,15 @@ var (
 	_ health.PeerBundleGate     = (*bundleimport.Importer)(nil)
 	_ health.PeerHeaderVerifier = (*bundleimport.Importer)(nil)
 )
+
+// An importer that cannot be built (a required collaborator is missing) is
+// never installed, anywhere.
+func TestBundleHost_NeverInstallsAnImporterThatCannotBeBuilt(t *testing.T) {
+	h, fp, g, l, _ := bundleHostFixture(t)
+	h.build = func() (*bundleimport.Importer, error) { return bundleimport.NewChecked(bundleimport.Config{}) }
+	assert.NotPanics(t, func() { h.apply(enabledCfg(true)) })
+	assert.Nil(t, fp.cur)
+	assert.Nil(t, g.cur, "no gate: a nil importer behind the interface would panic at first use")
+	assert.Nil(t, l.cur)
+	assert.Nil(t, h.Importer())
+}
