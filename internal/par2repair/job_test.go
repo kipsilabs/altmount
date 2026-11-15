@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"math/rand"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -316,29 +317,70 @@ func TestRunJobFetchesArticlesConcurrently(t *testing.T) {
 
 // overlapFetcher records whether fetches from two different files were ever
 // in flight together.
+//
+// The overlap must not depend on how long a fetch happens to take relative to
+// goroutine scheduling: on a loaded CI runner a fetch can start and finish
+// before the next article's goroutine has even run. So the last article of the
+// first file is held in flight until a fetch of another file has started. A
+// pipeline that drains at the file boundary never starts that fetch while the
+// held one is outstanding, so the hold times out and crossed stays false.
 type overlapFetcher struct {
 	inner *fakeFetcher
+	// lastIdx is the article index of the last article of each file.
+	lastIdx int
 
-	mu       sync.Mutex
-	inFlight map[string]int // file prefix -> count
-	crossed  bool
+	mu         sync.Mutex
+	inFlight   map[string]int // file prefix -> count
+	firstFile  string
+	crossed    bool
+	crossedCh  chan struct{} // closed on the first cross-file overlap
+	holdOutLen time.Duration
 }
 
 func filePrefixOf(messageID string) string {
 	return messageID[:strings.IndexByte(messageID, '-')]
 }
 
+// articleIndexOf parses the article index out of "<name-i@test>".
+func articleIndexOf(messageID string) int {
+	rest := messageID[strings.IndexByte(messageID, '-')+1:]
+	n, err := strconv.Atoi(rest[:strings.IndexByte(rest, '@')])
+	if err != nil {
+		return -1
+	}
+	return n
+}
+
 func (o *overlapFetcher) Fetch(ctx context.Context, messageID string) ([]byte, error) {
 	p := filePrefixOf(messageID)
+	if strings.HasPrefix(p, "<par2") {
+		// Recovery-volume fetches precede the sweep and are not part of
+		// the file-to-file pipeline under test.
+		time.Sleep(2 * time.Millisecond)
+		return o.inner.Fetch(ctx, messageID)
+	}
 	o.mu.Lock()
+	if o.firstFile == "" {
+		o.firstFile = p
+	}
+	hold := p == o.firstFile && articleIndexOf(messageID) == o.lastIdx
 	o.inFlight[p]++
 	for other, n := range o.inFlight {
-		if other != p && n > 0 {
+		if other != p && n > 0 && !o.crossed {
 			o.crossed = true
+			close(o.crossedCh)
 		}
 	}
 	o.mu.Unlock()
-	time.Sleep(2 * time.Millisecond)
+	if hold {
+		select {
+		case <-o.crossedCh:
+		case <-time.After(o.holdOutLen):
+		case <-ctx.Done():
+		}
+	} else {
+		time.Sleep(2 * time.Millisecond)
+	}
 	defer func() {
 		o.mu.Lock()
 		o.inFlight[p]--
@@ -352,7 +394,13 @@ func (o *overlapFetcher) Fetch(ctx context.Context, messageID string) ([]byte, e
 // articles of the previous one are still downloading.
 func TestRunJobPrefetchSpansFileBoundaries(t *testing.T) {
 	fx := mkRepairFixture(t, 1024, 512, 6, 1) // 16 articles per file
-	fetch := &overlapFetcher{inner: fx.fetch, inFlight: map[string]int{}}
+	fetch := &overlapFetcher{
+		inner:      fx.fetch,
+		lastIdx:    15, // 16 articles per file
+		inFlight:   map[string]int{},
+		crossedCh:  make(chan struct{}),
+		holdOutLen: 2 * time.Second,
+	}
 
 	plan, err := BuildPlan(fx.idx, fx.files, Caps{MaxRepairRatio: 0.5, MaxMemoryBytes: 64 << 20})
 	if err != nil {
