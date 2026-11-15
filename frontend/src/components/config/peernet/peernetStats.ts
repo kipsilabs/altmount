@@ -120,6 +120,7 @@ const IMPORT_REJECT_LABELS: ReadonlyMap<string, string> = new Map([
 		"extent_unverifiable",
 		"Archive layout could not be checked and the media format cannot stand in",
 	],
+	["part_order", "Archive volumes are not in the order their names give"],
 	["too_many_tables", "Too many archive volumes for the verification limit"],
 ]);
 

@@ -27,6 +27,8 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"path"
+	"strings"
 )
 
 // Format is the archive format of a volume.
@@ -114,6 +116,10 @@ type Block struct {
 	File, Dir bool
 	// Stored says the data is not compressed.
 	Stored bool
+	// Name is the entry's name as the header gives it ("" when the header does
+	// not carry one this package can read), with path separators as "/", at most
+	// maxNameLen bytes.
+	Name string
 	// Encrypted says the data area is AES encrypted; IV is the per-file IV the
 	// header carries (RAR 5 only).
 	Encrypted bool
@@ -267,6 +273,8 @@ type Extent struct {
 	// encrypted, and when both IVs are known they must be equal.
 	Keyed bool
 	IV    []byte
+	// Name is the base name the layout gives the file ("" skips the name check).
+	Name string
 }
 
 // Check judges an extent against a scan of its volume. A scan that stopped on
@@ -323,6 +331,9 @@ func checkBlock(v *Volume, b *Block, e Extent) Result {
 	case b.UnpackedSize >= 0 && b.UnpackedSize != e.FileSize:
 		return bad("the header says the file is %d bytes, the layout %d", b.UnpackedSize, e.FileSize)
 	}
+	if r, bad2 := checkName(v, b, e.Name); bad2 {
+		return r
+	}
 	end, ok := add(b.DataOffset, b.DataSize)
 	if !ok || end > v.Size {
 		return bad("the data area ends beyond the volume (%d of %d bytes)", end, v.Size)
@@ -353,4 +364,36 @@ func Verify(r io.ReaderAt, size int64, e Extent, lim Limits) Result {
 		return Result{Unverifiable, errText(err)}
 	}
 	return Check(v, err, e)
+}
+
+// maxNameLen bounds the entry names that are read.
+const maxNameLen = 1024
+
+// entryBase is the last component of an entry name.
+func entryBase(name string) string { return path.Base(strings.ReplaceAll(name, `\`, "/")) }
+
+// checkName binds the extent to the entry that carries its file's name. The
+// library may present a file under another name than the archive entry (a
+// deobfuscated payload keeps its extension), so a different name is accepted
+// only with the same extension, and only when no other file entry of the volume
+// has exactly the layout's name. The second return is true when the check
+// failed.
+func checkName(v *Volume, b *Block, name string) (Result, bool) {
+	if name == "" || b.Name == "" {
+		return Result{}, false
+	}
+	have := entryBase(b.Name)
+	if strings.EqualFold(have, name) {
+		return Result{}, false
+	}
+	if !strings.EqualFold(path.Ext(have), path.Ext(name)) {
+		return Result{Mismatch, fmt.Sprintf("the entry at this offset is named %q, the layout's file %q (not the same kind of file)", have, name)}, true
+	}
+	for k := range v.Blocks {
+		o := &v.Blocks[k]
+		if o != b && o.File && !o.Dir && o.Name != "" && strings.EqualFold(entryBase(o.Name), name) {
+			return Result{Mismatch, fmt.Sprintf("the entry at this offset is named %q but another entry of the volume is named %q like the layout's file", have, name)}, true
+		}
+	}
+	return Result{}, false
 }

@@ -2,6 +2,7 @@ package bundleimport
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
@@ -35,9 +36,6 @@ import (
 // file's first article, an unknown or encoded archive, a spent budget) is
 // unverifiable, and the file is then accepted only when its media structure check
 // passes and its container has a real structural check.
-
-// maxPartChecks bounds how many parts of a bundle get an archive header check.
-const maxPartChecks = 64
 
 // entryIndex answers which NZB entry a pool position belongs to (nzb scheme).
 type entryIndex struct {
@@ -118,9 +116,9 @@ func classifyPart(ents *entryIndex, f *bundle.File, ps []bundle.Segment) (partKi
 	}
 }
 
-// pickParts chooses the parts to check: all of them up to maxPartChecks, then
-// the first and last part of every media file, then a uniform random choice
-// (crypto/rand) of the rest. Slices come before raw parts.
+// pickParts lists every part that needs a header check: all of them. A bundle
+// whose parts are too many for the sampling budget is refused as a whole
+// (ReasonTooManyTables), never checked only in part.
 func pickParts(b *bundle.Bundle) []partRef {
 	ents := newEntryIndex(b)
 	var all []partRef
@@ -132,43 +130,26 @@ func pickParts(b *bundle.Bundle) []partRef {
 			}
 		}
 	}
-	if len(all) <= maxPartChecks {
-		return all
-	}
-	var picks, rest []partRef
-	for _, r := range all {
-		f := &b.Files[r.file]
-		if fileinfo.IsVerifiableMediaFile(f.Name) && (r.part == 0 || r.part == len(f.Parts)-1) && len(picks) < maxPartChecks/2 {
-			picks = append(picks, r)
-		} else {
-			rest = append(rest, r)
-		}
-	}
-	shuffle(rest)
-	return append(picks, rest[:maxPartChecks-len(picks)]...)
+	return all
 }
 
-// partReserve is the cost the header checks of the picked parts are expected to
-// have: a few articles each.
+// partReserve is what the header checks of the picked parts may cost beyond the
+// samples: one article each, for a header reader that did not keep the first
+// article (the common case costs nothing: the sampled article is reused).
 func partReserve(b *bundle.Bundle, picks []partRef) int64 {
 	var n int64
 	for _, r := range picks {
 		first := partsOfSliced(&b.Files[r.file])[r.part][0]
-		n += extentReserveArticles * first.Size
+		n += first.Size
 	}
 	return n
 }
 
-// markNeed0 makes the first article of every picked part a mandatory sample.
-func markNeed0(tables []sampleTable, picks []partRef) {
-	at := map[[2]int]int{}
+// markNeed0 makes the first article of every part a mandatory sample: the
+// header binding needs where it begins and the order binding needs its name.
+func markNeed0(tables []sampleTable) {
 	for i := range tables {
 		if tables[i].part {
-			at[[2]int{tables[i].file, tables[i].index}] = i
-		}
-	}
-	for _, r := range picks {
-		if i, ok := at[[2]int{r.file, r.part}]; ok {
 			tables[i].need0 = true
 		}
 	}
@@ -187,6 +168,9 @@ type partWork struct {
 	err    error
 	skip   string
 	table  int
+	// prefix is the first decoded bytes of the part's first article, when the
+	// yEnc sample kept them (used only while the walk starts at that article).
+	prefix []byte
 }
 
 // rawView is the part's articles read whole from the first byte of the first
@@ -220,6 +204,7 @@ func (i *Importer) verifyParts(ctx context.Context, b *bundle.Bundle, tables []s
 			return ReasonInvalid, false, fmt.Errorf("part %d of file %d has no sample table", r.part, r.file)
 		}
 		w := &partWork{ref: r, segs: ps, raw: rawView(ps), name: fmt.Sprintf("part-%d.bin", n), upTo: ps[0].Start, offset: ps[0].Start, table: tbl}
+		w.prefix = rel.prefix[tbl]
 		if r.kind == partRaw {
 			w.upTo = 0
 		} else {
@@ -245,11 +230,17 @@ func (i *Importer) verifyParts(ctx context.Context, b *bundle.Bundle, tables []s
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			w.vol, w.err = scanVolume(ctx, st, &volumeWork{name: w.name, outer: w.raw, upTo: w.upTo}, bud)
+			w.vol, w.err = scanVolume(ctx, st, &volumeWork{name: w.name, outer: w.raw, upTo: w.upTo, prefix: w.prefix}, bud)
 		}()
 	}
 	wg.Wait()
 	volumes := map[int][]*partWork{}
+	sevenZip := map[int]bool{} // files whose first part is a 7z volume
+	for _, w := range work {
+		if w.ref.part == 0 && w.vol != nil && w.vol.Format == archivehdr.Format7z {
+			sevenZip[w.ref.file] = true
+		}
+	}
 	for _, w := range work {
 		f := &b.Files[w.ref.file]
 		if w.err != nil {
@@ -267,6 +258,13 @@ func (i *Importer) verifyParts(ctx context.Context, b *bundle.Bundle, tables []s
 		case archivehdr.Mismatch:
 			return ReasonExtentMismatch, true, fmt.Errorf("%s: part %d of %d: %s", f.Name, w.ref.part+1, len(f.Parts), res.Detail)
 		default:
+			// A slice must be bound to an archive header, or the bundle is refused:
+			// otherwise a publisher could always pick the layout that cannot be
+			// judged. The one honest exception is a 7z volume, whose headers live
+			// at the end of the set and are often encoded.
+			if !sevenZipVolume(w, sevenZip[w.ref.file]) {
+				return ReasonExtentUnverifiable, false, fmt.Errorf("%s: part %d of %d cannot be bound to an archive header: %s", f.Name, w.ref.part+1, len(f.Parts), res.Detail)
+			}
 			rep.partsUnbound++
 			if _, ok := rep.unbound[w.ref.file]; !ok {
 				rep.unbound[w.ref.file] = res.Detail
@@ -276,6 +274,50 @@ func (i *Importer) verifyParts(ctx context.Context, b *bundle.Bundle, tables []s
 	for fi, ws := range volumes {
 		if d := volumeOrder(ws); d != "" {
 			return ReasonExtentMismatch, true, fmt.Errorf("%s: %s", b.Files[fi].Name, d)
+		}
+	}
+	return orderByNames(b, tables, rel)
+}
+
+// sevenZipVolume says the part may stay unbound because it belongs to a 7z set,
+// whose end header is out of reach or encoded. The first part must itself be a
+// 7z volume (or its end header encoded); every later part of such a set is a
+// continuation of the archive stream and must begin at the first byte of its
+// posted file.
+func sevenZipVolume(w *partWork, firstIsSevenZip bool) bool {
+	switch {
+	case errors.Is(w.err, archivehdr.ErrCompressedHeader):
+		return true
+	case w.ref.part == 0:
+		return w.vol != nil && w.vol.Format == archivehdr.Format7z
+	}
+	return firstIsSevenZip && w.skip == "" && w.offset == 0 && w.segs[0].Start == 0
+}
+
+// orderByNames binds the order of the parts of every multi-part file to the
+// volume names the articles carry (the yEnc name of each part's first article).
+func orderByNames(b *bundle.Bundle, tables []sampleTable, rel *relState) (Reason, bool, error) {
+	byFile := map[int][]string{}
+	counts := map[int]int{}
+	for t := range tables {
+		if tables[t].part {
+			counts[tables[t].file]++
+		}
+	}
+	for t := range tables {
+		if tables[t].part {
+			if byFile[tables[t].file] == nil {
+				byFile[tables[t].file] = make([]string, len(b.Files[tables[t].file].Parts))
+			}
+			byFile[tables[t].file][tables[t].index] = rel.name[t]
+		}
+	}
+	for fi, names := range byFile {
+		if len(names) < 2 {
+			continue
+		}
+		if d := nameOrder(names); d != "" {
+			return ReasonPartOrder, false, fmt.Errorf("%s: %s", b.Files[fi].Name, d)
 		}
 	}
 	return "", false, nil
@@ -324,7 +366,7 @@ func (i *Importer) placePart(ctx context.Context, b *bundle.Bundle, ents *entryI
 		view.Segments = append(view.Segments, bundle.Segment{Ref: ents.start[k] + j, Size: h.PartSize, Start: 0, End: h.PartSize - 1})
 	}
 	view.Segments = append(view.Segments, w.raw.Segments...)
-	w.raw, w.offset, w.upTo = view, first+w.segs[0].Start, first+w.segs[0].Start
+	w.raw, w.offset, w.upTo, w.prefix = view, first+w.segs[0].Start, first+w.segs[0].Start, nil
 }
 
 // checkPart judges one scanned part.
@@ -339,7 +381,7 @@ func checkPart(w *partWork, f *bundle.File, count int) archivehdr.Result {
 		}
 		return archivehdr.Result{Outcome: archivehdr.Bound}
 	}
-	e := archivehdr.Extent{Offset: w.offset, Length: bundle.Usable(w.segs), Index: w.ref.part, Count: count, FileSize: f.Size, Keyed: len(f.AESKey) > 0}
+	e := archivehdr.Extent{Offset: w.offset, Length: bundle.Usable(w.segs), Index: w.ref.part, Count: count, FileSize: f.Size, Keyed: len(f.AESKey) > 0, Name: f.Name}
 	if e.Keyed && w.ref.part == 0 {
 		e.IV = f.AESIV
 	}

@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"io"
 	"slices"
 	"strings"
 	"sync"
@@ -27,6 +26,24 @@ type YencHeader struct {
 	PartBegin int64
 	PartSize  int64
 	FileSize  int64
+	// Prefix is the first bytes of the decoded article (at most
+	// headerPrefixCap), when the reader kept them: the archive header walk of a
+	// part reads its volume's first article from here instead of fetching it a
+	// second time.
+	Prefix []byte
+}
+
+// headerPrefixCap is how much of an article the header reader keeps.
+const headerPrefixCap = 64 << 10
+
+// prefixWriter keeps the first headerPrefixCap bytes written and drops the rest.
+type prefixWriter struct{ buf []byte }
+
+func (w *prefixWriter) Write(p []byte) (int, error) {
+	if room := headerPrefixCap - len(w.buf); room > 0 {
+		w.buf = append(w.buf, p[:min(room, len(p))]...)
+	}
+	return len(p), nil
 }
 
 // SegmentHeaders reads the yEnc headers of one article from the user's own
@@ -47,11 +64,12 @@ func (h poolHeaders) SegmentHeader(ctx context.Context, id string) (YencHeader, 
 	if err != nil {
 		return YencHeader{}, err
 	}
-	body, err := cli.Fetch(ctx, nntppool.Req{MessageID: id, Writer: io.Discard})
+	w := &prefixWriter{}
+	body, err := cli.Fetch(ctx, nntppool.Req{MessageID: id, Writer: w})
 	if err != nil {
 		return YencHeader{}, err
 	}
-	return YencHeader{Name: body.YEnc.FileName, PartBegin: body.YEnc.PartBegin, PartSize: body.YEnc.PartSize, FileSize: body.YEnc.FileSize}, nil
+	return YencHeader{Name: body.YEnc.FileName, PartBegin: body.YEnc.PartBegin, PartSize: body.YEnc.PartSize, FileSize: body.YEnc.FileSize, Prefix: w.buf}, nil
 }
 
 // sampleTable is one segment table read as a whole file or archive volume.
@@ -387,7 +405,7 @@ func (i *Importer) verifyYenc(ctx context.Context, b *bundle.Bundle, names []str
 	tables := tablesOf(b, names)
 	picks := pickExtents(b)
 	partPicks := pickParts(b)
-	markNeed0(tables, partPicks)
+	markNeed0(tables)
 	reserve := extentReserve(b, picks) + partReserve(b, partPicks)
 	must, mustBytes := planMust(tables)
 	limit, ceiling := i.cfg.Policy.YencSamples(), i.cfg.Policy.YencBytes()
@@ -463,10 +481,15 @@ type relState struct {
 	total map[int]int64
 	// first is the 0-based offset of article 0 of a table, when it was sampled.
 	first map[int]int64
+	// name is the yEnc file name of article 0 of a table, when it was sampled
+	// and the table is a part; prefix is that article's first decoded bytes.
+	name   map[int]string
+	prefix map[int][]byte
 }
 
 func newRelState() *relState {
-	return &relState{base: map[int]int64{}, total: map[int]int64{}, first: map[int]int64{}}
+	return &relState{base: map[int]int64{}, total: map[int]int64{}, first: map[int]int64{},
+		name: map[int]string{}, prefix: map[int][]byte{}}
 }
 
 // judgeRelative compares the samples of every relative part with each other.
@@ -479,6 +502,9 @@ func (st *relState) judge(tables []sampleTable, plan []sample, res []sampleVerdi
 		h := res[k].hdr
 		if s.pos == 0 {
 			st.first[s.table] = h.PartBegin
+			if t.part {
+				st.name[s.table], st.prefix[s.table] = h.Name, h.Prefix
+			}
 		}
 		if !t.rel {
 			continue

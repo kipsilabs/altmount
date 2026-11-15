@@ -40,6 +40,9 @@ type setSpec struct {
 	// extraVol (RAR only).
 	extra    []byte
 	extraVol int
+	// junk bytes are written before the signature of volume junkVol-1 (0 = none):
+	// a volume that does not start like an archive, with every offset moved.
+	junk, junkVol int
 }
 
 type builtSet struct {
@@ -105,9 +108,14 @@ func (e *env) mkStoredSet(sp setSpec) builtSet {
 			} else {
 				a = archivetest.RAR4(files...)
 			}
+			shift := 0
+			if sp.junkVol == v+1 {
+				shift = sp.junk
+				a.Data = append(bytes.Repeat([]byte{'x'}, shift), a.Data...)
+			}
 			s.posted = append(s.posted, a.Data)
-			s.lo = append(s.lo, int(a.DataOffsets[0]))
-			s.hi = append(s.hi, int(a.DataOffsets[0])+n)
+			s.lo = append(s.lo, int(a.DataOffsets[0])+shift)
+			s.hi = append(s.hi, int(a.DataOffsets[0])+shift+n)
 			if v == sp.extraVol && sp.extra != nil {
 				extraLo, extraHi = int(a.DataOffsets[1]), int(a.DataOffsets[1])+len(sp.extra)
 			}
@@ -478,6 +486,16 @@ func TestParts_SecondFileInTheLastVolumeIsAcceptedToo(t *testing.T) {
 				nfo := []byte(strings.Repeat("a release note\n", 20))
 				s := e.mkStoredSet(setSpec{tag: "sf", kind: kind, payload: payload, cuts: evenCuts(len(payload), 3), scheme: scheme, extra: nfo, extraVol: 2})
 				res, err := e.imp.Accept(context.Background(), e.openReq(s.b))
+				if scheme == bundle.SchemeFiles {
+					// Without the NZB the subtitle's part begins at an article the
+					// bundle does not reference (deep in the volume): it cannot be
+					// header-bound, so the receiver declines, and not as a fault of
+					// the publisher.
+					require.Error(t, err)
+					assert.Equal(t, ReasonExtentUnverifiable, ReasonOf(err), "%v", err)
+					assert.Empty(t, e.rep.got)
+					return
+				}
 				require.NoError(t, err, "%v", err)
 				assert.Len(t, res.Paths, 2)
 				for _, p := range res.Paths {
@@ -528,13 +546,12 @@ func TestParts_PartPointingAtAnotherStoredFileIsRejected(t *testing.T) {
 				require.NoError(t, e.tryReseal(s.b))
 				res, err := e.imp.Accept(context.Background(), e.openReq(s.b))
 				if scheme == bundle.SchemeFiles {
-					// Without the NZB list the articles before the part are unknown, so
-					// a slice that does not begin at its posted file's first article is
-					// unverifiable: it is accepted only on the media structure, and
-					// reported as unbound.
-					if err == nil {
-						assert.Positive(t, res.Cost.PartsUnbound)
-					}
+					// Without the NZB list the articles before the part are unknown, so a
+					// slice that does not begin at its posted file's first article
+					// cannot be bound to a header: it is refused (not attributable).
+					require.Error(t, err, "%v", res)
+					assert.Equal(t, ReasonExtentUnverifiable, ReasonOf(err), "%v", err)
+					assert.Empty(t, e.rep.got)
 					return
 				}
 				require.Error(t, err)
@@ -700,12 +717,11 @@ func TestParts_VerificationCostByVolumeCount(t *testing.T) {
 			s := e.mkStoredSet(setSpec{tag: "c", kind: "rar5", payload: payload, cuts: evenCuts(len(payload), n), segSize: 1024, scheme: bundle.SchemeNZB, extraVol: -1})
 			res, err := e.imp.Accept(context.Background(), e.openReq(s.b))
 			require.NoError(t, err, "%v", err)
-			checked := min(n, maxPartChecks)
-			t.Logf("%d volumes (one article each): %d articles read, %d header checks (%d bound)", n, res.Cost.Articles, checked, res.Cost.PartsBound)
-			assert.Equal(t, checked, res.Cost.PartsBound)
-			// one article per part (it is first and last at once) plus the header read
-			// of every checked part
-			assert.Equal(t, n+checked, res.Cost.Articles)
+			t.Logf("%d volumes (one article each): %d articles read, %d header checks (%d bound)", n, res.Cost.Articles, n, res.Cost.PartsBound)
+			assert.Equal(t, n, res.Cost.PartsBound, "every part is header-checked")
+			// one article per part (it is first and last at once): the header walk
+			// reads the bytes the yEnc sample already fetched
+			assert.Equal(t, n, res.Cost.Articles)
 		})
 	}
 }
@@ -794,7 +810,7 @@ func TestParts_RealArchiverVolumesAreBoundAndReadBack(t *testing.T) {
 				}
 			}
 			in := bundle.ReleaseInput{Scheme: bundle.SchemeNZB, Title: "Real Archive", PostedAt: time.Unix(1_700_000_000, 0), NZBFiles: nzb,
-				Files: []bundle.FileInput{{Name: "movie.mkv", Meta: &metapb.FileMetadata{FileSize: int64(len(payload)), SegmentData: segs, Status: metapb.FileStatus_FILE_STATUS_HEALTHY}}}}
+				Files: []bundle.FileInput{{Name: "payload_a.bin", Meta: &metapb.FileMetadata{FileSize: int64(len(payload)), SegmentData: segs, Status: metapb.FileStatus_FILE_STATUS_HEALTHY}}}}
 			bd, err := bundle.FromLocal(in)
 			require.NoError(t, err)
 			require.Len(t, bd.Files[0].Parts, len(matches))

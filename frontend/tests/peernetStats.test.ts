@@ -143,6 +143,7 @@ const BACKEND_IMPORT_REJECT_KEYS = [
 	"structure_invalid",
 	"extent_mismatch",
 	"extent_unverifiable",
+	"part_order",
 	"too_many_tables",
 ];
 

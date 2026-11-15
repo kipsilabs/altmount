@@ -97,6 +97,9 @@ type volumeWork struct {
 	refs  []extentRef
 	vol   *archivehdr.Volume
 	err   error
+	// prefix is the first decoded bytes of the volume's first article, when a
+	// yEnc sample already read them: the walk takes them from here.
+	prefix []byte
 	// wrap is the verdict on the archive that wraps the volume (the header that
 	// precedes the table's first byte), when the table starts inside its first
 	// article.
@@ -263,7 +266,7 @@ func (i *Importer) verifyExtents(ctx context.Context, b *bundle.Bundle, st Stagi
 				}
 			}
 			res := archivehdr.Check(w.vol, w.err, archivehdr.Extent{Offset: e.InnerOffset, Length: e.InnerLength,
-				Index: r.ext, Count: len(f.Extents), FileSize: f.Size})
+				Index: r.ext, Count: len(f.Extents), FileSize: f.Size, Name: f.Name})
 			rep.checked++
 			switch res.Outcome {
 			case archivehdr.Bound:
@@ -303,7 +306,25 @@ func scanVolume(ctx context.Context, st Staging, w *volumeWork, bud *costBudget)
 	}
 	defer func() { _ = f.Close() }()
 	size := volumeBytes(w.outer)
-	return archivehdr.Scan(newChargedReader(f, w.outer, bud), size, w.upTo, archivehdr.DefaultLimits())
+	var r io.ReaderAt = newChargedReader(f, w.outer, bud)
+	if len(w.prefix) > 0 {
+		r = &prefixReader{prefix: w.prefix, next: r}
+	}
+	return archivehdr.Scan(r, size, w.upTo, archivehdr.DefaultLimits())
+}
+
+// prefixReader serves the first bytes of a volume from the article that was
+// already read and passes everything else on.
+type prefixReader struct {
+	prefix []byte
+	next   io.ReaderAt
+}
+
+func (p *prefixReader) ReadAt(b []byte, off int64) (int, error) {
+	if off >= 0 && off+int64(len(b)) <= int64(len(p.prefix)) {
+		return copy(b, p.prefix[off:]), nil
+	}
+	return p.next.ReadAt(b, off)
 }
 
 // volumeBytes is the readable size of the staged volume.

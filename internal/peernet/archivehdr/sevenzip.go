@@ -114,6 +114,9 @@ func (z *z7Buf) digests(n int) (defined []bool) {
 type z7Folder struct {
 	copyOnly  bool
 	encrypted bool
+	// keyedCopy is an AES coder over a Copy coder and nothing else: stored data
+	// that is encrypted, which a keyed layout describes.
+	keyedCopy bool
 	numPacked int
 	unpack    uint64
 	hasCRC    bool
@@ -268,6 +271,7 @@ func parse7zFolders(z *z7Buf) ([]z7Folder, error) {
 		}
 		var f z7Folder
 		var totalIn, totalOut int
+		var copies int
 		for c := 0; c < coders && !z.bad; c++ {
 			flags := z.byte()
 			if flags&0x80 != 0 {
@@ -284,10 +288,14 @@ func parse7zFolders(z *z7Buf) ([]z7Folder, error) {
 			if string(id) == string(z7AES) {
 				f.encrypted = true
 			}
-			f.copyOnly = coders == 1 && len(id) == 1 && id[0] == 0x00 && in == 1 && out == 1
+			if len(id) == 1 && id[0] == 0x00 && in == 1 && out == 1 {
+				copies++
+			}
+			f.copyOnly = coders == 1 && copies == 1
 			totalIn += in
 			totalOut += out
 		}
+		f.keyedCopy = coders == 2 && copies == 1 && f.encrypted
 		pairs := totalOut - 1
 		if pairs < 0 || totalIn-pairs < 1 || z.bad {
 			return bad()
@@ -430,6 +438,13 @@ func layout7z(packPos uint64, packSizes []uint64, folders []z7Folder, subs []int
 		next += f.numPacked
 		stored := f.copyOnly && f.numPacked == 1 && packed == f.unpack && !f.encrypted
 		if subs[i] == 0 {
+			continue
+		}
+		if f.keyedCopy && f.numPacked == 1 && subs[i] == 1 {
+			// stored data under an AES coder: the data area is the packed stream (the
+			// encrypted bytes), whose plain size is not recorded exactly (padding).
+			out = append(out, Block{HeaderOffset: start, DataOffset: start, DataSize: int64(packed), UnpackedSize: -1,
+				File: true, Stored: true, Encrypted: true})
 			continue
 		}
 		if !stored {

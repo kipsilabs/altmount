@@ -268,6 +268,10 @@ const (
 	// ReasonExtentUnverifiable: a file's archive extents could not be bound to
 	// a header and its container has no structural check to stand in.
 	ReasonExtentUnverifiable Reason = "extent_unverifiable"
+	// ReasonPartOrder: the parts of a multi-volume file are not in the order of
+	// the volumes their names (or numbers) say. Names are poster-chosen, so this
+	// is a local judgement and never blames the publisher.
+	ReasonPartOrder Reason = "part_order"
 	// ReasonTooManyTables: the layout has more segment tables than the yEnc
 	// sampling budget can cover at the minimum rate.
 	ReasonTooManyTables Reason = "too_many_tables"

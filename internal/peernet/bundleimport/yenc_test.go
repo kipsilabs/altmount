@@ -359,27 +359,25 @@ func TestPlanMust_MainFilePartsAreSampledAsOneTable(t *testing.T) {
 }
 
 // What the multi-part checks cost for stored sets of 100 MB volumes at 768 KB
-// articles (140 per volume): the mandatory samples plus one header read per
-// checked part.
+// articles (140 per volume): the mandatory samples only, because the header walk
+// of every part reads the first article the yEnc sample already fetched.
 func TestSamplingCostOfMultiVolumeSets(t *testing.T) {
 	for _, tc := range []struct {
 		volumes         int
 		articles        int
 		maxMB           float64
 		wantArticlesMax int
-	}{{50, 150, 130, 170}, {200, 150, 300, 390}} {
+	}{{50, 150, 130, 170}, {200, 150, 380, 500}, {600, 150, 1100, 1400}} {
 		tables := make([]sampleTable, tc.volumes)
 		for i := range tables {
 			tables[i] = bigTable(tc.articles, false)
 			tables[i].part, tables[i].mainPart, tables[i].index = true, true, i
-			tables[i].need0 = i < maxPartChecks
+			tables[i].need0 = true
 		}
 		must, mustBytes := planMust(tables)
-		checked := min(tc.volumes, maxPartChecks)
-		articles := len(must) + checked
-		mb := float64(mustBytes+int64(checked)*768_000) / 1e6
-		t.Logf("%d volumes: %d mandatory samples + %d header reads = %d articles, %.0f MB", tc.volumes, len(must), checked, articles, mb)
+		mb := float64(mustBytes) / 1e6
+		t.Logf("%d volumes: %d mandatory samples (every part checked), %.0f MB", tc.volumes, len(must), mb)
 		assert.LessOrEqual(t, mb, tc.maxMB)
-		assert.LessOrEqual(t, articles, tc.wantArticlesMax)
+		assert.LessOrEqual(t, len(must), tc.wantArticlesMax)
 	}
 }

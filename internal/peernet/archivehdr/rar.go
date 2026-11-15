@@ -1,6 +1,7 @@
 package archivehdr
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
@@ -171,8 +172,13 @@ func parseRAR5(body []byte, off, total int64) (Block, uint64, error) {
 		c.skip(4)
 	}
 	comp := c.vint()
+	c.vint() // host OS
+	nameLen := c.vint()
 	if c.err {
 		return bad("file header fields")
+	}
+	if nameLen <= maxNameLen && nameLen <= uint64(len(c.b)) {
+		blk.Name = cleanName(c.b[:nameLen])
 	}
 	blk.Dir = fileFlags&r5FileDir != 0
 	blk.Stored = (comp>>7)&7 == 0
@@ -343,6 +349,17 @@ func parseRAR4File(hdr []byte, flags uint16, blk *Block, file bool) error {
 	if unp <= 1<<62 {
 		blk.UnpackedSize = int64(unp)
 	}
+	nameAt := 32
+	if flags&r4Large != 0 {
+		nameAt = 40
+	}
+	if n := int(binary.LittleEndian.Uint16(hdr[26:28])); n <= maxNameLen && nameAt+n <= len(hdr) {
+		raw := hdr[nameAt : nameAt+n]
+		if i := bytes.IndexByte(raw, 0); i >= 0 { // unicode names: the plain part comes first
+			raw = raw[:i]
+		}
+		blk.Name = cleanName(raw)
+	}
 	blk.File = file
 	blk.Dir = flags&r4DirMask == r4DirMask
 	blk.Stored = hdr[25] == r4StoreBytes
@@ -350,4 +367,21 @@ func parseRAR4File(hdr []byte, flags uint16, blk *Block, file bool) error {
 	blk.SplitBefore = flags&r4SplitPrev != 0
 	blk.SplitAfter = flags&r4SplitNext != 0
 	return nil
+}
+
+// cleanName turns a header name into the form compared with a layout: "/"
+// separators, no control characters, bounded.
+func cleanName(raw []byte) string {
+	out := make([]byte, 0, len(raw))
+	for _, c := range raw {
+		switch {
+		case c == '\\':
+			out = append(out, '/')
+		case c < 0x20 || c == 0x7f:
+			return ""
+		default:
+			out = append(out, c)
+		}
+	}
+	return string(out)
 }

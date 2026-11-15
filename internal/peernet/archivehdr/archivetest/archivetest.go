@@ -262,9 +262,14 @@ func SevenZip(o SevenZipOpts, files ...File) Built {
 		h.WriteByte(0x00)
 		for i := 0; i < nFolders; i++ {
 			compressed := !o.Solid && files[i].Compressed
-			if compressed {
+			keyed := !o.Solid && files[i].IV != nil
+			switch {
+			case keyed:
+				// two coders (Copy, AES) joined by one bind pair: stored, then encrypted
+				h.Write([]byte{0x02, 0x01, 0x00, 0x24, 0x06, 0xF1, 0x07, 0x01, 0x02, 0x00, 0x00, 0x01, 0x00})
+			case compressed:
 				h.Write([]byte{0x01, 0x23, 0x03, 0x01, 0x01, 0x05, 0x5D, 0, 0, 0x10, 0}) // one LZMA coder with props
-			} else {
+			default:
 				h.Write([]byte{0x01, 0x01, 0x00}) // one coder, id size 1, Copy
 			}
 		}
@@ -274,6 +279,9 @@ func SevenZip(o SevenZipOpts, files ...File) Built {
 		} else {
 			for _, f := range files {
 				h.Write(z7num(uint64(len(f.Data))))
+				if f.IV != nil { // a keyed folder has two out streams
+					h.Write(z7num(uint64(len(f.Data))))
+				}
 			}
 		}
 		h.WriteByte(0x00)

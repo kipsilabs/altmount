@@ -325,3 +325,73 @@ func TestKeyedExtentNeedsAnEncryptedEntryWithTheSameIV(t *testing.T) {
 	e.Keyed = true
 	assert.Equal(t, Mismatch, verify(plain.Data, e).Outcome, "a keyed extent needs an encrypted entry")
 }
+
+// An honest keyed 7z (an AES coder over a Copy coder) is a stored, encrypted
+// entry; it must not be classified as compressed, which blamed the publisher.
+func TestKeyedStoredSevenZipIsBoundNotAMismatch(t *testing.T) {
+	iv := bytes.Repeat([]byte{7}, 16)
+	p := payload(4096)
+	a := archivetest.SevenZip(archivetest.SevenZipOpts{}, archivetest.File{Name: "movie.mkv", Data: p, IV: iv})
+	e := ext(a.DataOffsets[0], 4096, 0, 1, 4000)
+	e.Keyed = true
+	assert.Equal(t, Bound, verify(a.Data, e).Outcome)
+	e.Keyed = false
+	r := verify(a.Data, e)
+	assert.Equal(t, Mismatch, r.Outcome, "an encrypted entry with no key in the layout")
+}
+
+// R2: a RAR inside a stored RAR entry: an extent aimed at the inner archive's
+// data is the outer entry's bytes at the wrong place, so it must not bind.
+func TestNestedArchiveDataIsNotBound(t *testing.T) {
+	inner := archivetest.RAR5(archivetest.File{Name: "x.mkv", Data: payload(3000)})
+	outer := archivetest.RAR5(archivetest.File{Name: "inner.rar", Data: inner.Data})
+	r := verify(outer.Data, ext(outer.DataOffsets[0]+inner.DataOffsets[0], 3000, 0, 1, 3000))
+	assert.NotEqual(t, Bound, r.Outcome, "%s", r.Detail)
+}
+
+// R4 at the primitive level: a volume view that starts late or with junk is an
+// unknown archive (the importer refuses a slice it cannot bind).
+func TestShiftedVolumeStartIsNotBound(t *testing.T) {
+	a := archivetest.RAR5(archivetest.File{Name: "m.mkv", Data: payload(5000)})
+	r := verify(a.Data[3:], ext(a.DataOffsets[0]-3, 5000, 0, 1, 5000))
+	assert.NotEqual(t, Bound, r.Outcome)
+	r = verify(append([]byte("xxxx"), a.Data...), ext(a.DataOffsets[0]+4, 5000, 0, 1, 5000))
+	assert.NotEqual(t, Bound, r.Outcome)
+}
+
+// R1: two stored files of one size in one volume. Nothing but the entry names
+// tells which is which, so the extent of "Movie.mkv" must be the entry that is
+// named so; a file may carry another name only when no entry has its own.
+func TestEntryNamesBindTheExtentToItsFile(t *testing.T) {
+	for _, b := range rarBuilders {
+		t.Run(b.name, func(t *testing.T) {
+			a := b.build(archivetest.File{Name: "Movie.mkv", Data: payload(5000)}, archivetest.File{Name: "other.mkv", Data: payload(5000)})
+			named := func(off int64, name string) Extent {
+				e := ext(off, 5000, 0, 1, 5000)
+				e.Name = name
+				return e
+			}
+			assert.Equal(t, Bound, verify(a.Data, named(a.DataOffsets[0], "Movie.mkv")).Outcome)
+			assert.Equal(t, Bound, verify(a.Data, named(a.DataOffsets[1], "other.mkv")).Outcome)
+			swapped := verify(a.Data, named(a.DataOffsets[1], "Movie.mkv"))
+			assert.Equal(t, Mismatch, swapped.Outcome, "the second entry is not the entry named Movie.mkv")
+			assert.Contains(t, swapped.Detail, "name")
+		})
+	}
+}
+
+// A release may be presented under another name than the archive entry (a
+// deobfuscated payload): the extension must still agree and no other entry may
+// carry the file's own name.
+func TestRenamedEntryNeedsTheSameExtension(t *testing.T) {
+	for _, b := range rarBuilders {
+		t.Run(b.name, func(t *testing.T) {
+			a := b.build(archivetest.File{Name: "x7Qa9fK2.mkv", Data: payload(5000)})
+			e := ext(a.DataOffsets[0], 5000, 0, 1, 5000)
+			e.Name = "Release.Name.2024.mkv"
+			assert.Equal(t, Bound, verify(a.Data, e).Outcome)
+			e.Name = "Release.Name.2024.avi"
+			assert.Equal(t, Mismatch, verify(a.Data, e).Outcome)
+		})
+	}
+}
