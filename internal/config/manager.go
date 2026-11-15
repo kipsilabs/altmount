@@ -734,6 +734,14 @@ type ImportConfig struct {
 	// what it covered, which is a random sample. nil or 0 uses the default
 	// (45s); otherwise 5-300.
 	SegmentCheckTimeoutSeconds *int `yaml:"segment_check_timeout_seconds" mapstructure:"segment_check_timeout_seconds" json:"segment_check_timeout_seconds,omitempty"`
+
+	// FailFastOnMissingArticles, when true and
+	// health.acceptable_missing_segments_percentage is 0, fails an import as
+	// soon as the availability check finds a missing article in a media file,
+	// instead of first sweeping every file to import the undamaged ones. A
+	// season pack with one damaged episode then fails as a whole. Misses only
+	// in sidecar files (.nfo, .sfv, ...) drop those files and import the rest.
+	FailFastOnMissingArticles *bool `yaml:"fail_fast_on_missing_articles" mapstructure:"fail_fast_on_missing_articles" json:"fail_fast_on_missing_articles,omitempty"`
 }
 
 // LogConfig represents logging configuration with rotation support
