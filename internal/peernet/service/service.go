@@ -10,6 +10,7 @@ import (
 	"github.com/kipsilabs/altmount/internal/config"
 	"github.com/kipsilabs/altmount/internal/database"
 	"github.com/kipsilabs/altmount/internal/metadata"
+	"github.com/kipsilabs/altmount/internal/peernet/bundlex"
 	"github.com/kipsilabs/altmount/internal/peernet/contentid"
 	"github.com/kipsilabs/altmount/internal/peernet/publish"
 )
@@ -45,6 +46,10 @@ type Deps struct {
 	// ever published. Exclusions is read on every publish, so config changes
 	// apply at once; nil means none. Backbones may be nil: no attestation is
 	// then published.
+	// BundleState is the bundle-import repository; its negative cache of failed
+	// Bundle IDs lets the fetcher skip a layout that failed local verification.
+	// Nil: no negative cache.
+	BundleState  *database.PeernetBundleImportRepository
 	PublishState *database.PeernetPublishStateRepository
 	Origins      *database.PeernetOriginRepository
 	Exclusions   func() publish.Exclusions
@@ -52,6 +57,23 @@ type Deps struct {
 	// Health is the read-only local health lookup the periodic re-announce
 	// requires; nil means release records are never re-announced.
 	Health LocalHealth
+	// BundleSource, when set, is the full-metadata reader the bundle builder
+	// uses (tests). When nil it is taken from Metadata if that was made by
+	// NewMetadataHost. Without one, level 3 announces no bundles.
+	BundleSource bundlex.BuildSource
+	// Patches says whether a local PAR2 patch exists for an article. A release
+	// is shared as a bundle only when it is known that no patch covers it, so
+	// nil (patch status unknown) shares nothing. Pass bundlex.NoPatches{} for a
+	// node without a patch store.
+	Patches bundlex.PatchIndex
+	// PeerOrigin says whether a library file came from a peer bundle and whether
+	// its full local check passed. A file that came from a peer bundle is never
+	// published (record, attestation or bundle) until it has. Nil means no file
+	// came from a peer bundle. An error means "not eligible".
+	PeerOrigin PeerBundleOrigin
+	// BundleImportStatus reports the bundle importer's counters for the
+	// status; nil means none.
+	BundleImportStatus func() BundleImportStatus
 	// Metadata is observed (while enabled) to keep the content index current.
 	// May be nil.
 	Metadata MetadataHost
@@ -74,18 +96,28 @@ type Deps struct {
 	hub *hintsHub
 
 	// Test-only hooks.
-	publishQueueSize int              // publishing queue bound (default 512)
-	publishNow       func() time.Time // scheduling clock of publishing (tests; default time.Now)
-	beforePublish    func()           // runs before each queued notice is handled
-	backboneEvery    time.Duration    // backbone refresh check period (default 10 min)
-	noContentIndex   bool             // leave the content index to the test
-	allowLoopback    bool
-	listenHost       string
-	listenRetryBase  time.Duration  // first listener rebind delay (default 30 s)
-	applyHook        func(Settings) // runs at the start of every Apply
+	bundleServeLimits bundlex.ServeLimits // zero: defaults
+	onWithdraw        func([]string)      // told which release IDs were withdrawn
+	wrapProvider      func(bundlex.Provider) bundlex.Provider
+	publishQueueSize  int              // publishing queue bound (default 512)
+	publishNow        func() time.Time // scheduling clock of publishing (tests; default time.Now)
+	beforePublish     func()           // runs before each queued notice is handled
+	backboneEvery     time.Duration    // backbone refresh check period (default 10 min)
+	noContentIndex    bool             // leave the content index to the test
+	deriveDebounce    time.Duration    // quiet period before an incremental derive (default 3 s)
+	allowLoopback     bool
+	listenHost        string
+	listenRetryBase   time.Duration  // first listener rebind delay (default 30 s)
+	applyHook         func(Settings) // runs at the start of every Apply
 	// beforeListen runs after the routes are registered and before the
 	// listener starts accepting.
 	beforeListen func(routesRegistered, bound bool)
+}
+
+// PeerBundleOrigin is the narrow view of the bundle importer the publisher
+// needs (bundleimport.Importer.PeerBundleStatus has this shape).
+type PeerBundleOrigin interface {
+	PeerBundleStatus(ctx context.Context, filePath string) (fromPeer, fullCheckPassed bool, err error)
 }
 
 // MetadataHost is what the content index needs from the metadata service:
@@ -101,6 +133,10 @@ type metadataHost struct {
 }
 
 func (h metadataHost) SetFileObserver(o metadata.FileObserver) { h.ms.SetFileObserver(o) }
+
+func (h metadataHost) bundleBuildSource() bundlex.BuildSource {
+	return bundlex.NewMetadataSource(h.ms, nil)
+}
 
 // NewMetadataHost adapts the metadata service to MetadataHost.
 func NewMetadataHost(ms *metadata.MetadataService) MetadataHost {
@@ -135,7 +171,9 @@ func New(deps Deps) *Service {
 	if deps.hub == nil {
 		deps.hub = newHintsHub()
 	}
-	return &Service{deps: deps, settings: deps.Settings}
+	s := &Service{deps: deps, settings: deps.Settings}
+	s.deps.onWithdraw = s.invalidateBundles
+	return s
 }
 
 // Start brings the feature up when it is enabled.

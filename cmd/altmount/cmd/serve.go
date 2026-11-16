@@ -23,6 +23,7 @@ import (
 	"github.com/kipsilabs/altmount/internal/importer"
 	"github.com/kipsilabs/altmount/internal/metadata"
 	"github.com/kipsilabs/altmount/internal/nzbfilesystem/segcache"
+	"github.com/kipsilabs/altmount/internal/peernet/service"
 	"github.com/kipsilabs/altmount/internal/pool"
 	"github.com/kipsilabs/altmount/internal/progress"
 	"github.com/kipsilabs/altmount/internal/rclone"
@@ -194,7 +195,16 @@ func runServe(cmd *cobra.Command, args []string) error {
 	stremioCleanup.StartCleanup(ctx)
 
 	apiServer := setupAPIServer(app, repos, authService, configManager, metadataReader, metadataService, fs, poolManager, importerService, arrsService, mountService, progressBroadcaster, streamTracker, cacheSource)
-	peernetService := startPeernetService(ctx, cfg, db, metadataService, repos.HealthRepo, configManager)
+	// The PAR2 patch index lets level 3 prove a release is unpatched; the
+	// origin binder (bound to the bundle host below) keeps peer-imported files
+	// from being published before their full check passed.
+	peerOrigin := &peerOriginBinder{}
+	peernetService := startPeernetService(ctx, cfg, db, metadataService, repos.HealthRepo, configManager,
+		func(d *service.Deps) {
+			d.Patches = peernetPatches(par2RepairService.PatchStore())
+			d.PeerOrigin = peerOrigin
+			d.BundleImportStatus = peerOrigin.ImportStatus
+		})
 	apiServer.SetPeernetService(peernetService)
 	apiServer.SetLogFilePath(slogutil.GetLogFilePath(cfg.Log))
 	apiServer.SetMigrationRepo(db.MigrationRepo)
@@ -252,6 +262,24 @@ func runServe(cmd *cobra.Command, args []string) error {
 		wirePeernetHealthObserver(healthWorker, cfg, peernetService, configManager.OnConfigChange)
 		// Peer evidence for scheduled checks (nil adviser while the feature is off).
 		wirePeernetHints(ctx, peernetService, healthWorker, apiServer, db, configManager, cfg)
+		// Bundle import: fast path, full-check gate and queue/health badges (all
+		// absent while the feature is off). The fetcher and the bad-publisher
+		// reporter are connected through the seams (peernetBundleSeams).
+		bundleHost := newPeernetBundleHost(bundleWiringDeps{
+			Metadata: metadataService, DB: db, Importer: importerService, Pool: poolManager, Cache: cacheSource,
+			GetConfig: configManager.GetConfigGetter(), Health: healthWorker, API: apiServer,
+			Receiving: func() bool { return len(peernetService.ReceivingNetworks()) > 0 },
+		}, &peernetBundleSeams{})
+		// Stremio peer candidates and their play route (installed only while the
+		// feature is on and a fetcher is connected).
+		bundleHost.play = apiServer
+		bundleHost.peerPlay = stremioPeerPlayback{svc: peernetService, host: bundleHost, dirs: importerService}
+		wirePeernetBundleImport(bundleHost, cfg, configManager.OnConfigChange)
+		peerOrigin.Bind(bundleHost)
+		// Connect the halves: the service is the bundle fetcher and the
+		// bad-publisher reporter; the fast path installs only while the feature
+		// is enabled.
+		connectPeernetBundleSeams(bundleHost, peernetService, cfg)
 		apiServer.SetHealthWorker(healthWorker)
 	}
 	if par2RepairService != nil {

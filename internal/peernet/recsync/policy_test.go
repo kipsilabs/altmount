@@ -15,8 +15,8 @@ func TestPolicyFor(t *testing.T) {
 		// Level 2: shares metadata. Publishes its own records, pushes them,
 		// and serves own and relayed records.
 		{2, Policy{Exists: true, Pull: true, AcceptPush: true, Publish: true, Push: true, Serve: true}},
-		// Level 3 behaves like 2 for records (bundles come later).
-		{3, Policy{Exists: true, Pull: true, AcceptPush: true, Publish: true, Push: true, Serve: true}},
+		// Level 3 behaves like 2 for records and also serves bundles.
+		{3, Policy{Exists: true, Pull: true, AcceptPush: true, Publish: true, Push: true, Serve: true, ServeBundles: true}},
 		// Anything out of range fails closed.
 		{-1, Policy{}},
 		{4, Policy{}},
@@ -31,7 +31,15 @@ func TestPolicyFor(t *testing.T) {
 
 func TestPolicyLevelOneNeverPublishesOrServes(t *testing.T) {
 	p := PolicyFor(1)
-	if p.Publish || p.Push || p.Serve {
+	if p.Publish || p.Push || p.Serve || p.ServeBundles {
 		t.Fatalf("level 1 must publish and serve nothing: %+v", p)
+	}
+}
+
+func TestOnlyLevelThreeServesBundles(t *testing.T) {
+	for level := -1; level <= 4; level++ {
+		if got, want := PolicyFor(level).ServeBundles, level == 3; got != want {
+			t.Errorf("level %d: ServeBundles = %v, want %v", level, got, want)
+		}
 	}
 }

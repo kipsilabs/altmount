@@ -17,6 +17,11 @@ type ParseOptions struct {
 	// KnownMissingSegmentIDs seeds notFoundIDs so yEnc normalisation and 16KB
 	// completion never re-issue Stat/Body calls for already-known-missing IDs.
 	KnownMissingSegmentIDs map[string]struct{}
+	// PrebuiltStore and PrebuiltIndex are metadata.BuildStore of this very NZB,
+	// when the caller already built them and the NZB did not change since. Both
+	// or neither.
+	PrebuiltStore *metapb.NzbStore
+	PrebuiltIndex map[string]int64
 }
 
 // NzbType represents the type of NZB content
@@ -51,11 +56,22 @@ type ParsedNzb struct {
 	// article, for files whose header was recovered from a later article. The
 	// processor merges it into the repair queue so the hole gets patched.
 	DegradedFiles map[string]string
+	// passwordOrigin says where password was found (see PasswordOrigin).
+	passwordOrigin PasswordOrigin
 }
 
 // GetPassword returns the password for this NZB
 func (p *ParsedNzb) GetPassword() string {
 	return p.password
+}
+
+// PasswordOrigin reports where the password in effect was found. It is
+// PasswordOriginNone when there is none.
+func (p *ParsedNzb) PasswordOrigin() PasswordOrigin {
+	if p.password == "" {
+		return PasswordOriginNone
+	}
+	return p.passwordOrigin
 }
 
 // SetPassword sets the password for this NZB

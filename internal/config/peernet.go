@@ -69,6 +69,12 @@ type PeernetOpenNetworkConfig struct {
 	Level PeernetLevel `yaml:"level" mapstructure:"level" json:"level"`
 	// Peers are host:port addresses (no scheme, userinfo or path).
 	Peers []string `yaml:"peers" mapstructure:"peers" json:"peers"`
+	// FastPath lets layouts offered by open-network peers replace archive
+	// analysis when the user imports an NZB. Off by default: such a layout is
+	// verified by sampling only. Private networks do not need it (their
+	// offers use the fast path by default); direct imports (Stremio peer play)
+	// are unaffected.
+	FastPath bool `yaml:"fast_path" mapstructure:"fast_path" json:"fast_path"`
 }
 
 // PeernetSharingConfig holds publish-time exclusions.

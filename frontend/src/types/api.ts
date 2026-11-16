@@ -29,6 +29,10 @@ export const QueueStatus = {
 export type QueueStatus = (typeof QueueStatus)[keyof typeof QueueStatus];
 
 export interface QueueItem {
+	/** Imported from a peer bundle. */
+	peer_origin?: boolean;
+	/** The full check of a peer-bundle import has not passed yet. */
+	peer_full_check_pending?: boolean;
 	id: number;
 	nzb_path: string;
 	nzb_display_name: string;
@@ -197,6 +201,10 @@ export interface HealthCheckProgress {
 }
 
 export interface FileHealth {
+	/** Imported from a peer bundle. */
+	peer_origin?: boolean;
+	/** The full check of a peer-bundle import has not passed yet. */
+	peer_full_check_pending?: boolean;
 	check_progress?: HealthCheckProgress;
 	id: number;
 	file_path: string;

@@ -52,7 +52,15 @@ type Server struct {
 	peernet       PeernetService
 	// networkLabeler labels library streams healthy on the peer network; nil
 	// (the default) leaves Stremio responses untouched.
-	networkLabeler    atomic.Pointer[networkLabelerHolder]
+	networkLabeler atomic.Pointer[networkLabelerHolder]
+	// peerPlayback lists and plays Stremio candidates from the peer network; nil
+	// while the feature is off (the stream list is then exactly as before).
+	peerPlayback   atomic.Pointer[peerPlaybackHolder]
+	peerPlayGroup  singleflight.Group
+	peerPlayLimits atomic.Pointer[peerPlayLimiter]
+	// peerBundles marks queue and health items that came from a peer bundle;
+	// nil (the default) means no lookup and both flags false.
+	peerBundles       atomic.Pointer[peerBundleLookupHolder]
 	metadataReader    *metadata.MetadataReader
 	metadataService   *metadata.MetadataService
 	nzbFilesystem     *nzbfilesystem.NzbFilesystem
@@ -201,6 +209,7 @@ func (s *Server) SetupRoutes(app *fiber.App) {
 	stremioGroup.Get("/:key/manifest.json", s.handleStremioManifest)
 	stremioGroup.Get("/:key/stream/:type/:id.json", s.handleStremioAddonStream)
 	stremioGroup.Get("/:key/play", s.handleStremioAddonPlay)
+	stremioGroup.Get("/:key/peer/:release", s.handleStremioPeerPlay)
 
 	api := app.Group(s.config.Prefix)
 

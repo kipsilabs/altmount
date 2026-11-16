@@ -21,8 +21,8 @@ type NetworkStatus struct {
 	Attestations RecordCounts
 	// Publishers is the number of distinct publishers of stored records.
 	Publishers int
-	// LastPull is the last time a pull from any peer succeeded (zero: never
-	// since start).
+	// LastPull is the last time a pull from any peer succeeded (zero: never;
+	// derived from the persisted sync cursors after a restart).
 	LastPull time.Time
 	// Stored, Duplicates and Rejected count ingest outcomes since start;
 	// Rejected is keyed by reason name.
@@ -43,6 +43,17 @@ func (x *Exchange) Status(ctx context.Context, nw netid.NetworkID) NetworkStatus
 	x.mu.Lock()
 	st.LastPull = x.lastPull[nw.String()]
 	x.mu.Unlock()
+	if st.LastPull.IsZero() {
+		// After a restart the in-memory time is gone: the sync cursors, which
+		// are persisted, still say when records were last pulled.
+		if lp, ok := x.cfg.Cursors.(interface {
+			LastPullAt(ctx context.Context, networkID string) (time.Time, error)
+		}); ok {
+			if at, err := lp.LastPullAt(ctx, nw.String()); err == nil {
+				st.LastPull = at
+			}
+		}
+	}
 	stats, err := x.cfg.Store.Stats(ctx, nw.String())
 	x.logChange(ctx, "record stats "+nw.String()[:8], err)
 	if err != nil {

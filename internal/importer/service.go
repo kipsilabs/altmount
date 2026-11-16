@@ -258,6 +258,7 @@ type Service struct {
 	broadcaster     *progress.ProgressBroadcaster // WebSocket progress broadcaster
 	userRepo        *database.UserRepository      // User repository for API key lookup
 	poolManager     pool.Manager                  // Pool manager — used to push admission caps on config change
+	peerBundle      PeerBundleFastPath            // optional; nil unless the peer network is on
 	contentVerifyFS contentverify.Opener          // Optional: real NzbFilesystem, set post-construction to break the init-order cycle with nzbfilesystem
 	log             *slog.Logger
 
@@ -468,7 +469,7 @@ func (s *Service) Resume() {
 
 // IsPaused returns whether the service is paused
 func (s *Service) IsPaused() bool {
-	return s.queueManager.IsPaused()
+	return s.queueManager != nil && s.queueManager.IsPaused()
 }
 
 func (s *Service) RegisterConfigChangeHandler(configManager any) {
@@ -938,6 +939,15 @@ func (s *Service) processNzbItem(ctx context.Context, item *database.ImportQueue
 		}
 	}
 
+	if s.peerBundleHook() != nil {
+		var targetPath string
+		if item.TargetPath != nil {
+			targetPath = *item.TargetPath
+		}
+		s.processor.setPeerItem(int(item.ID), peerItemInfo{targetPath: targetPath, skipArr: item.SkipArrNotification})
+		defer s.processor.clearPeerItem(int(item.ID))
+	}
+
 	resultPath, writtenPaths, err := s.processor.ProcessNzbFile(ctx, item.NzbPath, basePath, int(item.ID), allowedExtensionsOverride, &virtualDir, extractedFiles, item.Category, item.Metadata, item.DownloadID)
 	var expansion *nestedNzbJobsError
 	if errors.As(err, &expansion) {
@@ -1396,6 +1406,10 @@ func (s *Service) handleProcessingSuccess(ctx context.Context, item *database.Im
 		s.broadcaster.NotifyStreamable(int(item.ID), resultingPath)
 	}
 
+	// A peer-bundle import is playable at once but is not announced to the ARRs
+	// until every file passed its full check.
+	s.holdPeerQueueItem(ctx, item)
+
 	// Refresh mount path if needed before post-processing
 	s.postProcessor.RefreshMountPathIfNeeded(ctx, resultingPath, item.ID)
 
@@ -1844,6 +1858,9 @@ func (s *Service) CancelProcessing(itemID int64) error {
 
 // ExecuteItem manually triggers processing for a specific queue item, bypassing concurrency limits.
 func (s *Service) ExecuteItem(ctx context.Context, itemID int64) error {
+	if item, err := s.database.Repository.GetQueueItem(ctx, itemID); err == nil && item.IsPeerImport() {
+		return ErrPeerImportNoNZB
+	}
 	s.ProcessItemInBackground(ctx, itemID)
 	return nil
 }

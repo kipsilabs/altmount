@@ -21,6 +21,7 @@ func TestPeernetDefaults(t *testing.T) {
 	assert.Empty(t, c.Peernet.AdvertiseAddress)
 	assert.Equal(t, PeernetLevelOff, c.Peernet.OpenNetwork.Level)
 	assert.Empty(t, c.Peernet.OpenNetwork.Peers)
+	assert.False(t, c.Peernet.OpenNetwork.FastPath, "open-network layouts never replace archive analysis unless the user opts in")
 	assert.Empty(t, c.Peernet.Sharing.ExcludedCategories)
 	assert.Empty(t, c.Peernet.Sharing.ExcludedIndexers)
 	assert.Equal(t, 3, c.Peernet.MinCorroboration)

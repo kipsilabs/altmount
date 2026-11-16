@@ -212,11 +212,16 @@ func (p *Parser) ParseNzb(ctx context.Context, n *nzbparser.Nzb, nzbPath string,
 	// Build the shared NzbStore and segment index for v3 format.
 	// Must be built from the raw *nzbparser.Nzb BEFORE any per-file processing
 	// (which may filter/reorder files). The index maps message-id → flat store index.
-	parsed.Store, parsed.SegmentIndex = metadata.BuildStore(n)
+	if opts.PrebuiltStore != nil && opts.PrebuiltIndex != nil {
+		parsed.Store, parsed.SegmentIndex = opts.PrebuiltStore, opts.PrebuiltIndex
+	} else {
+		parsed.Store, parsed.SegmentIndex = metadata.BuildStore(n)
+	}
 
 	// Extract password from metadata, filename tags, subject lines, or raw NZB meta
-	if pwd := extractNzbPassword(n, nzbPath); pwd != "" {
+	if pwd, origin := extractNzbPasswordWithOrigin(n, nzbPath); pwd != "" {
 		parsed.SetPassword(pwd)
+		parsed.passwordOrigin = origin
 	}
 
 	// Fetch first segment data for all files in parallel
@@ -1864,16 +1869,34 @@ var (
 	passwordMetaRegex     = regexp.MustCompile(`(?i)<meta\b[^>]*type\s*=\s*["']?(?:password|pass|pwd|password_hash)["']?[^>]*>([\s\S]*?)<\/meta>`)
 )
 
+// PasswordOrigin says where the password in effect for an NZB was found.
+type PasswordOrigin int
+
+// Password origins.
+const (
+	PasswordOriginNone    PasswordOrigin = iota // no password
+	PasswordOriginMeta                          // a <meta type="password"> in the NZB content
+	PasswordOriginName                          // spelled in the NZB file name
+	PasswordOriginSubject                       // spelled in a file subject
+)
+
 func extractNzbPassword(n *nzbparser.Nzb, nzbPath string) string {
+	pwd, _ := extractNzbPasswordWithOrigin(n, nzbPath)
+	return pwd
+}
+
+// extractNzbPasswordWithOrigin is extractNzbPassword plus where the password
+// came from. The precedence is the same.
+func extractNzbPasswordWithOrigin(n *nzbparser.Nzb, nzbPath string) (string, PasswordOrigin) {
 	if n == nil {
-		return ""
+		return "", PasswordOriginNone
 	}
 	// 1. Check n.Meta with case-insensitive keys
 	if n.Meta != nil {
 		for k, v := range n.Meta {
 			if strings.EqualFold(k, "password") || strings.EqualFold(k, "pass") || strings.EqualFold(k, "pwd") || strings.EqualFold(k, "password_hash") {
 				if trimmed := strings.TrimSpace(v); trimmed != "" {
-					return trimmed
+					return trimmed, PasswordOriginMeta
 				}
 			}
 		}
@@ -1882,24 +1905,24 @@ func extractNzbPassword(n *nzbparser.Nzb, nzbPath string) string {
 	baseName := filepath.Base(nzbPath)
 	if m := passwordBracketsRegex.FindStringSubmatch(baseName); len(m) > 1 {
 		if trimmed := strings.TrimSpace(m[1]); trimmed != "" {
-			return trimmed
+			return trimmed, PasswordOriginName
 		}
 	}
 	if m := passwordSlashRegex.FindStringSubmatch(baseName); len(m) > 1 {
 		if trimmed := strings.TrimSpace(m[1]); trimmed != "" {
-			return trimmed
+			return trimmed, PasswordOriginName
 		}
 	}
 	// 3. Check file subjects for {{password}} or /password:xyz/
 	for _, f := range n.Files {
 		if m := passwordBracketsRegex.FindStringSubmatch(f.Subject); len(m) > 1 {
 			if trimmed := strings.TrimSpace(m[1]); trimmed != "" {
-				return trimmed
+				return trimmed, PasswordOriginSubject
 			}
 		}
 		if m := passwordSlashRegex.FindStringSubmatch(f.Subject); len(m) > 1 {
 			if trimmed := strings.TrimSpace(m[1]); trimmed != "" {
-				return trimmed
+				return trimmed, PasswordOriginSubject
 			}
 		}
 	}
@@ -1912,12 +1935,12 @@ func extractNzbPassword(n *nzbparser.Nzb, nzbPath string) string {
 			}
 			if m := passwordMetaRegex.FindSubmatch(data[:limit]); len(m) > 1 {
 				if trimmed := strings.TrimSpace(string(m[1])); trimmed != "" {
-					return trimmed
+					return trimmed, PasswordOriginMeta
 				}
 			}
 		}
 	}
-	return ""
+	return "", PasswordOriginNone
 }
 
 // propagateArchiveType sets the archive-type flag on non-PAR2 files that are

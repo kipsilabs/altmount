@@ -19,6 +19,7 @@ import (
 	"github.com/kipsilabs/altmount/internal/database"
 	internalerrors "github.com/kipsilabs/altmount/internal/errors"
 	"github.com/kipsilabs/altmount/internal/httpclient"
+	"github.com/kipsilabs/altmount/internal/importer"
 	"github.com/kipsilabs/altmount/internal/importer/utils/nzbtrim"
 	"github.com/kipsilabs/altmount/internal/nzbfile"
 	"github.com/kipsilabs/altmount/internal/nzblnk"
@@ -170,6 +171,7 @@ func (s *Server) handleListQueue(c *fiber.Ctx) error {
 	for i, item := range items {
 		response[i] = ToQueueItemResponse(item)
 	}
+	s.annotateQueuePeerOrigin(c.Context(), items, response)
 
 	// Create metadata
 	meta := &APIMeta{
@@ -218,6 +220,7 @@ func (s *Server) handleGetQueue(c *fiber.Ctx) error {
 
 	// Convert to API response format
 	response := ToQueueItemResponse(item)
+	s.annotateQueuePeerOrigin(c.Context(), []*database.ImportQueueItem{item}, []*QueueItemResponse{response})
 	return RespondSuccess(c, response)
 }
 
@@ -309,6 +312,10 @@ func (s *Server) handleRetryQueue(c *fiber.Ctx) error {
 
 	if item == nil {
 		return RespondNotFound(c, "Queue item", "")
+	}
+
+	if item.IsPeerImport() {
+		return RespondConflict(c, "Cannot retry a peer import", importer.ErrPeerImportNoNZB.Error())
 	}
 
 	// Only allow retry of pending, failed or completed items
@@ -828,7 +835,7 @@ func (s *Server) handleUploadNZBLnk(c *fiber.Ctx) error {
 			}
 		}
 
-		item, err := s.importerService.AddToQueue(c.Context(), tempFile, basePath, categoryPtr, &priority, nil, nil, &resolved.Indexer)
+		item, err := s.importerService.AddToQueue(c.Context(), tempFile, basePath, categoryPtr, &priority, queueMetadataForPassword(resolved.Password), nil, &resolved.Indexer)
 		if err != nil {
 			os.Remove(tempFile)
 			result.ErrorMessage = "Failed to add to queue: " + err.Error()
@@ -868,6 +875,17 @@ func sanitizeFilename(name string) string {
 		result = "download"
 	}
 	return result
+}
+
+// queueMetadataForPassword is the queue metadata of an item whose NZB had a
+// user-supplied password embedded by embedPasswordInNZB: it marks the password
+// as injected (never copying it), so the importer does not take it for one the
+// NZB came with. With no password there is no metadata.
+func queueMetadataForPassword(password string) *string {
+	if password == "" {
+		return nil
+	}
+	return importer.MarkPasswordInjected(nil)
 }
 
 // embedPasswordInNZB injects a password into the NZB XML metadata
@@ -981,7 +999,7 @@ func (s *Server) handleSearchNZBByName(c *fiber.Ctx) error {
 		}
 	}
 
-	item, err := s.importerService.AddToQueue(c.Context(), tempFile, basePath, categoryPtr, &priority, nil, nil, &resolved.Indexer)
+	item, err := s.importerService.AddToQueue(c.Context(), tempFile, basePath, categoryPtr, &priority, queueMetadataForPassword(resolved.Password), nil, &resolved.Indexer)
 	if err != nil {
 		os.Remove(tempFile)
 		return RespondInternalError(c, "Failed to add to queue", err.Error())
@@ -1038,6 +1056,9 @@ func (s *Server) handleRestartQueueBulk(c *fiber.Ctx) error {
 
 		if item.Status == database.QueueStatusProcessing {
 			processedCount++
+		}
+		if item.IsPeerImport() {
+			return RespondConflict(c, "Cannot restart a peer import", importer.ErrPeerImportNoNZB.Error())
 		}
 	}
 
@@ -1378,6 +1399,10 @@ func (s *Server) handleDownloadNZB(c *fiber.Ctx) error {
 
 	if item == nil {
 		return RespondNotFound(c, "Queue item", "")
+	}
+
+	if item.IsPeerImport() {
+		return RespondConflict(c, "No NZB for a peer import", importer.ErrPeerImportNoNZB.Error())
 	}
 
 	resolved, resolveErr := nzbfile.ResolveOnDisk(item.NzbPath)

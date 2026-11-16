@@ -4,11 +4,14 @@ import { ExposureLevelSelect } from "./ExposureLevelSelect";
 import type { NodeState } from "./nodeState";
 import { PeerAddressList } from "./PeerAddressList";
 import { PeerTable } from "./PeerTable";
+import { openNetworkProxyNote } from "./peernetStats";
 import { SharedDataBlock } from "./SharedDataBlock";
 
 interface OpenNetworkCardProps {
 	form: PeernetConfig;
 	openNetwork: PeernetNetworkStatus | undefined;
+	/** Set when peers are reached through the outbound proxy. */
+	outboundProxy?: boolean;
 	nodeState: NodeState;
 	onChange: (patch: Partial<PeernetConfig>) => void;
 	disabled?: boolean;
@@ -17,6 +20,7 @@ interface OpenNetworkCardProps {
 export function OpenNetworkCard({
 	form,
 	openNetwork,
+	outboundProxy = false,
 	nodeState,
 	onChange,
 	disabled = false,
@@ -49,6 +53,29 @@ export function OpenNetworkCard({
 				<p className="text-base-content/60 text-xs">
 					Private, loopback and similar local addresses are not connected to on the open network.
 				</p>
+
+				<fieldset className="fieldset">
+					<legend className="fieldset-legend">Use offered layouts when importing</legend>
+					<label className="label cursor-pointer justify-start gap-3 whitespace-normal">
+						<input
+							type="checkbox"
+							className="checkbox"
+							aria-label="Use open-network layouts when importing an NZB"
+							checked={open.fast_path}
+							disabled={disabled}
+							onChange={(e) => onChange({ open_network: { ...open, fast_path: e.target.checked } })}
+						/>
+						<span className="label-text whitespace-normal">
+							Use layouts offered by open-network peers to skip archive analysis when you import an
+							NZB. The result is verified by sampling, not by full analysis.
+						</span>
+					</label>
+					{openNetworkProxyNote({ outbound_proxy: outboundProxy }) && (
+						<p className="text-warning text-xs">
+							{openNetworkProxyNote({ outbound_proxy: outboundProxy })}
+						</p>
+					)}
+				</fieldset>
 
 				<fieldset className="fieldset">
 					<legend className="fieldset-legend">Minimum corroboration</legend>

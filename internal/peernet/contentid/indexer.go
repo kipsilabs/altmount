@@ -2,6 +2,8 @@ package contentid
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -40,6 +42,15 @@ type Repository interface {
 	DeleteByPrefix(ctx context.Context, dir string) error
 	RenamePrefix(ctx context.Context, oldDir, newDir string) error
 	ListPage(ctx context.Context, after string, limit int) ([]database.PeernetContentEntry, error)
+	GetByPath(ctx context.Context, filePath string) (database.PeernetContentEntry, bool, error)
+	RefByPath(ctx context.Context, filePath string) (database.PeernetContentRef, bool, error)
+	RefsByPrefix(ctx context.Context, dir string, limit int) ([]database.PeernetContentRef, error)
+	GroupSummaries(ctx context.Context, after string, limit int) ([]database.PeernetGroupSummary, error)
+	GroupCounts(ctx context.Context, keys []string) (map[string]int, error)
+	GroupMembers(ctx context.Context, keys []string) ([]database.PeernetContentEntry, error)
+	ApplyDerived(ctx context.Context, updates []database.PeernetDerivedUpdate) (int, error)
+	ClearDerivedGroup(ctx context.Context, key string, batch int) ([]string, error)
+	StillIndexed(ctx context.Context, releaseIDs []string) (map[string]bool, error)
 }
 
 // ServiceSource adapts a metadata.MetadataService to Source.
@@ -89,6 +100,7 @@ type Indexer struct {
 	repo      Repository
 	batchSize int
 	progress  func(BackfillResult)
+	derive    *deriveState
 
 	// Files of one release share one store; hashing a large store once per
 	// file would be quadratic, so the most recent result is remembered. It is
@@ -100,7 +112,7 @@ type Indexer struct {
 
 // NewIndexer builds an Indexer.
 func NewIndexer(src Source, repo Repository, opts ...Option) *Indexer {
-	i := &Indexer{src: src, repo: repo, batchSize: defaultBatchSize}
+	i := &Indexer{src: src, repo: repo, batchSize: defaultBatchSize, derive: newDeriveState()}
 	for _, o := range opts {
 		o(i)
 	}
@@ -142,9 +154,24 @@ func migratedStore(ref string) bool {
 	return false
 }
 
+// groupKey is the local-only key shared by the files of one import: a hash of
+// the source NZB path the importer recorded in each file's metadata (it holds
+// the queue item's own folder, so it is unique per import). It is empty when
+// the metadata names no source. It is never transmitted and never part of an
+// ID: only the File IDs of the group are.
+func groupKey(sourceNzbPath string) string {
+	p := strings.TrimSpace(strings.ReplaceAll(sourceNzbPath, "\\", "/"))
+	if p == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte("altmount-peernet/import-group/v1\x00" + p))
+	return hex.EncodeToString(sum[:])
+}
+
 // Entry computes the index row for a virtual path without storing it. The
-// release ID is empty when the metadata has no shared store, or only one the
-// migration rebuilt from the surviving files.
+// release ID is empty (scheme none) when the metadata has no shared store, or
+// only one the migration rebuilt from the surviving files; such files get a
+// library-derived ID later, from their group (see DeriveAll).
 func (i *Indexer) Entry(ctx context.Context, virtualPath string) (database.PeernetContentEntry, error) {
 	var zero database.PeernetContentEntry
 	if err := ctx.Err(); err != nil {
@@ -161,7 +188,7 @@ func (i *Indexer) Entry(ctx context.Context, virtualPath string) (database.Peern
 	if err != nil {
 		return zero, fmt.Errorf("file id %q: %w", virtualPath, err)
 	}
-	e := database.PeernetContentEntry{FilePath: virtualPath, FileID: fileID.String()}
+	e := database.PeernetContentEntry{FilePath: virtualPath, FileID: fileID.String(), GroupKey: groupKey(m.SourceNzbPath)}
 	if m.StoreRef != "" && !migratedStore(m.StoreRef) {
 		store, err := i.src.ReadStore(m.StoreRef)
 		if err != nil {
@@ -169,7 +196,7 @@ func (i *Indexer) Entry(ctx context.Context, virtualPath string) (database.Peern
 		}
 		switch rid, err := i.releaseID(store); {
 		case err == nil:
-			e.ReleaseID = rid.String()
+			e.ReleaseID, e.ReleaseScheme = rid.String(), database.PeernetSchemeNZB
 		case errors.Is(err, ErrNoSegments):
 			// A store with no real article cannot name a release; keep the file ID.
 		default:
@@ -179,11 +206,49 @@ func (i *Indexer) Entry(ctx context.Context, virtualPath string) (database.Peern
 	return e, nil
 }
 
-// IndexPath computes and stores the IDs of one virtual file.
+// sameIdentity reports whether a stored row already says what a freshly
+// computed entry says. A derived ID (scheme files) is not part of the entry:
+// it belongs to the row's group, so a row that has one is the same as an entry
+// without a store-based ID as long as the file and the group are unchanged.
+func sameIdentity(row, e database.PeernetContentEntry) bool {
+	if row.FileID != e.FileID || row.GroupKey != e.GroupKey {
+		return false
+	}
+	if e.ReleaseScheme == database.PeernetSchemeNZB {
+		return row.ReleaseScheme == database.PeernetSchemeNZB && row.ReleaseID == e.ReleaseID
+	}
+	return row.ReleaseScheme != database.PeernetSchemeNZB
+}
+
+// IndexPath computes and stores the IDs of one virtual file. A file whose row
+// already says the same is not written again (health checks and status
+// updates rewrite metadata all the time), so the row never flickers and no
+// group is re-derived for nothing. A changed row marks its group, and the old
+// one if the group moved, for the next derive pass.
 func (i *Indexer) IndexPath(ctx context.Context, virtualPath string) error {
 	e, err := i.Entry(ctx, virtualPath)
 	if err != nil {
 		return err
 	}
-	return i.repo.Upsert(ctx, e)
+	old, had, err := i.repo.GetByPath(ctx, virtualPath)
+	if err != nil {
+		return fmt.Errorf("read index row %q: %w", virtualPath, err)
+	}
+	if had && sameIdentity(old, e) {
+		return nil
+	}
+	if had && keepsBundleGrouping(old, e) {
+		// The release identity came from a verified bundle; the metadata of a
+		// bundle import cannot recompute it or its group.
+		return nil
+	}
+	if err := i.repo.Upsert(ctx, e); err != nil {
+		return err
+	}
+	if had {
+		i.noteChanged(old, e)
+	} else {
+		i.noteChanged(database.PeernetContentEntry{}, e)
+	}
+	return nil
 }

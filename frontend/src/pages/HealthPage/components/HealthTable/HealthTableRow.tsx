@@ -1,5 +1,6 @@
 import { Clock, Heart, HeartCrack, Loader, Wrench } from "lucide-react";
 import { memo, useMemo } from "react";
+import { PeerBadge } from "../../../../components/ui/PeerBadge";
 import { HealthBadge } from "../../../../components/ui/StatusBadge";
 import {
 	formatFutureTime,
@@ -135,6 +136,10 @@ export const HealthTableRow = memo(function HealthTableRow({
 					<div>
 						<div className="flex flex-wrap items-center gap-2">
 							<div className="break-all font-bold">{item.file_path.split("/").pop() || ""}</div>
+							<PeerBadge
+								origin={item.peer_origin}
+								fullCheckPending={item.peer_full_check_pending}
+							/>
 							{item.indexer && (
 								<span className="badge badge-primary badge-xs shrink-0 border-primary/30 bg-primary/20 py-1.5 font-bold text-primary tracking-tight">
 									{item.indexer}

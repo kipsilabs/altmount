@@ -17,6 +17,16 @@ import (
 // ISO expansion), so this is a safety net, not an expected limit.
 const maxDirExpansionDepth = 8
 
+// WillScheduleHealth reports whether an import under the current configuration
+// creates a health record (and so a check) for the written file at path. It is
+// the single rule ScheduleHealthCheck applies and the peer-bundle importer asks.
+func WillScheduleHealth(cfg *config.Config, path string) bool {
+	if cfg == nil || !cfg.GetHealthEnabled() {
+		return false
+	}
+	return cfg.Import.ImportStrategy == config.ImportStrategyNone || isArrImportableMedia(path)
+}
+
 // ScheduleHealthCheck schedules an immediate health check for an imported file.
 // Multi-file imports (e.g. season packs) schedule one check per written virtual
 // file — resultingPath is a directory there, so the per-file paths are the only
@@ -55,7 +65,7 @@ func (c *Coordinator) ScheduleHealthCheck(ctx context.Context, item *database.Im
 	if cfg.Import.ImportStrategy != config.ImportStrategyNone {
 		media := make([]string, 0, len(paths))
 		for _, p := range paths {
-			if isArrImportableMedia(p) {
+			if WillScheduleHealth(cfg, p) {
 				media = append(media, p)
 			}
 		}
@@ -163,6 +173,7 @@ func isArrImportableMedia(p string) bool {
 	}
 	return arrAudioBookExtensions[strings.ToLower(path.Ext(p))]
 }
+
 // expandWrittenPaths resolves "DIR:"-prefixed entries (whole-directory imports such
 // as RAR/7z archives, which only report their NZB folder) into the per-file virtual
 // paths beneath them by walking the metadata tree. Plain file entries pass through

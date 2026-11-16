@@ -16,6 +16,7 @@ import { memo, useState } from "react";
 import { formatBytes, formatRelativeTime, truncateText } from "../../lib/utils";
 import { type QueueItem, QueueStatus } from "../../types/api";
 import { PathDisplay } from "../ui/PathDisplay";
+import { PeerBadge } from "../ui/PeerBadge";
 import { StatusBadge } from "../ui/StatusBadge";
 
 interface QueueItemCardProps {
@@ -70,6 +71,15 @@ export const QueueItemCard = memo(function QueueItemCard({
 								<PathDisplay path={item.nzb_display_name} maxLength={80} showFileName />
 							</div>
 						</div>
+
+						{item.peer_origin && (
+							<div className="mt-1">
+								<PeerBadge
+									origin={item.peer_origin}
+									fullCheckPending={item.peer_full_check_pending}
+								/>
+							</div>
+						)}
 
 						{item.indexer && (
 							<div className="mt-1 flex items-center gap-1 text-base-content/50 text-xs">

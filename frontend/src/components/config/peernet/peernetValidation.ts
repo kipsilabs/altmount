@@ -20,7 +20,7 @@ export const DEFAULT_PEERNET_CONFIG: PeernetConfig = {
 	accept_incoming: false,
 	listen_port: DEFAULT_LISTEN_PORT,
 	advertise_address: "",
-	open_network: { level: 0, peers: [] },
+	open_network: { level: 0, peers: [], fast_path: false },
 	sharing: { excluded_categories: [], excluded_indexers: [] },
 	min_corroboration: 3,
 };
@@ -37,7 +37,7 @@ export const EXPOSURE_LEVELS: readonly ExposureLevelInfo[] = [
 		level: 1,
 		name: "Receive only",
 		description:
-			"Receives release records and health information from peers and shares none of your releases. Peers can only see that this node is connected, through its node ID and IP address.",
+			"Receives release records and health information from peers and shares none of your releases. Peers can only see that this node is connected, through its node ID and IP address. It can also receive a bundle on demand, when you play or import a release a peer offers; that reveals the request to the peer asked.",
 	},
 	{
 		level: 2,
@@ -49,17 +49,18 @@ export const EXPOSURE_LEVELS: readonly ExposureLevelInfo[] = [
 		level: 3,
 		name: "Share bundles",
 		description:
-			"Not available yet. Serving finished imports to peers is not implemented, so this level cannot be selected. A network already set to 3 behaves exactly like level 2.",
+			"Also serves finished imports to peers on request, as bundles. The article IDs of your releases leave this node, and peers see which releases you have, tied to your node ID and IP address. Never shared as a bundle: rclone-encrypted files, files repaired by local PAR2 patches, and password-protected releases unless the password came inside the NZB itself on an import made after this feature was enabled.",
 	},
 ];
 
 export const LEVEL_PRIVACY_NOTICE =
 	"At this level other nodes can see which releases this instance has, tied to its node ID and IP address.";
 
-// Level 3 adds nothing today (no bundles are served), so it carries the same
-// notice as level 2 and claims nothing more.
-export function levelPrivacyNotice(_level: number): string {
-	return LEVEL_PRIVACY_NOTICE;
+export const LEVEL3_PRIVACY_NOTICE =
+	"At level 3 this node serves finished imports to peers on request, so the article IDs of your releases leave this node (at level 2 they do not). Peers see which releases you have, tied to your node ID and IP address. Never shared as a bundle: rclone-encrypted files, files repaired by local PAR2 patches, and password-protected releases unless the password came inside the NZB itself on an import made after this feature was enabled.";
+
+export function levelPrivacyNotice(level: number): string {
+	return level >= 3 ? LEVEL3_PRIVACY_NOTICE : LEVEL_PRIVACY_NOTICE;
 }
 
 // Levels 2 and 3 publish information about this instance's own releases.
@@ -385,6 +386,7 @@ export function normalizePeernetConfig(raw: Partial<PeernetConfig> | undefined):
 		open_network: {
 			level: level !== undefined && isPeernetLevel(level) ? level : 0,
 			peers: [...(raw?.open_network?.peers ?? [])],
+			fast_path: raw?.open_network?.fast_path === true,
 		},
 		sharing: {
 			excluded_categories: [...(raw?.sharing?.excluded_categories ?? [])],

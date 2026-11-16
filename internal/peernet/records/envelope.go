@@ -10,14 +10,16 @@ import (
 
 // Envelope is the indexable summary of an encoded record.
 type Envelope struct {
-	Kind        Kind
-	NetworkID   netid.NetworkID
-	ReleaseID   ReleaseID
-	FileID      FileID // zero for release records
-	PublisherID identity.NodeID
-	CreatedAt   time.Time
-	ExpiresAt   time.Time
-	ContentHash [32]byte
+	Kind      Kind
+	NetworkID netid.NetworkID
+	ReleaseID ReleaseID
+	FileID    FileID // zero for release records
+	// ReleaseScheme is SchemeNZB or SchemeFiles (an absent field is SchemeNZB).
+	ReleaseScheme uint8
+	PublisherID   identity.NodeID
+	CreatedAt     time.Time
+	ExpiresAt     time.Time
+	ContentHash   [32]byte
 }
 
 // Peek strictly decodes an encoded record of either kind and returns its
@@ -57,7 +59,7 @@ func Peek(b []byte) (Envelope, error) {
 func envelopeOf(k Kind, h *Header, file FileID, b []byte) Envelope {
 	return Envelope{
 		Kind: k, NetworkID: h.NetworkID, ReleaseID: h.ReleaseID, FileID: file,
-		PublisherID: h.PublisherID, CreatedAt: h.CreatedAt, ExpiresAt: h.ExpiresAt,
+		ReleaseScheme: h.Scheme(), PublisherID: h.PublisherID, CreatedAt: h.CreatedAt, ExpiresAt: h.ExpiresAt,
 		ContentHash: ContentHash(b),
 	}
 }

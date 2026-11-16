@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -34,6 +35,9 @@ const (
 type HintAdvisor interface {
 	HealthAdvice(ctx context.Context, releaseID, fileID string, localBackbones []string, now time.Time) (hints.Advice, error)
 	NetworkHealthy(ctx context.Context, releaseIDs ...string) (map[string]hints.NetworkHealth, error)
+	// NetworkHealthyFiles labels releases from file-level evidence; the map is
+	// release ID to the File IDs of its main files.
+	NetworkHealthyFiles(ctx context.Context, releases map[string][]string) (map[string]hints.NetworkHealth, error)
 	// SpendRecheck pays for a check moved forward on unhealthy evidence.
 	SpendRecheck(releaseID, fileID string, evidenceAt, now time.Time) bool
 }
@@ -71,10 +75,11 @@ type hintsHub struct {
 	recheckScheduled int64
 	lookupErrors     int64
 	cache            map[string]labelEntry
+	candCache        map[string]candEntry
 }
 
 func newHintsHub() *hintsHub {
-	return &hintsHub{given: map[string]int64{}, cache: map[string]labelEntry{}}
+	return &hintsHub{given: map[string]int64{}, cache: map[string]labelEntry{}, candCache: map[string]candEntry{}}
 }
 
 func (h *hintsHub) add(f func(*hintsHub)) {
@@ -155,9 +160,11 @@ func (s *Service) HealthAdvice(ctx context.Context, filePath string) hints.Advic
 		hub.lookupError()
 		return hints.Advice{}
 	}
-	if !ok || entry.ReleaseID == "" {
+	if !ok {
 		return hints.Advice{}
 	}
+	// Evidence is found by File ID, so a file with no Release ID still gets
+	// advice.
 	advice, err := src.Advisor.HealthAdvice(ctx, entry.ReleaseID, entry.FileID, src.Backbones(), time.Now())
 	if err != nil || ctx.Err() != nil {
 		hub.lookupError()
@@ -181,9 +188,11 @@ func (s *Service) NotePeerAdviceApplied(kind hints.AdviceKind) {
 
 // NetworkHealthyPaths returns the paths (of those given, at most
 // database.PeernetMaxPathsPerQuery) whose release is healthy on the network.
-// The match is exact by release ID from the content index; a path without one
-// is never labelled. It is one bounded batch lookup, cached for a short time,
-// and fails open to an empty result.
+// The release is the one the content index has for the path (a path without
+// one is never labelled) and it is healthy when every one of its video files
+// has qualifying evidence, matched by File ID (see hints.NetworkHealthyFiles).
+// It is one bounded batch lookup (one release-to-files query, one advisor
+// call), cached for a short time, and fails open to an empty result.
 func (s *Service) NetworkHealthyPaths(ctx context.Context, paths []string) map[string]bool {
 	out := map[string]bool{}
 	n, src := s.hintContext()
@@ -201,7 +210,7 @@ func (s *Service) NetworkHealthyPaths(ctx context.Context, paths []string) map[s
 		hub.lookupError()
 		return out
 	}
-	healthy, err := s.releaseLabels(ctx, src, rels)
+	healthy, err := s.releaseLabels(ctx, n, src, rels)
 	if err != nil {
 		hub.lookupError()
 		return out
@@ -215,7 +224,7 @@ func (s *Service) NetworkHealthyPaths(ctx context.Context, paths []string) map[s
 }
 
 // releaseLabels answers per release, from the short cache where it can.
-func (s *Service) releaseLabels(ctx context.Context, src *HintSources, rels map[string]string) (map[string]bool, error) {
+func (s *Service) releaseLabels(ctx context.Context, n *node, src *HintSources, rels map[string]string) (map[string]bool, error) {
 	hub, now := s.deps.hub, time.Now()
 	res := map[string]bool{}
 	var missing []string
@@ -236,7 +245,18 @@ func (s *Service) releaseLabels(ctx context.Context, src *HintSources, rels map[
 	if len(missing) == 0 {
 		return res, nil
 	}
-	got, err := src.Advisor.NetworkHealthy(ctx, missing...)
+	// The label is about the release's main files: look them up in one query,
+	// ask for one more than the label can use so a release with too many is
+	// recognised.
+	files, err := n.deps.Content.VideoFilesOfReleases(ctx, missing, hints.MaxLabelFilesPerRelease)
+	if err != nil {
+		return nil, err
+	}
+	asked := make(map[string][]string, len(missing))
+	for _, rel := range missing {
+		asked[rel] = files[rel]
+	}
+	got, err := src.Advisor.NetworkHealthyFiles(ctx, asked)
 	if err != nil {
 		return nil, err
 	}
@@ -320,13 +340,12 @@ func (n *node) recheckNetwork(ctx context.Context, src *HintSources, network str
 			if considered >= recheckFilesPerRef {
 				break
 			}
-			if e.ReleaseID != ref.ReleaseID {
-				continue
-			}
+			// Evidence is about the file, whatever release ID it was
+			// published under: every local copy of the file qualifies.
 			considered++
 			// Asking is read-only: the budget is spent below, and only when
 			// a check really was moved forward.
-			advice, err := src.Advisor.HealthAdvice(ctx, ref.ReleaseID, ref.FileID, src.Backbones(), now)
+			advice, err := src.Advisor.HealthAdvice(ctx, e.ReleaseID, ref.FileID, src.Backbones(), now)
 			if err != nil {
 				hub.lookupError()
 				return false
@@ -340,7 +359,7 @@ func (n *node) recheckNetwork(ctx context.Context, src *HintSources, network str
 				failed = true
 				continue
 			}
-			if moved && src.Advisor.SpendRecheck(ref.ReleaseID, ref.FileID, advice.EvidenceAt, now) {
+			if moved && src.Advisor.SpendRecheck(e.ReleaseID, ref.FileID, advice.EvidenceAt, now) {
 				hub.add(func(h *hintsHub) { h.recheckScheduled++ })
 			}
 		}
@@ -387,4 +406,121 @@ func (n *node) clearHintCursor(id netid.NetworkID) {
 	defer n.hintMu.Unlock()
 	delete(n.hintCursor, id.String())
 	delete(n.hintRetries, id.String())
+}
+
+// PeerCandidate is one release other nodes announced for a media key that this
+// node can fetch a bundle of and does not have. Title is peer-supplied data:
+// render it as text only.
+type PeerCandidate struct {
+	ReleaseID string
+	Title     string
+	TotalSize int64
+	// Healthy: healthy on the network (see hints.NetworkHealth).
+	Healthy bool
+}
+
+// candidateAdvisor is the optional part of the advisor that lists release
+// records for a media key (*hints.Advisor has it).
+type candidateAdvisor interface {
+	Candidates(ctx context.Context, imdbID string, season, episode *int) ([]hints.Candidate, error)
+}
+
+const (
+	peerCandidatesTimeout = 3 * time.Second
+	peerCandidatesTTL     = 15 * time.Second
+	peerCandidatesCache   = 64
+	// peerCandidatesScan bounds how many records one lookup checks for a
+	// fetchable offer; peerCandidatesMax how many it returns.
+	peerCandidatesScan = 20
+	peerCandidatesMax  = 10
+)
+
+type candEntry struct {
+	list []PeerCandidate
+	at   time.Time
+}
+
+// PeerCandidates lists releases other nodes announced for a media key (IMDb ID,
+// and season and episode for series; nil for a movie) that have a bundle this
+// node can fetch from a verified peer and that this node does not already have.
+// Healthy-on-the-network releases come first, then newest; at most ten. It is
+// one bounded lookup with a short timeout and a short cache, and fails open: on
+// any error, with the feature's consumers off or with no receiving network it
+// returns nothing.
+func (s *Service) PeerCandidates(ctx context.Context, imdbID string, season, episode *int) []PeerCandidate {
+	n, src := s.hintContext()
+	if n == nil || src == nil || n.fetcher == nil || n.deps.Content == nil || len(s.ReceivingNetworks()) == 0 {
+		return nil
+	}
+	adv, ok := src.Advisor.(candidateAdvisor)
+	if !ok {
+		return nil
+	}
+	key := candidateKey(imdbID, season, episode)
+	hub := s.deps.hub
+	hub.mu.Lock()
+	if e, ok := hub.candCache[key]; ok && time.Since(e.at) < peerCandidatesTTL {
+		hub.mu.Unlock()
+		return append([]PeerCandidate(nil), e.list...)
+	}
+	hub.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(ctx, peerCandidatesTimeout)
+	defer cancel()
+	found, err := adv.Candidates(ctx, imdbID, season, episode)
+	if err != nil {
+		hub.lookupError()
+		return nil
+	}
+	var rels []string
+	for _, c := range found {
+		if !c.Own {
+			rels = append(rels, c.ReleaseID)
+		}
+	}
+	var local map[string]bool
+	if len(rels) > 0 {
+		if local, err = n.deps.Content.StillIndexed(ctx, rels); err != nil {
+			hub.lookupError()
+			return nil
+		}
+	}
+	var out []PeerCandidate
+	scanned := 0
+	for _, c := range found {
+		if c.Own || local[c.ReleaseID] || len(out) >= peerCandidatesMax || scanned >= peerCandidatesScan {
+			continue
+		}
+		scanned++
+		offers, err := n.fetcher.Offers(ctx, c.ReleaseID)
+		if err != nil {
+			hub.lookupError()
+			return nil
+		}
+		for _, o := range offers {
+			if o.Fetchable && !o.Own {
+				out = append(out, PeerCandidate{ReleaseID: c.ReleaseID, Title: c.Title, TotalSize: c.TotalSize, Healthy: c.Health.Healthy})
+				break
+			}
+		}
+	}
+	hub.mu.Lock()
+	if len(hub.candCache) >= peerCandidatesCache {
+		clear(hub.candCache)
+	}
+	hub.candCache[key] = candEntry{list: append([]PeerCandidate(nil), out...), at: time.Now()}
+	hub.mu.Unlock()
+	return out
+}
+
+func candidateKey(imdbID string, season, episode *int) string {
+	k := imdbID
+	for _, v := range []*int{season, episode} {
+		if v == nil {
+			k += "|-"
+		} else {
+			k += "|" + strconv.Itoa(*v)
+		}
+	}
+	return k
 }

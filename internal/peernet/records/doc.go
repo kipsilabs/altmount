@@ -29,6 +29,16 @@
 //	6  publisher_key       bytes   32  (Ed25519)
 //	7  created_at          varint
 //	8  expires_at          varint
+//	9  release_scheme      varint  optional; absent means 1 ("nzb": the
+//	                               release_id hashes the NZB segment list);
+//	                               present must be exactly 2 ("files": the
+//	                               release_id is derived from File IDs, see
+//	                               contentid.ReleaseIDFromFiles). 1 and every
+//	                               other value are rejected. It is part of the
+//	                               signed body. Records without it are
+//	                               byte-identical to those signed before it
+//	                               existed. Nodes that predate it reject a
+//	                               record that carries it (unknown field).
 //
 // Release record:
 //

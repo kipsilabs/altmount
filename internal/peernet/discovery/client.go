@@ -37,6 +37,9 @@ func (s *Service) call(ctx context.Context, nc NetworkConfig, addr string, node 
 		_ = resp.Body.Close()
 		return nil, fmt.Errorf("discovery: verify response: %w", err)
 	}
+	if resp.RemoteIP != "" {
+		s.connIPs.Store(node.String(), resp.RemoteIP)
+	}
 	return resp, nil
 }
 

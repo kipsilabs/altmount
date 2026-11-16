@@ -52,6 +52,9 @@ type Peer struct {
 	// Trusted marks an address from local configuration rather than learned
 	// from a peer (see transport.CallOptions.TrustedAddress).
 	Trusted bool
+	// ConnectedIP is the literal IP this node last connected to when it
+	// verified the peer ("" when none is recorded). Corroboration keys on it.
+	ConnectedIP string
 }
 
 // PeerSource lists the verified peers of a network, at most limit of them.
@@ -175,6 +178,20 @@ func (x *Exchange) network(id netid.NetworkID) (NetworkInfo, bool) {
 	defer x.mu.Unlock()
 	info, ok := x.nets[id.String()]
 	return info, ok
+}
+
+// NetworkLevel returns the exposure level of a registered network. A network
+// that is not registered (unknown, off, or removed by its host) is not found.
+func (x *Exchange) NetworkLevel(id netid.NetworkID) (int, bool) {
+	info, ok := x.network(id)
+	return info.Level, ok
+}
+
+// PeerBackedOff reports whether peer, or the remote address ip (empty when
+// unknown), is currently backed off for sending hostile records in nw. Other
+// services use it to refuse a peer record exchange has already struck.
+func (x *Exchange) PeerBackedOff(nw netid.NetworkID, peer identity.NodeID, ip string) bool {
+	return x.pusherBackedOff(nw, peer, ip)
 }
 
 // networks returns the registered networks sorted by ID.

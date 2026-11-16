@@ -347,16 +347,17 @@ func (r *Repository) GetQueueItem(ctx context.Context, id int64) (*ImportQueueIt
 	query := `
 		SELECT id, download_id, nzb_path, relative_path, category, priority, status, created_at, updated_at,
 		       started_at, completed_at, retry_count, max_retries, error_message, batch_id, metadata, file_size, storage_path, target_path, indexer,
-		       skip_arr_notification, skip_post_import_links
+		       skip_arr_notification, skip_post_import_links, peer_hold
 		FROM import_queue WHERE id = ?
 	`
 
 	var item ImportQueueItem
+	var peerHold int
 	err := r.db.QueryRowContext(ctx, query, id).Scan(
 		&item.ID, &item.DownloadID, &item.NzbPath, &item.RelativePath, &item.Category, &item.Priority, &item.Status,
 		&item.CreatedAt, &item.UpdatedAt, &item.StartedAt, &item.CompletedAt,
 		&item.RetryCount, &item.MaxRetries, &item.ErrorMessage, &item.BatchID, &item.Metadata, &item.FileSize, &item.StoragePath, &item.TargetPath, &item.Indexer,
-		&item.SkipArrNotification, &item.SkipPostImportLinks,
+		&item.SkipArrNotification, &item.SkipPostImportLinks, &peerHold,
 	)
 
 	if err != nil {
@@ -365,6 +366,7 @@ func (r *Repository) GetQueueItem(ctx context.Context, id int64) (*ImportQueueIt
 		}
 		return nil, fmt.Errorf("failed to get queue item: %w", err)
 	}
+	item.PeerHold = peerHold != 0
 
 	return &item, nil
 }
@@ -374,16 +376,17 @@ func (r *Repository) GetQueueItemByDownloadID(ctx context.Context, downloadID st
 	query := `
 		SELECT id, download_id, nzb_path, relative_path, category, priority, status, created_at, updated_at,
 		       started_at, completed_at, retry_count, max_retries, error_message, batch_id, metadata, file_size, storage_path, target_path, indexer,
-		       skip_arr_notification, skip_post_import_links
+		       skip_arr_notification, skip_post_import_links, peer_hold
 		FROM import_queue WHERE download_id = ?
 	`
 
 	var item ImportQueueItem
+	var peerHold int
 	err := r.db.QueryRowContext(ctx, query, downloadID).Scan(
 		&item.ID, &item.DownloadID, &item.NzbPath, &item.RelativePath, &item.Category, &item.Priority, &item.Status,
 		&item.CreatedAt, &item.UpdatedAt, &item.StartedAt, &item.CompletedAt,
 		&item.RetryCount, &item.MaxRetries, &item.ErrorMessage, &item.BatchID, &item.Metadata, &item.FileSize, &item.StoragePath, &item.TargetPath, &item.Indexer,
-		&item.SkipArrNotification, &item.SkipPostImportLinks,
+		&item.SkipArrNotification, &item.SkipPostImportLinks, &peerHold,
 	)
 
 	if err != nil {
@@ -392,6 +395,7 @@ func (r *Repository) GetQueueItemByDownloadID(ctx context.Context, downloadID st
 		}
 		return nil, fmt.Errorf("failed to get queue item by download_id: %w", err)
 	}
+	item.PeerHold = peerHold != 0
 
 	return &item, nil
 }
@@ -416,10 +420,27 @@ func (r *Repository) UpdateQueueItemIndexer(ctx context.Context, id int64, index
 	return nil
 }
 
+// dropHeldHistory deletes the provisional history rows of the held peer-import
+// queue items matching the condition. A held item is not yet a finished import,
+// so nothing of it may outlive its queue row.
+func (r *Repository) dropHeldHistory(ctx context.Context, cond string, args ...any) error {
+	_, err := r.db.ExecContext(ctx,
+		`DELETE FROM import_history WHERE nzb_id IN (SELECT id FROM import_queue WHERE peer_hold <> 0 AND `+cond+`)`, args...)
+	if err != nil {
+		return fmt.Errorf("failed to drop the provisional history of a held peer import: %w", err)
+	}
+	return nil
+}
+
 // RemoveFromQueueByDownloadID removes an item from the queue by its DownloadID
 func (r *Repository) RemoveFromQueueByDownloadID(ctx context.Context, downloadID string) error {
 	query := `DELETE FROM import_queue WHERE download_id = ?`
 
+	// The provisional history of a held peer import goes first: once the queue
+	// row is gone its history row loses nzb_id and would show as Completed.
+	if err := r.dropHeldHistory(ctx, `download_id = ?`, downloadID); err != nil {
+		return err
+	}
 	result, err := r.db.ExecContext(ctx, query, downloadID)
 	if err != nil {
 		return fmt.Errorf("failed to remove from queue by download_id: %w", err)
@@ -493,6 +514,9 @@ func (r *Repository) HasActiveOrRecentQueueItemForStoragePath(
 
 // DeleteQueueItemsByPath removes items from the queue matching the given path
 func (r *Repository) DeleteQueueItemsByPath(ctx context.Context, path string) error {
+	if err := r.dropHeldHistory(ctx, `(storage_path = ? OR nzb_path = ?)`, path, path); err != nil {
+		return err
+	}
 	_, err := r.db.ExecContext(ctx,
 		`DELETE FROM import_queue WHERE storage_path = ? OR nzb_path = ?`, path, path)
 	if err != nil {
@@ -881,15 +905,37 @@ func (r *Repository) ListQueueItems(ctx context.Context, status *QueueStatus, se
 
 // ListActiveQueueItems retrieves pending and processing queue items
 func (r *Repository) ListActiveQueueItems(ctx context.Context, search string, category string, limit, offset int, sortBy, sortOrder string) ([]*ImportQueueItem, error) {
+	return r.listActiveQueueItems(ctx, false, search, category, limit, offset, sortBy, sortOrder)
+}
+
+// ListActiveQueueItemsWithHeld is ListActiveQueueItems plus the completed items
+// a peer bundle import still holds back (peer_hold set): the SABnzbd-compatible
+// queue shows them as work in progress.
+func (r *Repository) ListActiveQueueItemsWithHeld(ctx context.Context, search string, category string, limit, offset int, sortBy, sortOrder string) ([]*ImportQueueItem, error) {
+	return r.listActiveQueueItems(ctx, true, search, category, limit, offset, sortBy, sortOrder)
+}
+
+const activeQueueStatuses = "(status = 'pending' OR status = 'processing' OR status = 'paused')"
+
+// activeQueueCondition is the status condition of the active queue, widened by
+// the held peer imports when withHeld is set.
+func activeQueueCondition(withHeld bool) string {
+	if withHeld {
+		return "(" + activeQueueStatuses + " OR peer_hold <> 0)"
+	}
+	return activeQueueStatuses
+}
+
+func (r *Repository) listActiveQueueItems(ctx context.Context, withHeld bool, search string, category string, limit, offset int, sortBy, sortOrder string) ([]*ImportQueueItem, error) {
 	var query string
 	var args []any
 
 	baseSelect := `SELECT id, download_id, nzb_path, relative_path, category, priority, status, created_at, updated_at,
 	               started_at, completed_at, retry_count, max_retries, error_message, batch_id, metadata, file_size, storage_path, target_path, indexer,
-	               skip_arr_notification, skip_post_import_links
+	               skip_arr_notification, skip_post_import_links, peer_hold
 	               FROM import_queue`
 
-	conditions := []string{"(status = 'pending' OR status = 'processing' OR status = 'paused')"}
+	conditions := []string{activeQueueCondition(withHeld)}
 	var conditionArgs []any
 
 	if search != "" {
@@ -937,15 +983,17 @@ func (r *Repository) ListActiveQueueItems(ctx context.Context, search string, ca
 	var items []*ImportQueueItem
 	for rows.Next() {
 		var item ImportQueueItem
+		var peerHold int
 		err := rows.Scan(
 			&item.ID, &item.DownloadID, &item.NzbPath, &item.RelativePath, &item.Category, &item.Priority, &item.Status,
 			&item.CreatedAt, &item.UpdatedAt, &item.StartedAt, &item.CompletedAt,
 			&item.RetryCount, &item.MaxRetries, &item.ErrorMessage, &item.BatchID, &item.Metadata, &item.FileSize, &item.StoragePath, &item.TargetPath, &item.Indexer,
-			&item.SkipArrNotification, &item.SkipPostImportLinks,
+			&item.SkipArrNotification, &item.SkipPostImportLinks, &peerHold,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan queue item: %w", err)
 		}
+		item.PeerHold = peerHold != 0
 		items = append(items, &item)
 	}
 
@@ -997,10 +1045,19 @@ func (r *Repository) CountQueueItems(ctx context.Context, status *QueueStatus, s
 
 // CountActiveQueueItems counts the total number of pending and processing queue items
 func (r *Repository) CountActiveQueueItems(ctx context.Context, search string, category string) (int, error) {
+	return r.countActiveQueueItems(ctx, false, search, category)
+}
+
+// CountActiveQueueItemsWithHeld counts what ListActiveQueueItemsWithHeld lists.
+func (r *Repository) CountActiveQueueItemsWithHeld(ctx context.Context, search string, category string) (int, error) {
+	return r.countActiveQueueItems(ctx, true, search, category)
+}
+
+func (r *Repository) countActiveQueueItems(ctx context.Context, withHeld bool, search string, category string) (int, error) {
 	var query string
 	var args []any
 
-	baseQuery := `SELECT COUNT(*) FROM import_queue WHERE (status = 'pending' OR status = 'processing' OR status = 'paused')`
+	baseQuery := `SELECT COUNT(*) FROM import_queue WHERE ` + activeQueueCondition(withHeld)
 
 	var conditions []string
 	var conditionArgs []any
@@ -1366,7 +1423,7 @@ func sabnzbdHistoryUnion(category string) (string, []any) {
 		       q.file_size, q.completed_at, q.category, q.storage_path, q.metadata, q.error_message,
 		       COALESCE(q.completed_at, q.updated_at, q.created_at) AS sort_time
 		  FROM import_queue q
-		 WHERE q.status = 'completed' AND q.skip_arr_notification = FALSE
+		 WHERE q.status = 'completed' AND q.skip_arr_notification = FALSE AND q.peer_hold = 0
 		   AND (? = '' OR LOWER(q.category) = LOWER(?))
 		UNION ALL
 		SELECT 'history', COALESCE(h.nzb_id, h.id), h.download_id, h.nzb_name, 'completed',

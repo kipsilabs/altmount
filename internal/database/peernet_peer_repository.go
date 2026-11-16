@@ -274,6 +274,25 @@ func peerAddrPrefix(address string) string {
 	return pre.String()
 }
 
+// connectedPrefix is the /24 (IPv4) or /48 (IPv6) of a literal IP, "" for
+// anything else (an empty or non-IP value counts for nothing).
+func connectedPrefix(ip string) string {
+	a, err := netip.ParseAddr(strings.TrimSpace(ip))
+	if err != nil {
+		return ""
+	}
+	a = a.Unmap()
+	bits := 48
+	if a.Is4() {
+		bits = 24
+	}
+	pre, err := a.Prefix(bits)
+	if err != nil {
+		return ""
+	}
+	return pre.String()
+}
+
 // trimUnverifiedPrefix makes room for one more unverified learned row in p's
 // address prefix by evicting that prefix's stalest unverified rows, so one
 // address range can only ever churn its own rows.
@@ -611,17 +630,39 @@ func (r *PeernetPeerRepository) KnownAmong(ctx context.Context, network string, 
 }
 
 // KnownPrefixes is KnownAmong that also returns, per known node, the network
-// prefix (/24 IPv4, /48 IPv6) of the address this node verified it at. Nodes
-// whose address yields no prefix are left out: they cannot be told apart from
-// each other and so count as nothing.
+// prefix (/24 IPv4, /48 IPv6) of the remote IP this node actually connected to
+// when it last verified it. The stored address string is never used: a host
+// name would let one server count as several ranges. Nodes with no recorded
+// connected IP are left out: they count as nothing.
 func (r *PeernetPeerRepository) KnownPrefixes(ctx context.Context, network string, nodes []string, d time.Duration, now time.Time) (map[string]string, error) {
 	out := map[string]string{}
-	err := r.knownRows(ctx, network, nodes, d, now, func(node, address string) {
-		if p := peerAddrPrefix(address); address != "" && p != "" {
+	err := r.knownRows(ctx, network, nodes, d, now, func(node, connected string) {
+		if p := connectedPrefix(connected); p != "" {
 			out[node] = p
 		}
 	})
 	return out, err
+}
+
+// RecordConnectedIP stores the remote IP this node actually connected to when
+// it last verified the peer. Corroboration keys on it (see KnownPrefixes).
+func (r *PeernetPeerRepository) RecordConnectedIP(ctx context.Context, network, node, ip string) error {
+	_, err := r.exec(ctx, "record peernet peer connected ip",
+		`UPDATE peernet_peers SET connected_ip = ? WHERE network_id = ? AND node_id = ?`, ip, network, node)
+	return err
+}
+
+// ConnectedIP returns the recorded connected IP of a peer ("" if none).
+func (r *PeernetPeerRepository) ConnectedIP(ctx context.Context, network, node string) (string, error) {
+	var ip string
+	err := r.db.QueryRowContext(ctx, `SELECT connected_ip FROM peernet_peers WHERE network_id = ? AND node_id = ?`, network, node).Scan(&ip)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("peernet peer connected ip: %w", err)
+	}
+	return ip, nil
 }
 
 func (r *PeernetPeerRepository) knownRows(ctx context.Context, network string, nodes []string, d time.Duration, now time.Time, each func(node, address string)) error {
@@ -633,7 +674,7 @@ func (r *PeernetPeerRepository) knownRows(ctx context.Context, network string, n
 		for _, n := range part {
 			args = append(args, n)
 		}
-		q := `SELECT node_id, address FROM peernet_peers WHERE network_id = ? AND verified = 1
+		q := `SELECT node_id, connected_ip FROM peernet_peers WHERE network_id = ? AND verified = 1
 			AND first_verified > 0 AND first_verified <= ? AND last_success >= ?
 			AND node_id IN (?` + strings.Repeat(",?", len(part)-1) + `)`
 		rows, err := r.db.QueryContext(ctx, q, args...)

@@ -334,6 +334,9 @@ func (c *Client) enter() func() {
 
 // behaviorFor resolves the SegmentBehavior for a given message-ID, falling
 // back to the default.
+// BehaviorFor returns the behavior currently configured for a message-ID.
+func (c *Client) BehaviorFor(messageID string) SegmentBehavior { return c.behaviorFor(messageID) }
+
 func (c *Client) behaviorFor(messageID string) SegmentBehavior {
 	c.mu.RLock()
 	defer c.mu.RUnlock()

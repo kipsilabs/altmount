@@ -10,6 +10,7 @@ import (
 	"hash/fnv"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -150,6 +151,14 @@ type PeernetRecord struct {
 	Title     string
 	TotalSize int64
 
+	// ReleaseScheme says how ReleaseID was derived: PeernetSchemeNZB (the
+	// default, also for 0) or PeernetSchemeFiles. It comes from the signed
+	// record.
+	ReleaseScheme int
+	// BundleID is the Bundle ID the signed release record announces (lower-case
+	// hex), empty when the publisher serves no bundle.
+	BundleID string
+
 	Payload []byte
 }
 
@@ -244,6 +253,12 @@ func (r PeernetRecord) validate(now time.Time) error {
 		return invalid("relayer node id")
 	case r.Source == PeernetRecordSourceLocal && r.RelayerNodeID != "":
 		return invalid("own record with a relayer")
+	case r.ReleaseScheme < 0 || r.ReleaseScheme > PeernetSchemeFiles:
+		return invalid("release scheme %d", r.ReleaseScheme)
+	case r.BundleID != "" && !isLowerHexID(r.BundleID):
+		return invalid("bundle id")
+	case r.BundleID != "" && r.Kind != PeernetRecordKindRelease:
+		return invalid("bundle id on a non-release record")
 	case r.SegmentsChecked < 0 || r.TotalSegments < 0:
 		return invalid("negative segment count")
 	case len(r.Payload) == 0:
@@ -424,6 +439,10 @@ func (r *PeernetRecordRepository) insert(ctx context.Context, rec PeernetRecord,
 	if rec.Healthy != nil {
 		healthy = boolInt(*rec.Healthy)
 	}
+	scheme := rec.ReleaseScheme
+	if scheme == PeernetSchemeNone {
+		scheme = PeernetSchemeNZB
+	}
 	var season, episode any
 	if rec.Season != nil {
 		season = *rec.Season
@@ -434,12 +453,12 @@ func (r *PeernetRecordRepository) insert(ctx context.Context, rec PeernetRecord,
 	if _, err := tx.ExecContext(ctx, `INSERT INTO peernet_records
 		(network_id, seq, kind, content_hash, release_id, file_id, publisher_node_id, created_at, expires_at,
 		 received_at, source, relayer_node_id, healthy, backbones, checked_at, segments_checked, total_segments,
-		 imdb_id, season, episode, title, total_size, payload)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		 imdb_id, season, episode, title, total_size, payload, release_scheme, bundle_id)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		rec.NetworkID, seq, rec.Kind, rec.ContentHash, rec.ReleaseID, rec.FileID, rec.PublisherNodeID,
 		rec.CreatedAt.Unix(), rec.ExpiresAt.Unix(), now.Unix(), rec.Source, rec.RelayerNodeID, healthy,
 		canonicalBackbones(rec.Backbones), unixOrZero(checked), rec.SegmentsChecked, rec.TotalSegments,
-		rec.IMDbID, season, episode, rec.Title, rec.TotalSize, rec.Payload); err != nil {
+		rec.IMDbID, season, episode, rec.Title, rec.TotalSize, rec.Payload, scheme, rec.BundleID); err != nil {
 		return PeernetInsertResult{}, fmt.Errorf("insert peernet record: %w", err)
 	}
 	if err := addRowCounts(ctx, tx, rec.NetworkID, recordRef{publisher: rec.PublisherNodeID, source: rec.Source, relayer: rec.RelayerNodeID}, 1); err != nil {
@@ -447,6 +466,9 @@ func (r *PeernetRecordRepository) insert(ctx context.Context, rec PeernetRecord,
 	}
 	if err := tx.Commit(); err != nil {
 		return PeernetInsertResult{}, fmt.Errorf("insert peernet record: commit: %w", err)
+	}
+	if rec.BundleID != "" {
+		bundleOfferGeneration.Add(1)
 	}
 	if superseded {
 		return PeernetInsertResult{Outcome: PeernetRecordSuperseded, Seq: seq}, nil
@@ -813,4 +835,26 @@ func (r *PeernetRecordRepository) NetworkIDs(ctx context.Context) ([]string, err
 		out = append(out, id)
 	}
 	return out, rows.Err()
+}
+
+// bundleOfferGeneration counts the records stored with a Bundle ID in this
+// process. A cached "this node holds a bundle offer" answer is stale exactly
+// when the number changed.
+var bundleOfferGeneration atomic.Uint64
+
+// BundleOfferGeneration returns the number of bundle-announcing records stored
+// by this process so far (see AnyBundleOffer).
+func BundleOfferGeneration() uint64 { return bundleOfferGeneration.Load() }
+
+// AnyBundleOffer reports whether any stored record announces a bundle.
+func (r *PeernetRecordRepository) AnyBundleOffer(ctx context.Context) (bool, error) {
+	var one int
+	err := r.db.QueryRowContext(ctx, `SELECT 1 FROM peernet_records WHERE bundle_id <> '' LIMIT 1`).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("peernet records: any bundle offer: %w", err)
+	}
+	return true, nil
 }

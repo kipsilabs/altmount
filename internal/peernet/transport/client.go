@@ -10,9 +10,11 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/netip"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -88,6 +90,9 @@ type Request struct {
 // call's timer. Reading past CallOptions.MaxResponseBytes returns
 // ErrBodyTooLarge.
 type Response struct {
+	// RemoteIP is the literal IP the connection was made to ("" if unknown).
+	// A peer's corroboration is keyed on it, never on the address string.
+	RemoteIP   string
 	StatusCode int
 	Header     http.Header
 	Body       io.ReadCloser
@@ -185,7 +190,16 @@ func (c *Client) Do(ctx context.Context, addr string, expected identity.NodeID, 
 	if len(req.Body) > 0 {
 		body = bytes.NewReader(req.Body)
 	}
-	hr, err := http.NewRequestWithContext(callCtx, req.Method, u.String(), body)
+	var remoteIP atomic.Value
+	trace := &httptrace.ClientTrace{GotConn: func(i httptrace.GotConnInfo) {
+		if i.Conn == nil {
+			return
+		}
+		if host, _, err := net.SplitHostPort(i.Conn.RemoteAddr().String()); err == nil {
+			remoteIP.Store(host)
+		}
+	}}
+	hr, err := http.NewRequestWithContext(httptrace.WithClientTrace(callCtx, trace), req.Method, u.String(), body)
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("%w: %v", ErrInvalidConfig, err)
@@ -207,8 +221,9 @@ func (c *Client) Do(ctx context.Context, addr string, expected identity.NodeID, 
 		cancel()
 		return nil, ErrBodyTooLarge
 	}
+	ip, _ := remoteIP.Load().(string)
 	return &Response{
-		StatusCode: resp.StatusCode, Header: resp.Header,
+		RemoteIP: ip, StatusCode: resp.StatusCode, Header: resp.Header,
 		Body: &cappedBody{rc: resp.Body, max: opts.MaxResponseBytes, onClose: cancel},
 	}, nil
 }

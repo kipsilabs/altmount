@@ -7,7 +7,7 @@ package recsync
 //	  0      no     no      no         no      no    no     routes answer as if the network were unknown
 //	  1      yes    yes     yes        no      no    no     receive only: serves an empty page
 //	  2      yes    yes     yes        yes     yes   yes    own and relayed records served
-//	  3      yes    yes     yes        yes     yes   yes    same as 2 for records
+//	  3      yes    yes     yes        yes     yes   yes    same as 2 for records, and serves its bundles
 //
 // A level 1 node accepts pushes because "receives" does not name a channel
 // and an outbound-only publisher can reach a peer only by pushing; what it
@@ -25,6 +25,8 @@ type Policy struct {
 	Push bool
 	// Serve: this node serves its record list (own and relayed) to pullers.
 	Serve bool
+	// ServeBundles: this node serves finished-import bundles it announced.
+	ServeBundles bool
 }
 
 // PolicyFor returns the policy of an exposure level. Out-of-range levels fail
@@ -33,8 +35,10 @@ func PolicyFor(level int) Policy {
 	switch level {
 	case 1:
 		return Policy{Exists: true, Pull: true, AcceptPush: true}
-	case 2, 3:
+	case 2:
 		return Policy{Exists: true, Pull: true, AcceptPush: true, Publish: true, Push: true, Serve: true}
+	case 3:
+		return Policy{Exists: true, Pull: true, AcceptPush: true, Publish: true, Push: true, Serve: true, ServeBundles: true}
 	}
 	return Policy{}
 }

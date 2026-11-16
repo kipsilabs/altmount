@@ -1,6 +1,8 @@
 package database
 
 import (
+	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -55,6 +57,20 @@ type ImportQueueItem struct {
 	SkipArrNotification bool          `db:"skip_arr_notification"`
 	SkipPostImportLinks bool          `db:"skip_post_import_links"`
 	Indexer             *string       `db:"indexer"`
+	// PeerHold is set while the item's files (from a peer bundle) owe their
+	// full health check. Only the active-queue list and the single-item lookups
+	// fill it; every other read leaves it false.
+	PeerHold bool `db:"-"`
+}
+
+// PeerImportNzbPrefix starts the nzb_path of the queue row of a direct peer
+// import. Such a release came from a peer's bundle, not from an NZB: there is
+// no file behind the path, and the row cannot be retried, requeued or downloaded.
+const PeerImportNzbPrefix = "peernet-bundle/"
+
+// IsPeerImport reports whether the queue item records a direct peer import.
+func (i *ImportQueueItem) IsPeerImport() bool {
+	return i != nil && strings.HasPrefix(filepath.ToSlash(i.NzbPath), PeerImportNzbPrefix)
 }
 
 // BulkOperationResult represents the result of a bulk queue operation
@@ -69,11 +85,11 @@ type BulkOperationResult struct {
 
 // QueueStats represents statistics about the import queue
 type QueueStats struct {
-	ID                  int64     `db:"id"`
-	TotalQueued         int       `db:"total_queued"`
-	TotalProcessing     int       `db:"total_processing"`
-	TotalCompleted      int       `db:"total_completed"`
-	TotalFailed         int       `db:"total_failed"`
+	ID              int64 `db:"id"`
+	TotalQueued     int   `db:"total_queued"`
+	TotalProcessing int   `db:"total_processing"`
+	TotalCompleted  int   `db:"total_completed"`
+	TotalFailed     int   `db:"total_failed"`
 	// TotalWaitingRepair counts imports parked for a PAR2 repair. Counted
 	// live; queue_stats has no column for it.
 	TotalWaitingRepair  int       `db:"-"`
@@ -189,18 +205,18 @@ type ImportHourlyStat struct {
 
 // ImportHistory represents a persistent record of a single imported file
 type ImportHistory struct {
-	ID                  int64     `db:"id"`
-	DownloadID          *string   `db:"download_id"`
-	NzbID               *int64    `db:"nzb_id"` // Nullable if queue item deleted
-	NzbName             string    `db:"nzb_name"`
-	FileName            string    `db:"file_name"`
-	FileSize            int64     `db:"file_size"`
-	VirtualPath         string    `db:"virtual_path"`
-	LibraryPath         *string   `db:"library_path"` // Added to show final location from file_health
-	Category            *string   `db:"category"`
-	Metadata            *string   `db:"metadata"`
-	Indexer             *string   `db:"indexer"`
-	CompletedAt         time.Time `db:"completed_at"`
+	ID          int64     `db:"id"`
+	DownloadID  *string   `db:"download_id"`
+	NzbID       *int64    `db:"nzb_id"` // Nullable if queue item deleted
+	NzbName     string    `db:"nzb_name"`
+	FileName    string    `db:"file_name"`
+	FileSize    int64     `db:"file_size"`
+	VirtualPath string    `db:"virtual_path"`
+	LibraryPath *string   `db:"library_path"` // Added to show final location from file_health
+	Category    *string   `db:"category"`
+	Metadata    *string   `db:"metadata"`
+	Indexer     *string   `db:"indexer"`
+	CompletedAt time.Time `db:"completed_at"`
 }
 
 // ImportMigrationStatus represents the status of a migration item

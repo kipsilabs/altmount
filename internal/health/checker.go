@@ -93,6 +93,17 @@ type CheckOptions struct {
 	// knows about each due file, keyed by path. Peer advice is considered only
 	// for files listed here; nil (every other caller) means never.
 	PeerFiles map[string]PeerFileInfo
+	// FullCheckFiles lists files that owe a full check of every segment (peer
+	// bundle imports). They are sampled at 100 percent whatever the configured
+	// sample, and never get peer advice.
+	FullCheckFiles map[string]struct{}
+}
+
+// owesFullCheck reports whether the file is a peer-bundle import that must be
+// checked in full.
+func owesFullCheck(o CheckOptions, filePath string) bool {
+	_, ok := o.FullCheckFiles[filePath]
+	return ok
 }
 
 // PatchIndex reports articles restored locally by PAR2 repair.
@@ -112,6 +123,8 @@ type HealthChecker struct {
 	// peerAdviser supplies peer-network advice for scheduled re-checks (see
 	// peer_advice.go). Nil by default: no behaviour change and no overhead.
 	peerAdviser atomic.Pointer[peerAdviserHolder]
+	// peerHeaders is the optional header sample of a peer import's full check.
+	peerHeaders atomic.Pointer[peerHeaderHolder]
 	// patchStats is set while a healthy observer is installed: only then is
 	// CheckStats.PatchedByPAR2 computed (see patch_summary.go).
 	patchStats atomic.Bool
@@ -173,7 +186,9 @@ type healthCheckInput struct {
 // ID strings survive past preparation, so the proto segment slice is
 // collectible before the network sweep begins.
 type preparedCheck struct {
-	filePath      string
+	filePath string
+	// fullCheck marks a file that owes a forced full check (a peer import).
+	fullCheck     bool
 	sourceNzbPath string
 	sampledIDs    []string
 	earlyEvent    *HealthEvent
@@ -295,7 +310,8 @@ func (hc *HealthChecker) prepareCheck(ctx context.Context, filePath string, opts
 	}
 
 	// Override sample percentage if forced full check is requested
-	if len(opts) > 0 && opts[0].ForceFullCheck {
+	if len(opts) > 0 && (opts[0].ForceFullCheck || owesFullCheck(opts[0], filePath)) {
+		prep.fullCheck = len(opts) > 0 && owesFullCheck(opts[0], filePath)
 		samplePercentage = 100
 		slog.InfoContext(ctx, "Forcing full health check (100% sampling)", "file_path", filePath)
 	}
@@ -423,6 +439,13 @@ func (hc *HealthChecker) judgeValidation(ctx context.Context, prep preparedCheck
 		// A healthy record's details would otherwise be wiped, leaving no
 		// record that the probe ran (or that it could not).
 		event.Details = healthyDetails
+	}
+
+	// A peer import also gets a header sample (optional hook): the STAT sweep
+	// cannot see a size or offset lie.
+	if bad := hc.verifyPeerHeaders(ctx, prep, event); bad != nil {
+		bad.Stats = event.Stats
+		return *bad
 	}
 
 	// Only a consumer of the notice needs the patch summary, and only for a

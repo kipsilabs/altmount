@@ -505,7 +505,8 @@ func TestPeernetStatusCarriesRecordsAndAdvice(t *testing.T) {
 
 func TestPeernetStatusReportsLibrarySharing(t *testing.T) {
 	f := &fakePeernet{status: service.Status{Enabled: true, NodeID: hex64,
-		Library: service.LibraryStatus{Files: 10, WithReleaseID: 4, FileIDOnly: 5, NotIndexable: 1}}}
+		Library: service.LibraryStatus{Files: 10, WithReleaseID: 4, WithNZBReleaseID: 1, WithDerivedReleaseID: 3, FileIDOnly: 5,
+			NotIndexable: 1, NoSourceNZB: 2, GroupTooLarge: 1, Pending: 2}}}
 	code, m, raw := doReq(t, peernetApp(f), "GET", "/api/peernet/status", "")
 	require.Equal(t, 200, code, raw)
 	lib, ok := m["data"].(map[string]any)["library"].(map[string]any)
@@ -514,4 +515,42 @@ func TestPeernetStatusReportsLibrarySharing(t *testing.T) {
 	assert.EqualValues(t, 4, lib["with_release_id"])
 	assert.EqualValues(t, 5, lib["file_id_only"])
 	assert.EqualValues(t, 1, lib["not_indexable"])
+	assert.EqualValues(t, 1, lib["with_nzb_release_id"])
+	assert.EqualValues(t, 3, lib["with_derived_release_id"])
+	assert.EqualValues(t, 2, lib["no_source_nzb"])
+	assert.EqualValues(t, 1, lib["group_too_large"])
+	assert.EqualValues(t, 2, lib["pending"])
+}
+
+func TestPeernetStatusCarriesBundleCounters(t *testing.T) {
+	f := &fakePeernet{status: service.Status{Enabled: true, Bundles: service.BundleStatus{
+		Built: 2, CacheHits: 1, BuildFailures: 3, Cached: 1, CachedBytes: 99, Announced: 4,
+		NotShareable: map[string]int64{"rclone_encrypted": 2}, Served: 5, ServedBytes: 600,
+		ServeRefused: map[string]int64{"rate_limited": 1}, Fetched: 7, FetchRateLimited: 2,
+		FetchFailed: map[string]int64{"verification_failed": 1}, FetchBackedOff: 1, FullCheckReports: 6, FullCheckBackedOff: 2,
+		Import: service.BundleImportStatus{Accepted: 8, AlreadyImported: 1, Rejected: map[string]int64{"probe_missing": 3},
+			FullCheckPassed: 4, FullCheckFailed: 2, Announced: 3, BadBundleReports: 2}}}}
+	code, m, raw := doReq(t, peernetApp(f), "GET", "/api/peernet/status", "")
+	require.Equal(t, 200, code, raw)
+	b := m["data"].(map[string]any)["bundles"].(map[string]any)
+	for k, want := range map[string]float64{"built": 2, "cache_hits": 1, "build_failures": 3, "cached": 1, "cached_bytes": 99,
+		"announced": 4, "served": 5, "served_bytes": 600, "fetched": 7, "fetch_rate_limited": 2, "fetch_backed_off": 1,
+		"full_check_reports": 6, "full_check_backed_off": 2} {
+		assert.EqualValues(t, want, b[k], k)
+	}
+	assert.EqualValues(t, 2, b["not_shareable"].(map[string]any)["rclone_encrypted"])
+	assert.EqualValues(t, 1, b["serve_refused"].(map[string]any)["rate_limited"])
+	assert.EqualValues(t, 1, b["fetch_failed"].(map[string]any)["verification_failed"])
+	im := b["import"].(map[string]any)
+	for k, want := range map[string]float64{"accepted": 8, "already_imported": 1, "full_check_passed": 4,
+		"full_check_failed": 2, "announced": 3, "bad_bundle_reports": 2} {
+		assert.EqualValues(t, want, im[k], k)
+	}
+	assert.EqualValues(t, 3, im["rejected"].(map[string]any)["probe_missing"])
+
+	// Nothing counted: stable shape, empty objects rather than null.
+	_, m, _ = doReq(t, peernetApp(&fakePeernet{status: service.Status{Enabled: true}}), "GET", "/api/peernet/status", "")
+	b = m["data"].(map[string]any)["bundles"].(map[string]any)
+	assert.NotNil(t, b["not_shareable"])
+	assert.NotNil(t, b["import"].(map[string]any)["rejected"])
 }

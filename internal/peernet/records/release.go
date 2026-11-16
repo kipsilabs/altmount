@@ -115,7 +115,7 @@ func (r *ReleaseRecord) Verify(now time.Time, arrivedIn netid.NetworkID) error {
 // title is cleaned; other invalid input is an error. It returns the record and
 // its encoding.
 func BuildReleaseRecord(key *identity.Key, nw netid.NetworkID, in ReleaseRecord, now time.Time) (*ReleaseRecord, []byte, error) {
-	h, err := newHeader(key, nw, in.ReleaseID, now, RecordLifetime)
+	h, err := newHeader(key, nw, in.ReleaseID, in.ReleaseScheme, now, RecordLifetime)
 	if err != nil {
 		return nil, nil, err
 	}

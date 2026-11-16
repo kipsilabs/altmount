@@ -33,7 +33,7 @@ func TestPeernetContentRepository_UpsertAndLookup(t *testing.T) {
 
 	byFile, err := r.FindByFileID(ctx, hexID('a'))
 	require.NoError(t, err)
-	assert.Equal(t, []PeernetContentEntry{{FilePath: "movies/a.mkv", FileID: hexID('a'), ReleaseID: hexID('1')}}, byFile)
+	assert.Equal(t, []PeernetContentEntry{{FilePath: "movies/a.mkv", FileID: hexID('a'), ReleaseID: hexID('1'), ReleaseScheme: PeernetSchemeNZB}}, byFile)
 
 	byRel, err := r.FindByReleaseID(ctx, hexID('1'))
 	require.NoError(t, err)
@@ -173,7 +173,7 @@ func TestPeernetContentRepository_GetByPath(t *testing.T) {
 		got, ok, err := r.GetByPath(ctx, p)
 		require.NoError(t, err)
 		require.True(t, ok, p)
-		assert.Equal(t, PeernetContentEntry{FilePath: "movies/a.mkv", FileID: hexID('a'), ReleaseID: hexID('1')}, got)
+		assert.Equal(t, PeernetContentEntry{FilePath: "movies/a.mkv", FileID: hexID('a'), ReleaseID: hexID('1'), ReleaseScheme: PeernetSchemeNZB}, got)
 	}
 	_, _, err = r.GetByPath(ctx, "")
 	assert.Error(t, err)
@@ -213,5 +213,5 @@ func TestPeernetContentRepository_Counts(t *testing.T) {
 	require.NoError(t, r.Upsert(ctx, PeernetContentEntry{FilePath: "c.mkv", FileID: hexID('c')}))
 	c, err = r.Counts(ctx)
 	require.NoError(t, err)
-	assert.Equal(t, PeernetContentCounts{Files: 3, WithReleaseID: 1}, c)
+	assert.Equal(t, PeernetContentCounts{Files: 3, WithReleaseID: 1, WithNZBReleaseID: 1, NoSourceGroup: 2}, c)
 }

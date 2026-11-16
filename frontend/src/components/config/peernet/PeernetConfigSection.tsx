@@ -129,6 +129,7 @@ export function PeernetConfigSection({
 					<OpenNetworkCard
 						form={form}
 						openNetwork={openNetwork}
+						outboundProxy={status?.outbound_proxy === true}
 						nodeState={nodeState}
 						onChange={handleChange}
 						disabled={isReadOnly}

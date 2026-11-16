@@ -1,8 +1,53 @@
 import { ShieldAlert } from "lucide-react";
-import { useId } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import type { PeernetLevel } from "../../../types/peernet";
-import { isLevelAvailable } from "./peernetStats";
-import { EXPOSURE_LEVELS, levelNeedsPrivacyNotice, levelPrivacyNotice } from "./peernetValidation";
+import { levelNeedsConfirmation } from "./peernetStats";
+import {
+	EXPOSURE_LEVELS,
+	LEVEL3_PRIVACY_NOTICE,
+	levelNeedsPrivacyNotice,
+	levelPrivacyNotice,
+} from "./peernetValidation";
+
+interface ShareBundlesConfirmProps {
+	open: boolean;
+	onConfirm: () => void;
+	onCancel: () => void;
+}
+
+function ShareBundlesConfirm({ open, onConfirm, onCancel }: ShareBundlesConfirmProps) {
+	const ref = useRef<HTMLDialogElement>(null);
+	const titleId = useId();
+	useEffect(() => {
+		const dialog = ref.current;
+		if (!dialog) return;
+		if (open && !dialog.open) dialog.showModal();
+		if (!open && dialog.open) dialog.close();
+	}, [open]);
+	return (
+		<dialog ref={ref} className="modal" onClose={onCancel} aria-labelledby={titleId}>
+			<div className="modal-box">
+				<h3 id={titleId} className="font-bold text-lg">
+					Share bundles?
+				</h3>
+				<p className="py-2 text-sm">{LEVEL3_PRIVACY_NOTICE}</p>
+				<div className="modal-action">
+					<button type="button" className="btn btn-ghost" onClick={onCancel}>
+						Cancel
+					</button>
+					<button type="button" className="btn btn-primary" onClick={onConfirm}>
+						Share bundles
+					</button>
+				</div>
+			</div>
+			<form method="dialog" className="modal-backdrop">
+				<button type="submit" aria-label="Close">
+					close
+				</button>
+			</form>
+		</dialog>
+	);
+}
 
 interface ExposureLevelSelectProps {
 	name: string;
@@ -18,6 +63,11 @@ export function ExposureLevelSelect({
 	disabled = false,
 }: ExposureLevelSelectProps) {
 	const uid = useId();
+	const [confirming, setConfirming] = useState(false);
+	const select = (level: PeernetLevel) => {
+		if (levelNeedsConfirmation(value, level)) setConfirming(true);
+		else onChange(level);
+	};
 	return (
 		<fieldset className="fieldset">
 			<legend className="fieldset-legend">Exposure level</legend>
@@ -26,14 +76,11 @@ export function ExposureLevelSelect({
 					const id = `${uid}-${name}-level-${info.level}`;
 					const titleId = `${id}-title`;
 					const descId = `${id}-desc`;
-					const unavailable = !isLevelAvailable(info.level);
 					return (
 						<label
 							key={info.level}
 							htmlFor={id}
-							className={`flex items-start gap-3 rounded-box border p-3 ${
-								unavailable ? "cursor-not-allowed opacity-60" : "cursor-pointer"
-							} ${value === info.level ? "border-primary bg-primary/5" : "border-base-300"}`}
+							className={`flex cursor-pointer items-start gap-3 rounded-box border p-3 ${value === info.level ? "border-primary bg-primary/5" : "border-base-300"}`}
 						>
 							<input
 								id={id}
@@ -43,8 +90,8 @@ export function ExposureLevelSelect({
 								name={name}
 								className="radio radio-primary radio-sm mt-1"
 								checked={value === info.level}
-								disabled={disabled || unavailable}
-								onChange={() => onChange(info.level)}
+								disabled={disabled}
+								onChange={() => select(info.level)}
 							/>
 							<span className="min-w-0">
 								<span id={titleId} className="font-medium text-sm">
@@ -64,6 +111,14 @@ export function ExposureLevelSelect({
 					<span>{levelPrivacyNotice(value)}</span>
 				</div>
 			)}
+			<ShareBundlesConfirm
+				open={confirming}
+				onCancel={() => setConfirming(false)}
+				onConfirm={() => {
+					setConfirming(false);
+					onChange(3);
+				}}
+			/>
 		</fieldset>
 	);
 }

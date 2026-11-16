@@ -60,6 +60,10 @@ type Status struct {
 	ListenError    string
 	Error          string // why the feature could not start, if it could not
 	AcceptIncoming bool
+	// OutboundProxy is set when peer connections go through the configured
+	// outbound proxy. Every peer's connected address is then the proxy's, so an
+	// open-network offer can never be announced by distinct ranges.
+	OutboundProxy bool
 	// AdvertiseWarning is non-empty when the configured advertise address
 	// cannot be used on an active network. It never contains the address.
 	AdvertiseWarning string
@@ -72,6 +76,8 @@ type Status struct {
 	Publish PublishStatus
 	// Advice counts what the consuming side did since start.
 	Advice AdviceStatus
+	// Bundles counts bundle building, serving and fetching since start.
+	Bundles BundleStatus
 }
 
 // Status returns the current snapshot.
@@ -82,6 +88,7 @@ func (s *Service) Status(ctx context.Context) (Status, error) {
 		return st, nil
 	}
 	st.AcceptIncoming = set.AcceptIncoming
+	st.OutboundProxy = set.HTTPProxy != "" || set.HTTPSProxy != ""
 	s.mu.RLock()
 	st.Error = s.startErr
 	s.mu.RUnlock()
@@ -116,6 +123,7 @@ func (s *Service) Status(ctx context.Context) (Status, error) {
 		st.Publish = n.pipe.stats.snapshot()
 	}
 	st.Advice = s.adviceStatus()
+	st.Bundles = n.bundleStatus(ctx)
 	st.AdvertiseWarning = advertiseWarning(set.AdvertiseAddress, rows, set, n.deps.allowLoopback)
 	for i := range rows {
 		ns, err := n.networkStatus(ctx, &rows[i], set)

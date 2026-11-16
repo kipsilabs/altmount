@@ -392,6 +392,30 @@ func ToSABnzbdQueueSlot(item *database.ImportQueueItem, index int, progressBroad
 	}
 }
 
+// toSABnzbdHeldPeerSlot is the queue slot of a completed import that came from
+// a peer bundle and still owes its full health check. It is reported with the
+// status this API already uses for work in progress ("Downloading", which every
+// ARR client treats as active) at 99 percent with 1 percent left, never as
+// complete: the ARR must not import unverified content. When the check passes
+// the item leaves the queue and appears in the history as completed; when it
+// fails it appears there as failed.
+func toSABnzbdHeldPeerSlot(item *database.ImportQueueItem, index int, pb *progress.ProgressBroadcaster) SABnzbdQueueSlot {
+	working := *item
+	working.Status = database.QueueStatusProcessing
+	slot := ToSABnzbdQueueSlot(&working, index, pb)
+	var total int64
+	if item.FileSize != nil {
+		total = *item.FileSize
+	}
+	left := total / 100
+	slot.Percentage = "99"
+	slot.Sizeleft = formatHumanSize(left)
+	slot.Mbleft = formatSizeMB(left)
+	slot.Timeleft = "0:00:01"
+	slot.Eta = "unknown"
+	return slot
+}
+
 // ToSABnzbdHistorySlot converts an AltMount ImportQueueItem to SABnzbd history format
 func ToSABnzbdHistorySlot(item *database.ImportQueueItem, index int, finalPath string) SABnzbdHistorySlot {
 	if item == nil {
