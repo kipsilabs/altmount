@@ -236,9 +236,10 @@ func (s *Server) handleStremioAddonStream(c *fiber.Ctx) error {
 			}
 		}
 		if len(libraryStreams) > 0 {
-			return c.JSON(fiber.Map{"streams": libraryStreams})
+			return c.JSON(fiber.Map{"streams": s.labelNetworkHealthy(ctx, libraryStreams)})
 		}
 	}
+	libraryStreams = s.labelNetworkHealthy(ctx, libraryStreams)
 
 	// Map Stremio type to Prowlarr search type
 	prowlarrType := "search"

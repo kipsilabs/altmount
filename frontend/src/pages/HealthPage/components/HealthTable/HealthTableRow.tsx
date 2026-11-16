@@ -9,6 +9,7 @@ import {
 import { type FileHealth, HealthPriority } from "../../../../types/api";
 import { parseRepairReason } from "../par2RepairReason";
 import { RepairFailureMessage } from "../RepairFailureMessage";
+import { technicalDetails } from "../technicalDetails";
 import { ArticleCheckProgress } from "./ArticleCheckProgress";
 import { ContentVerificationBadge } from "./ContentVerificationBadge";
 import { HealthItemActionsMenu } from "./HealthItemActionsMenu";
@@ -213,9 +214,13 @@ export const HealthTableRow = memo(function HealthTableRow({
 				{/* Show error_details for additional technical details. Gated on an
 				    actual error: a healthy record now carries a content-verification
 				    envelope, which the badge above already renders. */}
-				{item.last_error && item.error_details && item.error_details !== item.last_error && (
-					<div className="mt-1 break-all text-warning text-xs">Technical: {item.error_details}</div>
-				)}
+				{item.last_error &&
+					technicalDetails(item.error_details) &&
+					technicalDetails(item.error_details) !== item.last_error && (
+						<div className="mt-1 break-all text-warning text-xs">
+							Technical: {technicalDetails(item.error_details)}
+						</div>
+					)}
 			</td>
 			<td>
 				<div className="flex flex-col gap-1">

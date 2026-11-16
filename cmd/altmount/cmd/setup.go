@@ -2,9 +2,11 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -25,8 +27,10 @@ import (
 	"github.com/kipsilabs/altmount/internal/nzbfilesystem"
 	"github.com/kipsilabs/altmount/internal/nzbfilesystem/segcache"
 	"github.com/kipsilabs/altmount/internal/par2repair"
+	"github.com/kipsilabs/altmount/internal/peernet/service"
 	"github.com/kipsilabs/altmount/internal/pool"
 	"github.com/kipsilabs/altmount/internal/progress"
+	"github.com/kipsilabs/altmount/internal/providerbackbone"
 	"github.com/kipsilabs/altmount/internal/rclone"
 	"github.com/kipsilabs/altmount/internal/webdav"
 	"github.com/kipsilabs/altmount/pkg/rclonecli"
@@ -452,6 +456,97 @@ func startPar2RepairService(
 	slog.InfoContext(ctx, "PAR2 repair service started",
 		"enabled", cfg.Par2Repair.Enabled != nil && *cfg.Par2Repair.Enabled)
 	return service
+}
+
+// startPeernetService creates the peer network service and starts it when the
+// feature is enabled. With the feature off it creates no key, listener,
+// client or goroutine. Config changes enable, disable and update it live.
+func startPeernetService(
+	ctx context.Context,
+	cfg *config.Config,
+	db *database.DB,
+	metadataService *metadata.MetadataService,
+	healthRepo *database.HealthRepository,
+	configManager *config.Manager,
+) *service.Service {
+	svc := service.New(peernetDeps(ctx, cfg, db, metadataService, healthRepo, configManager))
+	svc.Start(ctx)
+	configManager.OnConfigChange(svc.OnConfigChange)
+	return svc
+}
+
+// peernetDeps assembles the peer network service's dependencies.
+func peernetDeps(
+	ctx context.Context,
+	cfg *config.Config,
+	db *database.DB,
+	metadataService *metadata.MetadataService,
+	healthRepo *database.HealthRepository,
+	configManager *config.Manager,
+) service.Deps {
+	conn, d := db.Connection(), db.Dialect()
+	dataDir, dirErr := resolvePeernetDataDir(cfg)
+	if dirErr != nil {
+		// The feature refuses to start (and says why in its status) rather
+		// than putting keys in a guessed location.
+		slog.WarnContext(ctx, "Peer network has no safe place for its keys", "error", dirErr)
+	}
+	return service.Deps{
+		DataDir:  dataDir,
+		Networks: database.NewPeernetNetworkRepository(conn, d),
+		Peers:    database.NewPeernetPeerRepository(conn, d),
+		Content:  database.NewPeernetContentRepository(conn, d),
+		// Record exchange: stored records and the per-peer sync positions.
+		Records: database.NewPeernetRecordRepository(conn, d),
+		Cursors: database.NewPeernetSyncCursorRepository(conn, d),
+		// Publishing of this node's own healthy releases (levels 2 and 3).
+		PublishState: database.NewPeernetPublishStateRepository(conn, d),
+		Origins:      database.NewPeernetOriginRepository(conn, d),
+		Exclusions:   peernetExclusions(configManager.GetConfigGetter()),
+		Backbones:    newPeernetBackboneSource(configManager.GetConfigGetter(), providerbackbone.Default, nil),
+		Metadata:     service.NewMetadataHost(metadataService),
+		Health:       service.NewLocalHealth(healthRepo),
+		Settings:     service.SettingsFromConfig(cfg),
+	}
+}
+
+// peernetStateDirName is the hidden directory under the metadata root used when
+// the database path gives no usable directory.
+const peernetStateDirName = ".local-state"
+
+// resolvePeernetDataDir picks the absolute directory the peer network keeps its
+// keys under. Like the persistent NZB store (".nzbs"), it lives next to the
+// database file when database.path has a directory part (the case for the
+// default configuration, and the same base used when the database is
+// PostgreSQL and the path is only a local-state anchor). A bare file name such
+// as "altmount.db" would mean the working directory itself, which is not a
+// place to put keys, so the metadata root's hidden state directory is used instead. With
+// neither available it returns an error and the feature does not start.
+func resolvePeernetDataDir(cfg *config.Config) (string, error) {
+	if dir, ok := explicitDir(filepath.Dir(cfg.Database.Path), cfg.Database.Path != ""); ok {
+		return dir, nil
+	}
+	if root, ok := explicitDir(cfg.Metadata.RootPath, cfg.Metadata.RootPath != ""); ok {
+		return filepath.Join(root, peernetStateDirName), nil
+	}
+	return "", errors.New("neither database.path nor metadata.root_path names a directory")
+}
+
+// explicitDir returns p as an absolute path when it names a specific
+// directory. "" and "." (the working directory itself) do not.
+func explicitDir(p string, present bool) (string, bool) {
+	if !present || p == "" {
+		return "", false
+	}
+	clean := filepath.Clean(p)
+	if clean == "." {
+		return "", false
+	}
+	abs, err := filepath.Abs(clean)
+	if err != nil {
+		return "", false
+	}
+	return abs, true
 }
 
 // startHealthWorker creates and starts the health monitoring worker

@@ -32,6 +32,7 @@ import (
 	"github.com/kipsilabs/altmount/internal/importer/utils/nzbtrim"
 	"github.com/kipsilabs/altmount/internal/metadata"
 	metapb "github.com/kipsilabs/altmount/internal/metadata/proto"
+	"github.com/kipsilabs/altmount/internal/nzbname"
 	"github.com/kipsilabs/altmount/internal/pool"
 	"github.com/kipsilabs/altmount/internal/progress"
 	"github.com/kipsilabs/altmount/internal/slogutil"
@@ -1856,8 +1857,10 @@ func (p *Parser) determineNzbType(files []ParsedFile) NzbType {
 }
 
 var (
-	passwordBracketsRegex = regexp.MustCompile(`(?i)\{\{\s*([^{}]+?)\s*\}\}`)
-	passwordSlashRegex    = regexp.MustCompile(`(?i)/(?:password|pwd)[:=]\s*([^\s/]+)`)
+	// Shared with the peer network, which strips the same spellings from
+	// release titles.
+	passwordBracketsRegex = nzbname.BracketsRegex
+	passwordSlashRegex    = nzbname.SlashRegex
 	passwordMetaRegex     = regexp.MustCompile(`(?i)<meta\b[^>]*type\s*=\s*["']?(?:password|pass|pwd|password_hash)["']?[^>]*>([\s\S]*?)<\/meta>`)
 )
 

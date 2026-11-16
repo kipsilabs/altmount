@@ -1,4 +1,5 @@
 // Configuration types that match the backend API structure
+import type { PeernetConfig } from "./peernet";
 
 // Mount type for unified mount configuration
 export type MountType = "none" | "rclone" | "fuse" | "rclone_external";
@@ -24,6 +25,7 @@ export interface ConfigResponse {
 	user_agent?: string;
 	network: NetworkConfig;
 	par2_repair: Par2RepairConfig;
+	peernet?: PeernetConfig;
 	mount_path: string;
 	mount_type: MountType;
 	memory_limit_mb?: number | null; // Go soft memory limit; 0/unset auto, -1 off
@@ -389,6 +391,7 @@ export interface ConfigUpdateRequest {
 	user_agent?: string;
 	network?: NetworkConfig;
 	par2_repair?: Par2RepairConfig;
+	peernet?: PeernetConfig;
 	mount_path?: string;
 	mount_type?: MountType;
 	profiler_enabled?: boolean;
@@ -597,6 +600,7 @@ export type ConfigSection =
 	| "stremio"
 	| "network"
 	| "par2_repair"
+	| "peernet"
 	| "system";
 
 // Form data interfaces for UI components
@@ -1085,6 +1089,12 @@ export const CONFIG_SECTIONS: Record<ConfigSection | "system", ConfigSectionInfo
 		title: "PAR2 Repair",
 		description: "Background reconstruction of missing usenet articles from PAR2 recovery data",
 		icon: "Wrench",
+		canEdit: true,
+	},
+	peernet: {
+		title: "Peer Network",
+		description: "Optionally share which releases are healthy with other instances",
+		icon: "Network",
 		canEdit: true,
 	},
 	system: {

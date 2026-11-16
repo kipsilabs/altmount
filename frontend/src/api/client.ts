@@ -58,6 +58,18 @@ import type {
 	StremioDisplayPreview,
 } from "../types/config";
 
+import type {
+	PeernetCreateInviteRequest,
+	PeernetCreateNetworkRequest,
+	PeernetInvite,
+	PeernetInviteLink,
+	PeernetJoinNetworkRequest,
+	PeernetMember,
+	PeernetNetworkStatus,
+	PeernetPeer,
+	PeernetStatus,
+	PeernetUpdateNetworkRequest,
+} from "../types/peernet";
 import type { UpdateChannel, UpdateStatusResponse } from "../types/update";
 
 export interface LogEntry {
@@ -819,6 +831,85 @@ class APIClient {
 			method: "PATCH",
 			body: JSON.stringify(config),
 		});
+	}
+
+	// Peer network
+	async getPeernetStatus() {
+		return this.request<PeernetStatus>("/peernet/status");
+	}
+
+	async getPeernetPeers(networkId: string) {
+		return this.request<PeernetPeer[]>(`/peernet/networks/${encodeURIComponent(networkId)}/peers`);
+	}
+
+	async confirmPeernetPeer(networkId: string, address: string) {
+		return this.request<void>(`/peernet/networks/${encodeURIComponent(networkId)}/peers/confirm`, {
+			method: "POST",
+			body: JSON.stringify({ address }),
+		});
+	}
+
+	async createPeernetNetwork(body: PeernetCreateNetworkRequest) {
+		return this.request<PeernetNetworkStatus>("/peernet/networks", {
+			method: "POST",
+			body: JSON.stringify(body),
+		});
+	}
+
+	async joinPeernetNetwork(body: PeernetJoinNetworkRequest) {
+		return this.request<PeernetNetworkStatus>("/peernet/networks/join", {
+			method: "POST",
+			body: JSON.stringify(body),
+		});
+	}
+
+	async updatePeernetNetwork(networkId: string, body: PeernetUpdateNetworkRequest) {
+		return this.request<PeernetNetworkStatus>(
+			`/peernet/networks/${encodeURIComponent(networkId)}`,
+			{
+				method: "PATCH",
+				body: JSON.stringify(body),
+			},
+		);
+	}
+
+	async deletePeernetNetwork(networkId: string) {
+		return this.request<void>(`/peernet/networks/${encodeURIComponent(networkId)}`, {
+			method: "DELETE",
+		});
+	}
+
+	async getPeernetInvites(networkId: string) {
+		return this.request<PeernetInvite[]>(
+			`/peernet/networks/${encodeURIComponent(networkId)}/invites`,
+		);
+	}
+
+	async createPeernetInvite(networkId: string, body: PeernetCreateInviteRequest) {
+		return this.request<PeernetInviteLink>(
+			`/peernet/networks/${encodeURIComponent(networkId)}/invites`,
+			{ method: "POST", body: JSON.stringify(body) },
+		);
+	}
+
+	async deletePeernetInvite(networkId: string, inviteId: string) {
+		return this.request<void>(
+			`/peernet/networks/${encodeURIComponent(networkId)}/invites/${encodeURIComponent(inviteId)}`,
+			{ method: "DELETE" },
+		);
+	}
+
+	async getPeernetMembers(networkId: string) {
+		return this.request<PeernetMember[]>(
+			`/peernet/networks/${encodeURIComponent(networkId)}/members`,
+		);
+	}
+
+	async deletePeernetMember(networkId: string, nodeId: string) {
+		return this.request<void>(
+			`/peernet/networks/${encodeURIComponent(networkId)}/members/${encodeURIComponent(nodeId)}`,
+			{ method: "DELETE" },
+		);
 	}
 
 	async reloadConfig() {

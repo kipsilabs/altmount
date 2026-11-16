@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"path"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/javi11/nntppool/v5"
@@ -13,7 +14,6 @@ import (
 	"github.com/kipsilabs/altmount/internal/contentverify"
 	"github.com/kipsilabs/altmount/internal/database"
 	"github.com/kipsilabs/altmount/internal/holes"
-	"github.com/kipsilabs/altmount/internal/importer/parser/fileinfo"
 	"github.com/kipsilabs/altmount/internal/metadata"
 	metapb "github.com/kipsilabs/altmount/internal/metadata/proto"
 	"github.com/kipsilabs/altmount/internal/pool"
@@ -35,6 +35,10 @@ const (
 	// quota, auth, truncated sweep). It carries no verdict: the file keeps the
 	// status it had and is simply re-checked later.
 	EventTypeCheckInconclusive EventType = "check_inconclusive"
+	// EventTypeCheckDeferred means no check ran: peer evidence allowed one due
+	// check of a healthy file to be postponed (HealthEvent.DeferUntil). It is
+	// not a verdict and never a status.
+	EventTypeCheckDeferred EventType = "check_deferred"
 )
 
 // HealthEvent represents a health check event
@@ -49,6 +53,17 @@ type HealthEvent struct {
 	// Classification is the playback-impact verdict for video files with
 	// missing segments (nil when not applicable).
 	Classification *holes.Impact
+	// Stats describes the sweep behind a verdict. It is nil for events that
+	// never reached the segment stage (metadata missing or corrupt, file
+	// removed, no segments, infrastructure failure of the whole check).
+	Stats *CheckStats
+	// DeferUntil is when a deferred check becomes due again
+	// (EventTypeCheckDeferred only).
+	DeferUntil time.Time
+	// ReducedByPeerAdvice is set when peer advice lowered the sample of this
+	// check. Such a result must not be attested to the peer network, and the
+	// next scheduled check of the file is a normal one.
+	ReducedByPeerAdvice bool
 }
 
 // CheckProgress reports article-check work for one file. ArticlesChecked includes
@@ -74,6 +89,10 @@ type CheckOptions struct {
 	// file's current status or the configured default. Used by the
 	// manual recheck API to let a user force a re-probe.
 	VerifyContentOverride *bool
+	// PeerFiles marks the check as the scheduled cycle's and carries what it
+	// knows about each due file, keyed by path. Peer advice is considered only
+	// for files listed here; nil (every other caller) means never.
+	PeerFiles map[string]PeerFileInfo
 }
 
 // PatchIndex reports articles restored locally by PAR2 repair.
@@ -90,6 +109,12 @@ type HealthChecker struct {
 	configGetter    config.ConfigGetter
 	rcloneClient    rclonecli.RcloneRcClient // Optional rclone client for VFS notifications
 	contentVerifyFS contentverify.Opener     // Optional: real NzbFilesystem for content probing
+	// peerAdviser supplies peer-network advice for scheduled re-checks (see
+	// peer_advice.go). Nil by default: no behaviour change and no overhead.
+	peerAdviser atomic.Pointer[peerAdviserHolder]
+	// patchStats is set while a healthy observer is installed: only then is
+	// CheckStats.PatchedByPAR2 computed (see patch_summary.go).
+	patchStats atomic.Bool
 }
 
 // NewHealthChecker creates a new health checker
@@ -156,6 +181,17 @@ type preparedCheck struct {
 	// it survives past preparation for error reporting without holding onto
 	// the segment slice itself during the network sweep.
 	totalSegments int
+	// realSegments is totalSegments without gap placeholders; patched and
+	// knownHoles are scalar summaries of the file's metadata for CheckStats.
+	realSegments int
+	knownHoles   bool
+	// patched is only meaningful when patchedKnown: preparation never scans
+	// the patch store per segment (that is a hash plus a stat each), it is
+	// resolved on demand by the consumers that need it.
+	patched      bool
+	patchedKnown bool
+	// reducedByPeer is set when peer advice lowered this check's sample.
+	reducedByPeer bool
 	// currentStatus is the file's HealthStatus before this check started,
 	// used to gate content verification to first-time (Pending) checks
 	// unless verifyContentOverride forces it either way.
@@ -271,6 +307,8 @@ func (hc *HealthChecker) prepareCheck(ctx context.Context, filePath string, opts
 	)
 
 	prep.totalSegments = len(input.segments)
+	prep.realSegments = countRealSegments(input.segments)
+	prep.knownHoles = len(input.knownHoles) > 0
 	if input.releaseDate > 0 {
 		prep.releaseDate = time.Unix(input.releaseDate, 0)
 	}
@@ -285,6 +323,16 @@ func (hc *HealthChecker) prepareCheck(ctx context.Context, filePath string, opts
 		details := database.HealthErrorDetails{ErrorType: "metadata_gap", Message: err.Error()}
 		event.Details = details.Marshal()
 		prep.earlyEvent = &event
+		return prep
+	}
+
+	// Peer-network advice (nil adviser: nothing happens). It may defer this
+	// check once or lower its sample; it is consulted once, after the local
+	// integrity check so corruption is never hidden.
+	var deferred *HealthEvent
+	samplePercentage, deferred = hc.applyPeerAdvice(ctx, &prep, input.segments, opts, cfg, samplePercentage)
+	if deferred != nil {
+		prep.earlyEvent = deferred
 		return prep
 	}
 
@@ -306,6 +354,8 @@ func (hc *HealthChecker) prepareCheck(ctx context.Context, filePath string, opts
 // through hc.metadataService.
 func (hc *HealthChecker) judgeValidation(ctx context.Context, prep preparedCheck, result usenet.ValidationResult, valErr error) HealthEvent {
 	event := baseResultEvent(prep.filePath, prep.sourceNzbPath)
+	event.Stats = statsFor(prep, result)
+	event.ReducedByPeerAdvice = prep.reducedByPeer
 
 	// An inconclusive sweep proves nothing. Reading a transient provider
 	// failure — whether the whole pool was unreachable or just a handful of
@@ -364,13 +414,22 @@ func (hc *HealthChecker) judgeValidation(ctx context.Context, prep preparedCheck
 	}
 
 	if hc.shouldVerifyContent(prep) {
-		corrupted, healthyDetails := hc.judgeContentVerification(ctx, prep)
+		corrupted, healthyDetails, passed := hc.runContentVerification(ctx, prep)
 		if corrupted != nil {
+			corrupted.Stats = event.Stats
 			return *corrupted
 		}
+		event.Stats.MediaHeaderVerified = passed
 		// A healthy record's details would otherwise be wiped, leaving no
 		// record that the probe ran (or that it could not).
 		event.Details = healthyDetails
+	}
+
+	// Only a consumer of the notice needs the patch summary, and only for a
+	// healthy result, so the store is scanned here and nowhere else.
+	if hc.patchStats.Load() {
+		event.Stats.PatchedByPAR2 = hc.patchedFor(ctx, &prep)
+		event.Stats.PatchKnown = true
 	}
 
 	// All checked segments are available - record will be deleted.
@@ -380,88 +439,6 @@ func (hc *HealthChecker) judgeValidation(ctx context.Context, prep preparedCheck
 	// Status not needed as the record will be deleted from database
 
 	return event
-}
-
-// shouldVerifyContent decides whether judgeValidation should run a content
-// probe for this file: explicit override wins; otherwise only a first-time
-// (Pending) check is probed, so repeated repair-recheck cycles on an
-// already-flagged file don't re-probe on every pass.
-func (hc *HealthChecker) shouldVerifyContent(prep preparedCheck) bool {
-	if hc.contentVerifyFS == nil {
-		// Probing through a nil Opener panics, so the wiring check comes
-		// first — an API-forced override must not be able to reach it.
-		return false
-	}
-	if prep.verifyContentOverride != nil {
-		return *prep.verifyContentOverride
-	}
-	if !hc.configGetter().GetHealthVerifyContent() {
-		return false
-	}
-	return prep.currentStatus == database.HealthStatusPending
-}
-
-// judgeContentVerification probes prep.filePath's content signature. It
-// returns a Corrupted event when the result is definitive, and otherwise the
-// error_details to attach to the healthy event: a nil event with non-nil
-// details records that the probe ran and passed, or that it could not
-// complete. Both returns are nil when the file is not an eligible media type
-// and no probe happened at all. A transient probe error must never mark a
-// file corrupted, so it stays on the healthy path — but it is recorded there
-// rather than only logged, because a healthy record that says nothing cannot
-// be told apart from one that was verified clean.
-func (hc *HealthChecker) judgeContentVerification(ctx context.Context, prep preparedCheck) (*HealthEvent, *string) {
-	if !fileinfo.IsVerifiableMediaFile(prep.filePath) {
-		return nil, nil
-	}
-
-	cfg := hc.configGetter()
-	result := contentverify.Probe(ctx, hc.contentVerifyFS, prep.filePath, cfg.GetHealthVerifyContentTimeout())
-
-	var errType, message string
-	switch result.Result {
-	case contentverify.ContentValid:
-		details := database.HealthErrorDetails{ContentVerification: database.ContentVerificationPassed}
-		return nil, details.Marshal()
-	case contentverify.ContentProbeError:
-		slog.WarnContext(ctx, "Content verification could not complete",
-			"file_path", prep.filePath,
-			"error", result.Err)
-		details := database.HealthErrorDetails{
-			ContentVerification: database.ContentVerificationUnavailable,
-			Message:             probeErrorMessage(result.Err),
-		}
-		return nil, details.Marshal()
-	case contentverify.ContentInvalid:
-		errType = "content_invalid"
-		message = "no recognized media container signature was found in the file's header"
-	case contentverify.ContentSegmentMissing:
-		errType = "content_segment_missing"
-		message = "the article needed to read the file's header is missing from your Usenet provider"
-	default:
-		return nil, nil
-	}
-
-	event := baseResultEvent(prep.filePath, prep.sourceNzbPath)
-	event.Type = EventTypeFileCorrupted
-	event.Status = database.HealthStatusCorrupted
-	event.Error = fmt.Errorf("content verification failed: %s", message)
-	details := database.HealthErrorDetails{
-		ErrorType:           errType,
-		Message:             message,
-		ContentVerification: database.ContentVerificationFailed,
-	}
-	event.Details = details.Marshal()
-	return &event, nil
-}
-
-// probeErrorMessage renders why a probe could not complete, so the UI can
-// explain an unproven file instead of just flagging it as unverified.
-func probeErrorMessage(err error) string {
-	if err == nil {
-		return "the content probe could not complete"
-	}
-	return fmt.Sprintf("the content probe could not complete: %s", err)
 }
 
 // CheckFile checks the health of a specific file

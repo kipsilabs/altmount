@@ -7,6 +7,7 @@ import {
 	Globe,
 	HardDrive,
 	Link,
+	Network as NetworkIcon,
 	Radio,
 	RefreshCw,
 	Server,
@@ -27,6 +28,7 @@ import { MountConfigSection } from "../components/config/MountConfigSection";
 import { NetworkConfigSection } from "../components/config/NetworkConfigSection";
 import { Par2RepairConfigSection } from "../components/config/Par2RepairConfigSection";
 import { ProvidersConfigSection } from "../components/config/ProvidersConfigSection";
+import { PeernetConfigSection } from "../components/config/peernet/PeernetConfigSection";
 import { SABnzbdConfigSection } from "../components/config/SABnzbdConfigSection";
 import { StreamingConfigSection } from "../components/config/StreamingConfigSection";
 import { StremioConfigSection } from "../components/config/StremioConfigSection";
@@ -64,6 +66,7 @@ import type {
 	WebDAVConfig,
 } from "../types/config";
 import { CONFIG_SECTIONS } from "../types/config";
+import type { PeernetConfig } from "../types/peernet";
 
 // Helper function to get icon component
 const getIconComponent = (iconName: string) => {
@@ -81,6 +84,7 @@ const getIconComponent = (iconName: string) => {
 		Server,
 		Tv,
 		Link,
+		Network: NetworkIcon,
 	};
 	return iconMap[iconName as keyof typeof iconMap] || Settings;
 };
@@ -101,7 +105,7 @@ const SECTION_GROUPS = [
 	},
 	{
 		title: "System",
-		sections: ["auth", "network", "system"],
+		sections: ["auth", "network", "peernet", "system"],
 	},
 ];
 
@@ -287,6 +291,11 @@ export function ConfigurationPage() {
 				await updateConfigSection.mutateAsync({
 					section: "par2_repair",
 					config: { par2_repair: data as unknown as Par2RepairConfig },
+				});
+			} else if (section === "peernet") {
+				await updateConfigSection.mutateAsync({
+					section: "peernet",
+					config: { peernet: data as unknown as PeernetConfig },
 				});
 			} else if (section === "log") {
 				const logData = data as unknown as LogFormData & { profiler_enabled?: boolean };
@@ -584,6 +593,13 @@ export function ConfigurationPage() {
 										isUpdating={updateConfigSection.isPending}
 									/>
 								)}
+								{activeSection === "peernet" && (
+									<PeernetConfigSection
+										config={config}
+										onUpdate={handleConfigUpdate}
+										isUpdating={updateConfigSection.isPending}
+									/>
+								)}
 								{![
 									"webdav",
 									"auth",
@@ -599,6 +615,7 @@ export function ConfigurationPage() {
 									"stremio",
 									"network",
 									"par2_repair",
+									"peernet",
 								].includes(activeSection) && (
 									<ComingSoonSection
 										sectionName={CONFIG_SECTIONS[activeSection]?.title || activeSection}

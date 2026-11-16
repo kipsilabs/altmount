@@ -19,6 +19,7 @@ import {
 import { type FileHealth, HealthPriority } from "../../../../types/api";
 import { parseRepairReason } from "../par2RepairReason";
 import { RepairFailureMessage } from "../RepairFailureMessage";
+import { technicalDetails } from "../technicalDetails";
 import { ArticleCheckProgress } from "./ArticleCheckProgress";
 import { ContentVerificationBadge } from "./ContentVerificationBadge";
 import { HealthItemActionsMenu } from "./HealthItemActionsMenu";
@@ -224,12 +225,16 @@ export const HealthItemCard = memo(function HealthItemCard({
 
 				{/* Gated on an actual error: a healthy record now carries a
 				    content-verification envelope, which the badge above renders. */}
-				{item.last_error && item.error_details && item.error_details !== item.last_error && (
-					<div className="alert alert-warning px-3 py-2">
-						<AlertCircle className="h-4 w-4 shrink-0" />
-						<span className="text-xs">Technical: {truncateText(item.error_details, 80)}</span>
-					</div>
-				)}
+				{item.last_error &&
+					technicalDetails(item.error_details) &&
+					technicalDetails(item.error_details) !== item.last_error && (
+						<div className="alert alert-warning px-3 py-2">
+							<AlertCircle className="h-4 w-4 shrink-0" />
+							<span className="text-xs">
+								Technical: {truncateText(technicalDetails(item.error_details) ?? "", 80)}
+							</span>
+						</div>
+					)}
 
 				{/* Expandable Details */}
 				<button

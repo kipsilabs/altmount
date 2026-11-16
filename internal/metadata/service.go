@@ -11,6 +11,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	lru "github.com/hashicorp/golang-lru/v2"
@@ -53,6 +54,20 @@ type FileMetadataLite struct {
 	Status     metapb.FileStatus
 }
 
+// FileObserver is told about metadata files appearing and disappearing. It is
+// optional (see SetFileObserver) and purely advisory: implementations must not
+// block for long and must handle their own errors, because the metadata
+// operation has already succeeded when they are called. Paths are normalized
+// virtual paths without a leading slash.
+type FileObserver interface {
+	FileWritten(ctx context.Context, virtualPath string)
+	FileDeleted(ctx context.Context, virtualPath string)
+	DirectoryDeleted(ctx context.Context, virtualPath string)
+	// DirectoryRenamed reports a whole metadata directory moving; the files
+	// keep their content, only their paths change.
+	DirectoryRenamed(ctx context.Context, oldVirtualPath, newVirtualPath string)
+}
+
 // MetadataService provides low-level read/write operations for metadata files.
 //
 // The full FileMetadata proto is never cached: callers that need segments
@@ -78,6 +93,21 @@ type MetadataService struct {
 	// storeRefCounter tracks reference counts for shared NzbStore files.
 	// nil means reference counting is disabled.
 	storeRefCounter StoreRefCounter
+	// observer, when set, is notified after metadata files are written,
+	// renamed or deleted. nil disables notifications. Held atomically so it
+	// can be set and cleared while the service is in use.
+	observer atomic.Pointer[observerBox]
+}
+
+// observerBox lets an interface value live in an atomic.Pointer.
+type observerBox struct{ o FileObserver }
+
+// fileObserver returns the current observer, or nil.
+func (ms *MetadataService) fileObserver() FileObserver {
+	if b := ms.observer.Load(); b != nil {
+		return b.o
+	}
+	return nil
 }
 
 // NewMetadataService creates a new metadata service
@@ -99,6 +129,16 @@ func (ms *MetadataService) Store() *StoreService {
 // NzbStore files are maintained when metadata is deleted or created.
 func (ms *MetadataService) SetStoreRefCounter(c StoreRefCounter) {
 	ms.storeRefCounter = c
+}
+
+// SetFileObserver wires in an optional FileObserver. It is safe to call while
+// the service is in use. Passing nil removes the observer.
+func (ms *MetadataService) SetFileObserver(o FileObserver) {
+	if o == nil {
+		ms.observer.Store(nil)
+		return
+	}
+	ms.observer.Store(&observerBox{o: o})
 }
 
 // IncStoreRef increments the reference count for a v3 store file.
@@ -184,8 +224,22 @@ func (ms *MetadataService) metaDirPath(virtualPath string) string {
 	return filepath.Join(ms.rootPath, normalizeVirtualPath(virtualPath))
 }
 
-// WriteFileMetadata writes file metadata to disk
+// WriteFileMetadata writes file metadata to disk and tells the file observer
+// (if any) that the file was written.
 func (ms *MetadataService) WriteFileMetadata(virtualPath string, metadata *metapb.FileMetadata) error {
+	if err := ms.writeFileMetadata(virtualPath, metadata); err != nil {
+		return err
+	}
+	if obs := ms.fileObserver(); obs != nil {
+		obs.FileWritten(context.Background(), normalizeVirtualPath(virtualPath))
+	}
+	return nil
+}
+
+// writeFileMetadata is WriteFileMetadata without the observer notification,
+// for callers that notify themselves (WriteFileMetadataAuto) or that cannot
+// change a file's identity (UpdateFileMetadata).
+func (ms *MetadataService) writeFileMetadata(virtualPath string, metadata *metapb.FileMetadata) error {
 	virtualPath = normalizeVirtualPath(virtualPath)
 
 	metadataPath := ms.metaFilePath(virtualPath)
@@ -336,7 +390,7 @@ func (ms *MetadataService) WriteFileMetadataV3(ctx context.Context, virtualPath 
 
 	// WriteFileMetadata's v3 branch (StoreRef set) clears inline SegmentData/
 	// SharedOuterSources/NestedSource.Segments and keeps SegmentRefs/SegmentRuns.
-	if err := ms.WriteFileMetadata(virtualPath, m); err != nil {
+	if err := ms.writeFileMetadata(virtualPath, m); err != nil {
 		return err
 	}
 	ms.IncStoreRef(ctx, storeRef)
@@ -350,12 +404,12 @@ func (ms *MetadataService) WriteFileMetadataV3(ctx context.Context, virtualPath 
 func (ms *MetadataService) WriteFileMetadataAuto(ctx context.Context, virtualPath string, metadata *metapb.FileMetadata, index map[string]int64, storeRef string) error {
 	write := func() error {
 		if storeRef == "" {
-			return ms.WriteFileMetadata(virtualPath, metadata)
+			return ms.writeFileMetadata(virtualPath, metadata)
 		}
 		if err := ms.WriteFileMetadataV3(ctx, virtualPath, metadata, index, storeRef); err != nil {
 			slog.WarnContext(ctx, "v3 metadata write failed; writing v1",
 				"path", virtualPath, "error", err)
-			return ms.WriteFileMetadata(virtualPath, metadata)
+			return ms.writeFileMetadata(virtualPath, metadata)
 		}
 		return nil
 	}
@@ -365,6 +419,9 @@ func (ms *MetadataService) WriteFileMetadataAuto(ctx context.Context, virtualPat
 	}
 
 	ms.removeCorruptedCopy(ctx, virtualPath)
+	if obs := ms.fileObserver(); obs != nil {
+		obs.FileWritten(ctx, normalizeVirtualPath(virtualPath))
+	}
 	return nil
 }
 
@@ -755,8 +812,11 @@ func (ms *MetadataService) UpdateFileMetadata(virtualPath string, updateFunc fun
 	// Always restore ModifiedAt to its pre-call value.
 	metadata.ModifiedAt = originalModifiedAt
 
-	// Write back to disk
-	return ms.WriteFileMetadata(virtualPath, metadata)
+	// Write back to disk. No observer notification on purpose: the update
+	// callbacks in use (file status, known holes) cannot change anything a file
+	// identity is derived from (segment message-IDs and structure), so the
+	// content index needs no refresh.
+	return ms.writeFileMetadata(virtualPath, metadata)
 }
 
 // UpdateFileStatus updates the status of a file in metadata.
@@ -817,6 +877,10 @@ func (ms *MetadataService) DeleteFileMetadata(ctx context.Context, virtualPath s
 
 	// Clean up empty parent directories in metadata path
 	utils.RemoveEmptyDirs(ms.rootPath, metadataDir)
+
+	if obs := ms.fileObserver(); obs != nil {
+		obs.FileDeleted(ctx, virtualPath)
+	}
 
 	// Decrement reference count for shared store file and delete it if no more refs.
 	if ms.storeRefCounter != nil && storeRef != "" {
@@ -887,6 +951,10 @@ func (ms *MetadataService) DeleteDirectory(virtualPath string) error {
 	err := os.RemoveAll(metadataDir)
 	if err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("failed to delete metadata directory: %w", err)
+	}
+
+	if obs := ms.fileObserver(); obs != nil {
+		obs.DirectoryDeleted(ctx, virtualPath)
 	}
 
 	// Post-pass: decrement ref counts and delete orphaned store files.
@@ -1014,6 +1082,28 @@ func (ms *MetadataService) RenameFileMetadata(oldVirtualPath, newVirtualPath str
 		}
 	}
 
+	if obs := ms.fileObserver(); obs != nil {
+		ctx := context.Background()
+		obs.FileDeleted(ctx, oldVirtualPath)
+		obs.FileWritten(ctx, newVirtualPath)
+	}
+
+	return nil
+}
+
+// RenameDirectory moves a whole metadata directory (and everything in it)
+// from oldVirtualPath to newVirtualPath and tells the file observer.
+func (ms *MetadataService) RenameDirectory(oldVirtualPath, newVirtualPath string) error {
+	oldVirtualPath = normalizeVirtualPath(oldVirtualPath)
+	newVirtualPath = normalizeVirtualPath(newVirtualPath)
+	ms.purgeCachedTree(oldVirtualPath)
+	ms.purgeCachedTree(newVirtualPath)
+	if err := os.Rename(ms.metaDirPath(oldVirtualPath), ms.metaDirPath(newVirtualPath)); err != nil {
+		return err
+	}
+	if obs := ms.fileObserver(); obs != nil {
+		obs.DirectoryRenamed(context.Background(), oldVirtualPath, newVirtualPath)
+	}
 	return nil
 }
 
@@ -1122,6 +1212,10 @@ func (ms *MetadataService) MoveToCorrupted(ctx context.Context, virtualPath stri
 		// Rename can fail across different volumes, though usually metadata is on one volume.
 		// For simplicity, we return the error here as it's unexpected for metadata.
 		return err
+	}
+
+	if obs := ms.fileObserver(); obs != nil {
+		obs.FileDeleted(ctx, virtualPath)
 	}
 
 	// The .meta's disk mtime is pinned to the proto's ModifiedAt (the import time),
