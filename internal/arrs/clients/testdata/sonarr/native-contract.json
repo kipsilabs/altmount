@@ -1324,6 +1324,39 @@
           }
         }
       }
+    },
+    "/api/v5/parse": {
+      "get": {
+        "parameters": [
+          {
+            "name": "title",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "path",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {},
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ParseResource"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "enums": {
