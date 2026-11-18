@@ -148,7 +148,7 @@ export function StreamRoutingCard({
 				</div>
 
 				{/* Timeouts & TTL Controls */}
-				<div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+				<div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
 					<fieldset className="fieldset min-w-0">
 						<legend className="fieldset-legend font-semibold text-xs">
 							Stream Fallback Timeout
