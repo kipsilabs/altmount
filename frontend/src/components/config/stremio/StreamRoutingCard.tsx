@@ -172,7 +172,7 @@ export function StreamRoutingCard({
 								ms
 							</span>
 						</div>
-						<p className="label text-[11px] text-base-content/50">
+						<p className="label whitespace-normal text-[11px] text-base-content/50">
 							Max wait time before auto-switching to candidate release on stall.
 						</p>
 					</fieldset>
@@ -196,7 +196,7 @@ export function StreamRoutingCard({
 								Hours
 							</span>
 						</div>
-						<p className="label text-[11px] text-base-content/50">
+						<p className="label whitespace-normal text-[11px] text-base-content/50">
 							Duration to retain parsed NZB streams. 0 = keep forever.
 						</p>
 					</fieldset>
@@ -220,7 +220,7 @@ export function StreamRoutingCard({
 								Hours
 							</span>
 						</div>
-						<p className="label text-[11px] text-base-content/50">
+						<p className="label whitespace-normal text-[11px] text-base-content/50">
 							Duration to hide dead / DMCAed NZB candidates from stream search.
 						</p>
 					</fieldset>
