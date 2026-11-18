@@ -1,4 +1,15 @@
 -- +goose Up
+-- Some SQLite databases have migration 044 recorded without its index table.
+-- Restore the schema from 044 before adding columns to the table.
+CREATE TABLE IF NOT EXISTS peernet_content_index (
+    file_path TEXT PRIMARY KEY,
+    file_id TEXT NOT NULL,
+    release_id TEXT NOT NULL DEFAULT '',
+    indexed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_peernet_content_file_id ON peernet_content_index(file_id);
+CREATE INDEX IF NOT EXISTS idx_peernet_content_release_id ON peernet_content_index(release_id);
+
 -- How each indexed file's release_id was derived: 0 none, 1 "nzb" (hash of the
 -- release's NZB segment list), 2 "files" (derived from the File IDs of the
 -- files of one import, for metadata that predates the NZB store). Existing
