@@ -227,7 +227,7 @@ func (proc *Processor) ProbePeerRelease(ctx context.Context, files []PeerProbeLi
 		pct   int
 	}{{all, cfg.Import.SegmentSamplePercentage}, {edges, 100}} {
 		verdict, err := validation.FastFailReleaseProbeVerdict(ctx, probe.files, proc.poolManager, probe.pct,
-			concurrency, proc.validationTimeout, proc.patchIndex, time.Time{})
+			concurrency, proc.validationTimeout, proc.patchIndex, time.Time{}, cfg.GetImportSegmentCheckTimeout())
 		if err != nil {
 			return fmt.Errorf("%w: %w", ErrPeerProbeInconclusive, err)
 		}
