@@ -3,6 +3,8 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -156,7 +158,11 @@ func (s *Server) handleNzbStreams(c *fiber.Ctx) error {
 	var nzbFilename string
 	var nzbData []byte
 
-	if nzbURL != "" {
+	// Reuse a recent import of the same URL instead of fetching the NZB again.
+	grabbed := s.recentNzbGrab(ctx, cfg.Stremio.NzbGrabCacheHours, nzbURL)
+	if grabbed != nil {
+		nzbFilename = filepath.Base(grabbed.NzbPath)
+	} else if nzbURL != "" {
 		// Download NZB from the provided URL
 		const maxNzbFetchSize = 100 * 1024 * 1024 // 100 MB
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, nzbURL, nil)
@@ -243,6 +249,11 @@ func (s *Server) handleNzbStreams(c *fiber.Ctx) error {
 	nzbName := nzbtrim.TrimNzbExtension(safeFilename)
 	tempPath := filepath.Join(uploadDir, safeFilename)
 
+	if grabbed != nil {
+		slog.InfoContext(ctx, "Reusing NZB grabbed earlier from the same URL", "queue_id", grabbed.ID)
+		return s.waitAndRespond(c, grabbed.ID, baseURL, downloadKey, nzbName, selector, timeoutSecs)
+	}
+
 	// --- Find or add NZB to queue, deduplicated per filename ---
 	// stremioPlayGroup serialises all callers with the same safeFilename: the first
 	// one runs the full find-or-add path; concurrent duplicates (e.g. two users
@@ -301,8 +312,14 @@ func (s *Server) handleNzbStreams(c *fiber.Ctx) error {
 			basePath = &completeDir
 		}
 
+		var downloadID *string
+		if nzbURL != "" {
+			id := nzbGrabID(nzbURL)
+			downloadID = &id
+		}
+
 		priority := database.QueuePriorityHigh
-		item, err := s.importerService.AddToQueue(workCtx, tempPath, basePath, &category, &priority, nil, nil, nil)
+		item, err := s.importerService.AddToQueue(workCtx, tempPath, basePath, &category, &priority, nil, downloadID, nil)
 		if err != nil {
 			os.Remove(tempPath)
 			return nil, fmt.Errorf("failed to add NZB to queue: %w", err)
@@ -320,6 +337,36 @@ func (s *Server) handleNzbStreams(c *fiber.Ctx) error {
 	}
 
 	return s.waitAndRespond(c, rawID.(int64), baseURL, downloadKey, nzbName, selector, timeoutSecs)
+}
+
+// nzbGrabID is the download ID of an import fetched from nzbURL. Only a hash of
+// the URL is stored, as indexer URLs carry API keys.
+func nzbGrabID(nzbURL string) string {
+	sum := sha256.Sum256([]byte(nzbURL))
+	return "nzburl:" + hex.EncodeToString(sum[:])
+}
+
+// recentNzbGrab returns the import an earlier request created from nzbURL while
+// it is still running, or completed less than ttlHours ago. A failed or expired
+// import returns nil, so the NZB is fetched again.
+func (s *Server) recentNzbGrab(ctx context.Context, ttlHours int, nzbURL string) *database.ImportQueueItem {
+	if nzbURL == "" || ttlHours <= 0 || s.queueRepo == nil {
+		return nil
+	}
+	item, err := s.queueRepo.GetQueueItemByDownloadID(ctx, nzbGrabID(nzbURL))
+	if err != nil || item == nil {
+		return nil
+	}
+	switch item.Status {
+	case database.QueueStatusPending, database.QueueStatusProcessing, database.QueueStatusPaused:
+		return item
+	case database.QueueStatusCompleted:
+		if item.StoragePath != nil && *item.StoragePath != "" && item.CompletedAt != nil &&
+			time.Since(*item.CompletedAt) < time.Duration(ttlHours)*time.Hour {
+			return item
+		}
+	}
+	return nil
 }
 
 // waitAndRespond subscribes to the progress broadcaster and waits for the queue item to

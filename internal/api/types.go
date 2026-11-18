@@ -273,6 +273,7 @@ type StremioAPIResponse struct {
 	MaxRetries          int    `json:"max_retries,omitempty"`
 	StreamTTLSeconds    int    `json:"stream_ttl_seconds,omitempty"`
 	NzbTTLHours         int    `json:"nzb_ttl_hours"`
+	NzbGrabCacheHours   int    `json:"nzb_grab_cache_hours"`
 	// No omitempty: an explicit 0 must survive the round-trip, otherwise saving the
 	// config would silently restore the defaults.
 	FailedReleaseTTLHours int                        `json:"failed_release_ttl_hours"`
@@ -535,6 +536,7 @@ func ToConfigAPIResponse(cfg *config.Config, apiKey string) *ConfigAPIResponse {
 		MaxRetries:            cfg.Stremio.MaxRetries,
 		StreamTTLSeconds:      cfg.Stremio.StreamTTLSeconds,
 		NzbTTLHours:           cfg.Stremio.NzbTTLHours,
+		NzbGrabCacheHours:     cfg.Stremio.NzbGrabCacheHours,
 		FailedReleaseTTLHours: cfg.Stremio.FailedReleaseTTLHours,
 		MaxFallbackReleases:   cfg.Stremio.MaxFallbackReleases,
 		FastFailHeaderOnly:    cfg.Stremio.EffectiveFastFailHeaderOnly(),
