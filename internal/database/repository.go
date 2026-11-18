@@ -378,7 +378,6 @@ func (r *Repository) GetQueueItemByDownloadID(ctx context.Context, downloadID st
 		       started_at, completed_at, retry_count, max_retries, error_message, batch_id, metadata, file_size, storage_path, target_path, indexer,
 		       skip_arr_notification, skip_post_import_links, peer_hold
 		FROM import_queue WHERE download_id = ?
-		ORDER BY id DESC LIMIT 1
 	`
 
 	var item ImportQueueItem
