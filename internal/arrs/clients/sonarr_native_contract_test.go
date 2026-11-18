@@ -80,6 +80,14 @@ func TestNativeEndpointParity(t *testing.T) {
 			_, e := c.SendCommandContext(ctx, &sonarr.CommandRequest{Name: "EpisodeSearch", EpisodeIDs: []int64{1, 2}})
 			return e
 		}},
+		{name: "parse", method: "GET", path: "/parse", query: map[string][]string{"title": {"Some.Show.S02E04.1080p.WEB-DL-GRP"}}, response: `{"title":"Some.Show.S02E04.1080p.WEB-DL-GRP","episodes":[{"id":11,"seriesId":7,"episodeFileId":501,"hasFile":true}]}`, call: func(c SonarrClient) error {
+			v, e := c.ParseContext(ctx, &sonarr.ParseInput{Title: "Some.Show.S02E04.1080p.WEB-DL-GRP"})
+			if e == nil {
+				require.Len(t, v.Episodes, 1)
+				require.Equal(t, int64(501), v.Episodes[0].EpisodeFileID)
+			}
+			return e
+		}},
 		{name: "command poll", method: "GET", path: "/command/1", response: `{"id":1}`, call: func(c SonarrClient) error { _, e := c.GetCommandStatusContext(ctx, 1); return e }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

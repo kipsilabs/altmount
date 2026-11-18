@@ -175,3 +175,38 @@ func (s *nativeSonarr) DeleteAny(ctx context.Context, r starr.Request) error {
 	}
 	return sanitizeSonarrError(s.APIer.DeleteAny(ctx, r))
 }
+
+// nativeParseResource is the part of Sonarr v5's ParseResource
+// (GET /api/v5/parse) that callers read: the title and the episodes the title
+// maps to. parsedEpisodeInfo, languages and customFormats are left out on
+// purpose: v5 already reshaped parsedEpisodeInfo (seasonNumbers is a list),
+// and decoding only what is read keeps a later change there from failing
+// the parse.
+type nativeParseResource struct {
+	ID       int64             `json:"id"`
+	Title    string            `json:"title"`
+	Episodes []*sonarr.Episode `json:"episodes"`
+}
+
+// ParseContext asks Sonarr v5 which series and episodes a release name or path
+// is (GET /api/v5/parse). The returned ParseOutput carries ID, Title and
+// Episodes only; ParsedEpisodeInfo is always nil. A title Sonarr cannot map to
+// a series gives no episodes, not an error.
+func (s *nativeSonarr) ParseContext(ctx context.Context, input *sonarr.ParseInput) (*sonarr.ParseOutput, error) {
+	if input == nil || (strings.TrimSpace(input.Title) == "" && strings.TrimSpace(input.Path) == "") {
+		return nil, fmt.Errorf("%w: parse needs a title or a path", starr.ErrRequestError)
+	}
+	q := url.Values{}
+	if input.Title != "" {
+		q.Set("title", input.Title)
+	}
+	if input.Path != "" {
+		q.Set("path", input.Path)
+	}
+	var res nativeParseResource
+	req := starr.Request{URI: "/v5/parse", Query: q}
+	if err := s.GetInto(ctx, req, &res); err != nil {
+		return nil, fmt.Errorf("api.Get(%s): %w", &req, err)
+	}
+	return &sonarr.ParseOutput{ID: res.ID, Title: res.Title, Episodes: res.Episodes}, nil
+}
