@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"log/slog"
+	"net"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -33,13 +34,67 @@ type StreamTracker struct {
 	metricsTracker usenet.MetricsTracker
 
 	// activeCount is the exact number of entries currently in the streams map.
-	// Maintained as an int64 counter so ActiveStreams() is O(1) and safe to
+	// Maintained as an int64 counter so ActiveConnections() is O(1) and safe to
 	// call from hot paths (e.g. the pool admission gate).
 	activeCount atomic.Int64
 
 	// notifier, when set, is notified after every stream add/remove so the
 	// import-admission cap can react to streams starting/stopping.
 	notifier StreamChangeNotifier
+
+	// Playbacks, not requests. A reader such as rclone opens one file with
+	// many parallel range GETs (--vfs-read-chunk-streams, each from its own
+	// source port); counting each as a stream multiplied the import budget's
+	// per-stream reserve until imports were left one connection.
+	// activePlaybacks counts distinct playbackKeys with at least one open
+	// stream; ActiveStreams reports it.
+	playbackMu      sync.Mutex
+	playbackOf      map[string]string // stream id -> playback key
+	playbackStreams map[string]int    // playback key -> open streams
+	activePlaybacks atomic.Int64
+}
+
+// playbackKey identifies one playback session: the same file, read by the same
+// user through the same source from the same client host with the same agent.
+// The client's port is dropped, since parallel connections each get their own.
+func playbackKey(s *nzbfilesystem.ActiveStream) string {
+	host := s.ClientIP
+	if h, _, err := net.SplitHostPort(s.ClientIP); err == nil {
+		host = h
+	}
+	return s.FilePath + "|" + s.UserName + "|" + s.Source + "|" + host + "|" + s.UserAgent
+}
+
+func (t *StreamTracker) addPlayback(id string, s *nzbfilesystem.ActiveStream) {
+	key := playbackKey(s)
+	t.playbackMu.Lock()
+	defer t.playbackMu.Unlock()
+	if t.playbackOf == nil {
+		t.playbackOf = make(map[string]string)
+		t.playbackStreams = make(map[string]int)
+	}
+	if _, dup := t.playbackOf[id]; dup {
+		return
+	}
+	t.playbackOf[id] = key
+	t.playbackStreams[key]++
+	if t.playbackStreams[key] == 1 {
+		t.activePlaybacks.Add(1)
+	}
+}
+
+func (t *StreamTracker) removePlayback(id string) {
+	t.playbackMu.Lock()
+	defer t.playbackMu.Unlock()
+	key, ok := t.playbackOf[id]
+	if !ok {
+		return
+	}
+	delete(t.playbackOf, id)
+	if t.playbackStreams[key]--; t.playbackStreams[key] <= 0 {
+		delete(t.playbackStreams, key)
+		t.activePlaybacks.Add(-1)
+	}
 }
 
 type streamSample struct {
@@ -270,6 +325,7 @@ func (t *StreamTracker) AddStream(filePath, source, userName, clientIP, userAgen
 	}
 	t.streams.Store(id, internal)
 	t.activeCount.Add(1)
+	t.addPlayback(id, stream)
 	t.notifyChange()
 	return stream
 }
@@ -280,9 +336,16 @@ func (t *StreamTracker) SetChangeNotifier(n StreamChangeNotifier) {
 	t.notifier = n
 }
 
-// ActiveStreams returns the current number of tracked streams.
-// Implements pool.StreamActivitySource (structurally).
+// ActiveStreams returns the number of active playbacks: open streams grouped
+// by playbackKey, so one player reading a file over many parallel connections
+// counts once. Implements pool.StreamActivitySource (structurally); the import
+// budget reserves headroom per playback.
 func (t *StreamTracker) ActiveStreams() int {
+	return int(t.activePlaybacks.Load())
+}
+
+// ActiveConnections returns the number of open stream requests.
+func (t *StreamTracker) ActiveConnections() int {
 	return int(t.activeCount.Load())
 }
 
@@ -381,6 +444,7 @@ func (t *StreamTracker) Remove(id string) {
 
 		t.streams.Delete(id)
 		t.activeCount.Add(-1)
+		t.removePlayback(id)
 		t.notifyChange()
 	}
 }
