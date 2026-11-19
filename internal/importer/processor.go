@@ -445,6 +445,72 @@ func isSidecarFile(filename string) bool {
 	return false
 }
 
+// releaseProbeVerdict is validation.FastFailReleaseProbeVerdict; a var so
+// tests can hand preParseFastFail a given probe verdict.
+var releaseProbeVerdict = validation.FastFailReleaseProbeVerdict
+
+// recheckWithoutSidecars backs import.fail_fast_on_missing_articles when the
+// release probe missed only sidecar articles. It probes the release again with
+// the sidecars left out: a miss in the media fails the import with
+// multifile.ErrNoFilesProcessed, and clean media imports with only the
+// sidecars that missed marked broken.
+func (proc *Processor) recheckWithoutSidecars(
+	ctx context.Context,
+	files []validation.FastFailFile,
+	missingIDs []string,
+	cfg *config.Config,
+	concurrency int,
+	releaseDate time.Time,
+	probeStart time.Time,
+) ([]validation.FastFailFileResult, error) {
+	withoutSidecars := make([]validation.FastFailFile, len(files))
+	for i, ff := range files {
+		if isSidecarFile(ff.Filename) {
+			withoutSidecars[i] = validation.FastFailFile{Filename: ff.Filename}
+			continue
+		}
+		withoutSidecars[i] = ff
+	}
+	recheck, err := releaseProbeVerdict(
+		ctx, withoutSidecars, proc.poolManager, cfg.Import.SegmentSamplePercentage,
+		concurrency, proc.validationTimeout, proc.patchIndex, releaseDate,
+		cfg.GetImportSegmentCheckTimeout(),
+	)
+	if err != nil {
+		return nil, err
+	}
+	if recheck.Missing {
+		if proc.log != nil {
+			proc.log.InfoContext(ctx, "Import segment check failed: release has missing articles",
+				"missing_sampled", len(recheck.MissingIDs),
+				"files", len(files),
+				"duration", time.Since(probeStart).Round(time.Millisecond))
+		}
+		return nil, multifile.ErrNoFilesProcessed
+	}
+	// Media clean: drop only the sidecars that missed.
+	gone := make(map[string]struct{}, len(missingIDs))
+	for _, id := range missingIDs {
+		gone[id] = struct{}{}
+	}
+	results := validation.PlaceholderResults(files, proc.patchIndex)
+	for i, ff := range files {
+		if !isSidecarFile(ff.Filename) {
+			continue
+		}
+		for _, seg := range ff.Segments {
+			if seg == nil {
+				continue
+			}
+			if _, miss := gone[seg.Id]; miss {
+				results[i].Broken = true
+				results[i].MissingSegmentIDs = append(results[i].MissingSegmentIDs, seg.Id)
+			}
+		}
+	}
+	return results, nil
+}
+
 // preParseFastFail runs a per-file Stat-based reachability check against the raw NZB
 // before any Body fetches. PAR2 files and sidecars are never Stat-checked (they're
 // included regardless), so their segments are omitted from the sweep to avoid wasted
@@ -503,7 +569,7 @@ func (proc *Processor) preParseFastFail(ctx context.Context, n *nzbparser.Nzb, c
 	// common case — pay only this and skip the per-file sweep entirely, keeping
 	// the "Checking segment availability" stage short.
 	probeStart := time.Now()
-	verdict, err := validation.FastFailReleaseProbeVerdict(
+	verdict, err := releaseProbeVerdict(
 		ctx,
 		fastFailFiles,
 		proc.poolManager,
@@ -520,8 +586,20 @@ func (proc *Processor) preParseFastFail(ctx context.Context, n *nzbparser.Nzb, c
 	missing := verdict.Missing
 	acceptableMissingPercent := cfg.GetAcceptableMissingSegmentsPercentage()
 
+	failFast := cfg.GetImportFailFastOnMissingArticles() && acceptableMissingPercent == 0
+
 	var results []validation.FastFailFileResult
 	switch {
+	case failFast && missing && probeMissesOnlySidecars(fastFailFiles, verdict.MissingIDs):
+		// Ahead of the dead-release verdict: a separately posted .nfo often
+		// expires on its own, and when it comes first in the NZB the probe's
+		// first wave can hit nothing else. Misses confined to sidecars say
+		// nothing about the media, so re-check the release once without them.
+		results, err = proc.recheckWithoutSidecars(ctx, fastFailFiles, verdict.MissingIDs, cfg,
+			concurrency, releaseDate, probeStart)
+		if err != nil {
+			return nil, nil, nil, err
+		}
 	case verdict.Dead:
 		// Every sampled article of the first wave is gone: the per-file sweep
 		// would only re-learn that with hundreds more STATs, each a slow 430
@@ -579,64 +657,15 @@ func (proc *Processor) preParseFastFail(ctx context.Context, n *nzbparser.Nzb, c
 		// are broken first (phase 2, a per-file sweep at the full percentage)
 		// can take minutes on a taken-down release while the client that
 		// queued it (an addon waiting to stream) gives up; failing now lets it
-		// move on to its next release. Misses confined to sidecars re-check
-		// the rest once without them.
-		if cfg.GetImportFailFastOnMissingArticles() && acceptableMissingPercent == 0 {
-			if !probeMissesOnlySidecars(fastFailFiles, verdict.MissingIDs) {
-				if proc.log != nil {
-					proc.log.InfoContext(ctx, "Import segment check failed: release has missing articles",
-						"missing_sampled", len(verdict.MissingIDs),
-						"files", len(fastFailFiles),
-						"duration", time.Since(probeStart).Round(time.Millisecond))
-				}
-				return nil, nil, nil, multifile.ErrNoFilesProcessed
+		// move on to its next release. Sidecar-only misses were settled above.
+		if failFast {
+			if proc.log != nil {
+				proc.log.InfoContext(ctx, "Import segment check failed: release has missing articles",
+					"missing_sampled", len(verdict.MissingIDs),
+					"files", len(fastFailFiles),
+					"duration", time.Since(probeStart).Round(time.Millisecond))
 			}
-			withoutSidecars := make([]validation.FastFailFile, len(fastFailFiles))
-			for i, ff := range fastFailFiles {
-				if isSidecarFile(ff.Filename) {
-					withoutSidecars[i] = validation.FastFailFile{Filename: ff.Filename}
-					continue
-				}
-				withoutSidecars[i] = ff
-			}
-			recheck, err := validation.FastFailReleaseProbeVerdict(
-				ctx, withoutSidecars, proc.poolManager, cfg.Import.SegmentSamplePercentage,
-				concurrency, proc.validationTimeout, proc.patchIndex, releaseDate,
-				cfg.GetImportSegmentCheckTimeout(),
-			)
-			if err != nil {
-				return nil, nil, nil, err
-			}
-			if recheck.Missing {
-				if proc.log != nil {
-					proc.log.InfoContext(ctx, "Import segment check failed: release has missing articles",
-						"missing_sampled", len(recheck.MissingIDs),
-						"files", len(fastFailFiles),
-						"duration", time.Since(probeStart).Round(time.Millisecond))
-				}
-				return nil, nil, nil, multifile.ErrNoFilesProcessed
-			}
-			// Media clean: drop only the sidecars that missed.
-			gone := make(map[string]struct{}, len(verdict.MissingIDs))
-			for _, id := range verdict.MissingIDs {
-				gone[id] = struct{}{}
-			}
-			results = validation.PlaceholderResults(fastFailFiles, proc.patchIndex)
-			for i, ff := range fastFailFiles {
-				if !isSidecarFile(ff.Filename) {
-					continue
-				}
-				for _, seg := range ff.Segments {
-					if seg == nil {
-						continue
-					}
-					if _, miss := gone[seg.Id]; miss {
-						results[i].Broken = true
-						results[i].MissingSegmentIDs = append(results[i].MissingSegmentIDs, seg.Id)
-					}
-				}
-			}
-			break
+			return nil, nil, nil, multifile.ErrNoFilesProcessed
 		}
 
 		// Phase 2 (escalation): the probe found an unreachable segment, so map
