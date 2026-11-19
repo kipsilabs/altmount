@@ -3,6 +3,7 @@ package parser
 import (
 	"context"
 	"errors"
+	"math/rand"
 	"sync"
 	"time"
 
@@ -20,6 +21,12 @@ const pastEndStatTimeout = 10 * time.Second
 const (
 	pastEndStatAttempts       = 5
 	pastEndStatsPerConnection = 2
+)
+
+// See confirmDeadPastEnd. Vars so tests can change them.
+var (
+	pastEndSampleSize   = 32
+	pastEndSampleBudget = 15 * time.Second
 )
 
 // pastEndRetryBackoff is multiplied by the attempt number between retries.
@@ -68,8 +75,54 @@ func (p *Parser) confirmDeadPastEnd(ctx context.Context, cp pool.NntpClient, can
 	// a wider pool swamps a small one and most checks expire unanswered.
 	cfg := p.getConfig()
 	concurrency := min(p.poolManager.StatSweepConcurrency(cfg.StatConcurrency()), max(cfg.TotalProviderConnections()*pastEndStatsPerConnection, 1))
-	dead := make(map[string]bool, len(ids))
-	alive := make(map[string]bool)
+	// Past pastEndSampleSize extras, check a random sample under
+	// pastEndSampleBudget instead of every one. A post with one dead extra per
+	// volume lists hundreds, each 430 walks every provider, and the full sweep
+	// held a 100-volume UHD import for ~55 s. Every sampled extra dead: trim
+	// them all. Any alive or unanswered: trim none, which is what an
+	// unconfirmed full sweep does too.
+	if pastEndSampleSize > 0 && len(ids) > pastEndSampleSize {
+		start := time.Now()
+		sample := make([]string, len(ids))
+		copy(sample, ids)
+		rand.Shuffle(len(sample), func(i, j int) { sample[i], sample[j] = sample[j], sample[i] })
+		sample = sample[:pastEndSampleSize]
+		sampleCtx, cancel := context.WithTimeout(ctx, pastEndSampleBudget)
+		sDead, sAlive := p.sweepPastEnd(sampleCtx, cp, sample, concurrency, articleDate)
+		cancel()
+		allDead := len(sDead) == len(sample)
+		if p.log != nil {
+			p.log.InfoContext(ctx, "Checked a sample of the articles listed past the end of files",
+				"extras", len(ids), "files", len(candidates), "sampled", len(sample),
+				"dead", len(sDead), "alive", len(sAlive), "trim", allDead,
+				"duration", time.Since(start).Round(time.Millisecond))
+		}
+		if !allDead {
+			return nil
+		}
+		return candidates
+	}
+
+	dead, _ := p.sweepPastEnd(ctx, cp, ids, concurrency, articleDate)
+
+	confirmed := make([]pastEndCandidate, 0, len(candidates))
+	for _, c := range candidates {
+		allDead := true
+		for _, seg := range c.file.Segments[c.keep:] {
+			allDead = allDead && dead[seg.ID]
+		}
+		if allDead {
+			confirmed = append(confirmed, c)
+		}
+	}
+	return confirmed
+}
+
+// sweepPastEnd STATs ids with retries (fewer at a time each round, since slow
+// 430s make wide batches expire) and returns the definitive answers.
+func (p *Parser) sweepPastEnd(ctx context.Context, cp pool.NntpClient, ids []string, concurrency int, articleDate time.Time) (dead, alive map[string]bool) {
+	dead = make(map[string]bool, len(ids))
+	alive = make(map[string]bool)
 	remaining := ids
 	for attempt := 1; attempt <= pastEndStatAttempts && len(remaining) > 0; attempt++ {
 		statCtx, cancel := context.WithTimeout(ctx, pool.StatManyTimeout(len(remaining), concurrency, pastEndStatTimeout))
@@ -102,17 +155,7 @@ func (p *Parser) confirmDeadPastEnd(ctx context.Context, cp pool.NntpClient, can
 		}
 	}
 
-	confirmed := make([]pastEndCandidate, 0, len(candidates))
-	for _, c := range candidates {
-		allDead := true
-		for _, seg := range c.file.Segments[c.keep:] {
-			allDead = allDead && dead[seg.ID]
-		}
-		if allDead {
-			confirmed = append(confirmed, c)
-		}
-	}
-	return confirmed
+	return dead, alive
 }
 
 // FindDeadArticlesPastEnd returns, by file index, how many articles to keep for
