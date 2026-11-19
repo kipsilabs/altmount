@@ -512,6 +512,7 @@ func (proc *Processor) preParseFastFail(ctx context.Context, n *nzbparser.Nzb, c
 		proc.validationTimeout,
 		proc.patchIndex,
 		releaseDate,
+		cfg.GetImportSegmentCheckTimeout(),
 	)
 	if err != nil {
 		return nil, nil, nil, err

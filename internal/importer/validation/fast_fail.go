@@ -27,6 +27,22 @@ const (
 // attempts. A var so tests can shorten it.
 var fastFailStatBudget = 15 * time.Second
 
+// releaseProbeBudget is how long the release probe may run when the caller
+// passes no budget (import.segment_check_timeout_seconds unset). A probe that
+// runs out of time with no missing article among at least minTimeBoxedChecked
+// answers passes on what it covered: the sample is in random order, so what it
+// covered is itself a random sample. A var so tests can shorten it.
+var releaseProbeBudget = 45 * time.Second
+
+// minTimeBoxedChecked is the fewest clean answers a probe that ran out of
+// time needs to pass.
+const minTimeBoxedChecked = 64
+
+// releaseProbeSlack keeps the probe's own context alive a little past the
+// sweep budget, so the sweep (not the probe) hits the deadline and reports
+// which articles it covered.
+const releaseProbeSlack = 5 * time.Second
+
 var (
 	// ErrFastFailInconclusive means bounded retries could not establish whether
 	// one or more sampled articles exist. It is deliberately distinct from a
@@ -57,7 +73,11 @@ func statIDsWithBoundedRetries(
 	stopOnMissing bool,
 	patchIdx PatchIndex,
 	articleDate time.Time,
+	budget time.Duration,
 ) (missing map[string]error, unverified []string, err error) {
+	if budget <= 0 {
+		budget = fastFailStatBudget
+	}
 	remaining := make([]string, 0, len(ids))
 	seen := make(map[string]struct{}, len(ids))
 	for _, id := range ids {
@@ -72,7 +92,7 @@ func statIDsWithBoundedRetries(
 	var lastErr error
 
 	sweepStart := time.Now()
-	sweepCtx, cancelSweep := context.WithTimeout(ctx, fastFailStatBudget)
+	sweepCtx, cancelSweep := context.WithTimeout(ctx, budget)
 	defer cancelSweep()
 	for attempt := 1; len(remaining) > 0; attempt++ {
 		attemptTimeout := timeout
@@ -181,7 +201,7 @@ func statIDsWithBoundedRetries(
 		// behind more 430s (each one costs the provider a slow spool lookup), so
 		// waiting them out adds tens of seconds and changes nothing.
 		stalled := attempt >= fastFailStatMaxAttempts && !converging
-		overBudget := sweepCtx.Err() != nil || time.Since(sweepStart)+delay >= fastFailStatBudget
+		overBudget := sweepCtx.Err() != nil || time.Since(sweepStart)+delay >= budget
 		if stalled || overBudget || releaseLooksDead(len(missing), len(ids)-len(remaining)) {
 			return missing, remaining, fmt.Errorf("%w: %d segment(s) remained unverified after %d attempts: %w",
 				ErrFastFailInconclusive, len(remaining), attempt, lastErr)
@@ -228,7 +248,8 @@ const (
 // small one, where each article is a large share of the evidence.
 func tolerableUnverified(sampled int) int {
 	if sampled >= 32 {
-		return 2
+		// 2 of a small sample, ~0.2 % of a large one.
+		return max(2, sampled/500)
 	}
 	return 0
 }
@@ -328,30 +349,6 @@ func selectFastFailSegments(segments []*metapb.SegmentData, samplePercentage int
 	return out
 }
 
-// maxReleaseProbeSamples bounds the release probe. It answers one question —
-// is anything missing? — and a release damaged enough to matter (the hole
-// caps sit near 2 %) is caught by a few dozen STATs with near certainty,
-// while the per-file sweep that follows a miss keeps the full sample. A
-// percentage-sized probe on a large release was hundreds of STATs and most
-// of a second on every import.
-const maxReleaseProbeSamples = 64
-
-// capReleaseProbeSample keeps the selector's edge picks (its first five are
-// the first three and last two segments) and thins the random middle to fit.
-func capReleaseProbeSample(selected []*metapb.SegmentData) []*metapb.SegmentData {
-	if len(selected) <= maxReleaseProbeSamples {
-		return selected
-	}
-	const edge = 5
-	keep := make([]*metapb.SegmentData, 0, maxReleaseProbeSamples)
-	keep = append(keep, selected[:edge]...)
-	middle := selected[edge:]
-	for _, i := range rand.Perm(len(middle))[:maxReleaseProbeSamples-edge] {
-		keep = append(keep, middle[i])
-	}
-	return keep
-}
-
 // FastFailFile is the minimal file surface needed for early segment reachability checks.
 type FastFailFile struct {
 	Filename string
@@ -403,7 +400,7 @@ func FastFailReleaseProbe(
 	patchIdx PatchIndex,
 	articleDate time.Time,
 ) (bool, error) {
-	v, err := FastFailReleaseProbeVerdict(ctx, files, poolManager, segmentSamplePercentage, maxConnections, timeout, patchIdx, articleDate)
+	v, err := FastFailReleaseProbeVerdict(ctx, files, poolManager, segmentSamplePercentage, maxConnections, timeout, patchIdx, articleDate, 0)
 	return v.Missing, err
 }
 
@@ -600,7 +597,7 @@ func FastFailCheckFiles(
 			ids[i] = job.segID
 		}
 
-		missingByID, unverified, err := statIDsWithBoundedRetries(ctx, usenetPool, ids, maxConnections, timeout, timeout, false, patchIdx, articleDate)
+		missingByID, unverified, err := statIDsWithBoundedRetries(ctx, usenetPool, ids, maxConnections, timeout, timeout, false, patchIdx, articleDate, fastFailStatBudget)
 		if err != nil && !errors.Is(err, ErrFastFailInconclusive) {
 			return nil, err
 		}

@@ -728,6 +728,12 @@ type ImportConfig struct {
 	// import if no recognized media container signature is found.
 	VerifyContent               *bool `yaml:"verify_content" mapstructure:"verify_content" json:"verify_content,omitempty"`
 	VerifyContentTimeoutSeconds *int  `yaml:"verify_content_timeout_seconds" mapstructure:"verify_content_timeout_seconds" json:"verify_content_timeout_seconds,omitempty"`
+	// SegmentCheckTimeoutSeconds bounds the import availability check that
+	// STATs SegmentSamplePercentage of a release's articles. A check that runs
+	// out of time with nothing missing among at least 64 answers passes on
+	// what it covered, which is a random sample. nil or 0 uses the default
+	// (45s); otherwise 5-300.
+	SegmentCheckTimeoutSeconds *int `yaml:"segment_check_timeout_seconds" mapstructure:"segment_check_timeout_seconds" json:"segment_check_timeout_seconds,omitempty"`
 }
 
 // LogConfig represents logging configuration with rotation support
@@ -1261,6 +1267,9 @@ func (c *Config) Validate() error {
 
 	if c.Import.SegmentSamplePercentage < 1 || c.Import.SegmentSamplePercentage > 100 {
 		return fmt.Errorf("import segment_sample_percentage must be between 1 and 100")
+	}
+	if v := c.Import.SegmentCheckTimeoutSeconds; v != nil && *v != 0 && (*v < 5 || *v > 300) {
+		return fmt.Errorf("import segment_check_timeout_seconds must be between 5 and 300, or 0 for the default")
 	}
 
 	if c.Import.ReadTimeoutSeconds <= 0 {

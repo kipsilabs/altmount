@@ -269,6 +269,9 @@ func TestFastFailReleaseProbeDoesNotTolerateManyUnverified(t *testing.T) {
 	prev := fastFailStatBudget
 	fastFailStatBudget = 3 * time.Second
 	t.Cleanup(func() { fastFailStatBudget = prev })
+	prevProbe := releaseProbeBudget
+	releaseProbeBudget = 3 * time.Second
+	t.Cleanup(func() { releaseProbeBudget = prevProbe })
 
 	_, err := FastFailReleaseProbe(context.Background(), probeFile(64), fastFailPoolManager{client: client}, 100, 64, 30*time.Second, nil, time.Time{})
 	if !errors.Is(err, ErrFastFailInconclusive) {

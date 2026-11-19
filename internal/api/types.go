@@ -172,6 +172,7 @@ type ImportAPIResponse struct {
 	FilterSampleFiles           *bool `json:"filter_sample_files,omitempty"`
 	VerifyContent               *bool `json:"verify_content,omitempty"`
 	VerifyContentTimeoutSeconds *int  `json:"verify_content_timeout_seconds,omitempty"`
+	SegmentCheckTimeoutSeconds  *int  `json:"segment_check_timeout_seconds,omitempty"`
 }
 
 // SABnzbdAPIResponse sanitizes SABnzbd config for API responses
@@ -605,6 +606,7 @@ func ToImportAPIResponse(importConfig config.ImportConfig) ImportAPIResponse {
 		FilterSampleFiles:           importConfig.FilterSampleFiles,
 		VerifyContent:               importConfig.VerifyContent,
 		VerifyContentTimeoutSeconds: importConfig.VerifyContentTimeoutSeconds,
+		SegmentCheckTimeoutSeconds:  importConfig.SegmentCheckTimeoutSeconds,
 	}
 }
 

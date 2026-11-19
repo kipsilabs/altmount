@@ -274,6 +274,7 @@ export interface ImportConfig {
 	allowed_file_extensions: string[];
 	max_download_prefetch: number;
 	segment_sample_percentage: number; // Percentage of segments to check (1-100)
+	segment_check_timeout_seconds?: number; // Time limit for the import segment check (default 45s, 5-300)
 	read_timeout_seconds: number;
 	import_strategy: ImportStrategy;
 	import_dir?: string | null;

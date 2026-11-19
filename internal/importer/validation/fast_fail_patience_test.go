@@ -69,6 +69,9 @@ func TestFastFailReleaseProbeConvergenceIsBoundedByTotalBudget(t *testing.T) {
 	prev := fastFailStatBudget
 	fastFailStatBudget = 150 * time.Millisecond
 	t.Cleanup(func() { fastFailStatBudget = prev })
+	prevProbe := releaseProbeBudget
+	releaseProbeBudget = 150 * time.Millisecond
+	t.Cleanup(func() { releaseProbeBudget = prevProbe })
 
 	client := newScriptedStatClient(convergingScript(60, 5))
 
