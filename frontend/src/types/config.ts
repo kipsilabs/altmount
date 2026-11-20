@@ -287,6 +287,7 @@ export interface ImportConfig {
 	history_retention_days?: number | null;
 	verify_content?: boolean; // Probe each media file's header for a valid container signature before reporting import success
 	verify_content_timeout_seconds?: number; // Per-file content probe timeout (default 15s)
+	fail_fast_on_missing_articles?: boolean; // Fail the import on the first missing media article when no damage is acceptable
 }
 
 // Log configuration
