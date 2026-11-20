@@ -117,16 +117,7 @@ func (c *rcloneRcClient) RefreshDir(ctx context.Context, provider string, dirs [
 		if dir == "" {
 			continue
 		}
-		refreshArgs := map[string]any{
-			"dir":       dir,
-			"_async":    "false", // Run synchronously to ensure cache is ready
-			"recursive": "false", // Non-recursive by default
-		}
-		if provider != "" {
-			refreshArgs["fs"] = fmt.Sprintf("%s:", provider)
-		}
-
-		refreshPayload, err := json.Marshal(refreshArgs)
+		refreshPayload, err := json.Marshal(vfsRefreshArgs(provider, dir))
 		if err != nil {
 			errs = append(errs, err)
 			continue
@@ -150,13 +141,50 @@ func (c *rcloneRcClient) RefreshDir(ctx context.Context, provider string, dirs [
 			errs = append(errs, fmt.Errorf("vfs/refresh failed for %s: status %d, error: %s", dir, resp.StatusCode, string(body)))
 			continue
 		}
+		err = readVFSRefreshResult(resp.Body, dir)
 		resp.Body.Close()
+		if err != nil {
+			errs = append(errs, err)
+		}
 	}
 
 	if len(errs) > 0 {
 		return fmt.Errorf("VFS sync completed with %d errors; first error: %w", len(errs), errs[0])
 	}
 
+	return nil
+}
+
+func vfsRefreshArgs(provider, dir string) map[string]any {
+	args := map[string]any{"_async": "false", "recursive": "false"}
+	// rclone refreshes the root when no dir parameter is supplied.
+	if dir != "/" && dir != "." {
+		args["dir"] = dir
+	}
+	if provider != "" {
+		args["fs"] = fmt.Sprintf("%s:", provider)
+	}
+	return args
+}
+
+func readVFSRefreshResult(body io.Reader, dir string) error {
+	var response struct {
+		Result map[string]string `json:"result"`
+	}
+	if err := json.NewDecoder(body).Decode(&response); err != nil {
+		return fmt.Errorf("vfs/refresh for %q: decode response: %w", dir, err)
+	}
+	key := dir
+	if dir == "/" || dir == "." {
+		key = ""
+	}
+	status, ok := response.Result[key]
+	if !ok {
+		return fmt.Errorf("vfs/refresh for %q: missing result", dir)
+	}
+	if status != "OK" {
+		return fmt.Errorf("vfs/refresh failed for %q: %s", dir, status)
+	}
 	return nil
 }
 
