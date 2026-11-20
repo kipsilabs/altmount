@@ -46,7 +46,11 @@ func (c *Coordinator) notifyVFSWith(ctx context.Context, rcloneClient rclonecli.
 			vfsName = config.MountProvider
 		}
 
-		dirsToRefresh := refreshDirsFor(path)
+		dir := path
+		if c.metadataService != nil && c.metadataService.FileExists(path) && !c.metadataService.DirectoryExists(path) {
+			dir = stdpath.Dir(rclonecli.ToVFSPath(path))
+		}
+		dirsToRefresh := refreshDirsFor(dir)
 
 		slog.DebugContext(refreshCtx, "Notifying rclone VFS refresh", "dirs", dirsToRefresh, "vfs", vfsName)
 
@@ -107,11 +111,8 @@ func (c *Coordinator) RefreshMountPathIfNeeded(ctx context.Context, resultingPat
 	}
 }
 
-// refreshDirsFor returns the entries to hand to rclone for a newly imported
-// path: the path itself, then its parent and grandparent, since those
-// directories may be new too. Note the first entry is the path as given, which
-// for a single-file import is the file rather than a directory - preserved as
-// the existing behaviour.
+// refreshDirsFor returns the release directory and up to two ancestors,
+// since those directories may be new too.
 //
 // The ancestry is walked on the forward-slash form. rclone's VFS is
 // forward-slash on every platform, and walking with filepath.Dir on Windows
@@ -124,11 +125,11 @@ func (c *Coordinator) RefreshMountPathIfNeeded(ctx context.Context, resultingPat
 // agree, so the only behaviour change there is Clean collapsing duplicate and
 // trailing slashes, which previously leaked through to rclone.
 func refreshDirsFor(p string) []string {
-	// rclone wants no leading slash; "." is its spelling for the mount root.
+	// Use mount-relative directory paths and "/" for the root.
 	normalize := func(s string) string {
 		s = strings.TrimPrefix(s, "/")
-		if s == "" {
-			return "."
+		if s == "" || s == "." {
+			return "/"
 		}
 		return s
 	}

@@ -459,20 +459,20 @@ func (m *Manager) RefreshDir(ctx context.Context, provider string, dirs []string
 		if dir == "" {
 			continue
 		}
-		refreshArgs := map[string]any{
-			"fs":        fmt.Sprintf("%s:", provider),
-			"dir":       dir,
-			"_async":    "false",
-			"recursive": "false",
-		}
 		req := RCRequest{
 			Command: "vfs/refresh",
-			Args:    refreshArgs,
+			Args:    vfsRefreshArgs(provider, dir),
 		}
-		_, err := m.makeRequestWithContext(ctx, req, true)
+		refreshCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+		resp, err := m.makeRequestWithContext(refreshCtx, req, false)
+		if err == nil {
+			err = readVFSRefreshResult(resp.Body, dir)
+			resp.Body.Close()
+		}
+		cancel()
 		if err != nil {
 			m.logger.ErrorContext(ctx, "Failed to refresh directory", "err", err, "provider", provider, "dir", dir)
-			return fmt.Errorf("failed to refresh directory %s for provider %s: %w", dir, provider, err)
+			errs = append(errs, fmt.Errorf("failed to refresh directory %s for provider %s: %w", dir, provider, err))
 		}
 	}
 

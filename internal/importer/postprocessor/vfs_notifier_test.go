@@ -1,10 +1,66 @@
 package postprocessor
 
 import (
+	"context"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/kipsilabs/altmount/internal/config"
+	"github.com/kipsilabs/altmount/internal/metadata"
 )
+
+type recordingVFSClient struct {
+	dirs []string
+}
+
+func (c *recordingVFSClient) RefreshDir(_ context.Context, _ string, dirs []string) error {
+	c.dirs = dirs
+	return nil
+}
+
+func (*recordingVFSClient) ForgetDir(context.Context, string, []string) error {
+	return nil
+}
+
+func TestNotifyVFSRefreshesDirectories(t *testing.T) {
+	for _, tc := range []struct {
+		path   string
+		isFile bool
+		want   []string
+	}{
+		{path: "/complete/tv/release.mkv/episode.mkv", isFile: true, want: []string{"complete/tv/release.mkv", "complete/tv", "complete"}},
+		{path: "/complete/tv/release.mkv", want: []string{"complete/tv/release.mkv", "complete/tv", "complete"}},
+		{path: "/episode.mkv", isFile: true, want: []string{"/"}},
+	} {
+		t.Run(tc.path, func(t *testing.T) {
+			service := metadata.NewMetadataService(t.TempDir())
+			if tc.isFile {
+				metaPath := service.GetMetadataFilePath(tc.path)
+				if err := os.MkdirAll(filepath.Dir(metaPath), 0755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(metaPath, nil, 0644); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := os.MkdirAll(service.GetMetadataDirectoryPath(tc.path), 0755); err != nil {
+				t.Fatal(err)
+			}
+			client := &recordingVFSClient{}
+			coordinator := NewCoordinator(Config{
+				ConfigGetter:    func() *config.Config { return &config.Config{MountType: config.MountTypeRClone} },
+				MetadataService: service,
+				RcloneClient:    client,
+			})
+			coordinator.NotifyVFS(context.Background(), tc.path, false)
+			if !equalStrings(client.dirs, tc.want) {
+				t.Fatalf("refreshed %q, want %q", client.dirs, tc.want)
+			}
+		})
+	}
+}
 
 func equalStrings(a, b []string) bool {
 	if len(a) != len(b) {
