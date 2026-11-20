@@ -884,6 +884,7 @@ export interface StremioConfig {
 	indexers?: StremioIndexersConfig;
 	scoring?: StreamScoringConfig;
 	nzb_ttl_hours: number;
+	nzb_grab_cache_hours: number;
 	failed_release_ttl_hours: number;
 	max_fallback_releases: number;
 	include_library_streams?: boolean;

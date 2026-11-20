@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -19,7 +18,6 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/kipsilabs/altmount/internal/auth"
 	"github.com/kipsilabs/altmount/internal/database"
-	"github.com/kipsilabs/altmount/internal/httpclient"
 	"github.com/kipsilabs/altmount/internal/importer/parser/fileinfo"
 	"github.com/kipsilabs/altmount/internal/importer/utils/nzbtrim"
 	"github.com/javi11/nzbparser"
@@ -156,27 +154,19 @@ func (s *Server) handleNzbStreams(c *fiber.Ctx) error {
 	var nzbFilename string
 	var nzbData []byte
 
-	if nzbURL != "" {
-		// Download NZB from the provided URL
-		const maxNzbFetchSize = 100 * 1024 * 1024 // 100 MB
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, nzbURL, nil)
-		if err != nil {
-			return RespondBadRequest(c, "Invalid nzb_url", err.Error())
-		}
-		// Some indexers (e.g. NZBHydra2) reject requests without a browser-like User-Agent.
-		req.Header.Set("User-Agent", cfg.GetUserAgent())
-		resp, err := httpclient.NewForExternal(cfg.Network, httpclient.LongTimeout).Do(req) //nolint:gosec // URL is provided by an authenticated caller
+	// Reuse a recent import of the same URL instead of fetching the NZB again.
+	grabbed := s.recentNzbGrab(ctx, cfg.Stremio.NzbGrabCacheHours, nzbURL)
+	if grabbed != nil {
+		nzbFilename = filepath.Base(grabbed.NzbPath)
+	} else if nzbURL != "" {
+		// Download NZB from the provided URL; concurrent requests for it share one download.
+		data, err, _ := s.nzbGrabs.fetches.Do(nzbGrabKey(nzbURL), func() (any, error) {
+			return fetchNzbURL(context.WithoutCancel(ctx), cfg, nzbURL)
+		})
 		if err != nil {
 			return RespondBadRequest(c, "Failed to fetch NZB from URL", err.Error())
 		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			return RespondBadRequest(c, "Failed to fetch NZB from URL", fmt.Sprintf("HTTP %d", resp.StatusCode))
-		}
-		nzbData, err = io.ReadAll(io.LimitReader(resp.Body, maxNzbFetchSize))
-		if err != nil {
-			return RespondBadRequest(c, "Failed to read NZB from URL", err.Error())
-		}
+		nzbData = data.([]byte)
 		// Derive filename from URL path
 		nzbFilename = filepath.Base(nzbURL)
 		if idx := strings.Index(nzbFilename, "?"); idx >= 0 {
@@ -242,6 +232,11 @@ func (s *Server) handleNzbStreams(c *fiber.Ctx) error {
 	safeFilename := filepath.Base(nzbFilename)
 	nzbName := nzbtrim.TrimNzbExtension(safeFilename)
 	tempPath := filepath.Join(uploadDir, safeFilename)
+
+	if grabbed != nil {
+		slog.InfoContext(ctx, "Reusing NZB grabbed earlier from the same URL", "queue_id", grabbed.ID)
+		return s.waitAndRespond(c, grabbed.ID, baseURL, downloadKey, nzbName, selector, timeoutSecs)
+	}
 
 	// --- Find or add NZB to queue, deduplicated per filename ---
 	// stremioPlayGroup serialises all callers with the same safeFilename: the first
@@ -317,6 +312,9 @@ func (s *Server) handleNzbStreams(c *fiber.Ctx) error {
 	})
 	if sfErr != nil {
 		return RespondInternalError(c, "Failed to process NZB", sfErr.Error())
+	}
+	if nzbURL != "" {
+		s.nzbGrabs.put(nzbGrabKey(nzbURL), rawID.(int64), cfg.Stremio.NzbGrabCacheHours)
 	}
 
 	return s.waitAndRespond(c, rawID.(int64), baseURL, downloadKey, nzbName, selector, timeoutSecs)

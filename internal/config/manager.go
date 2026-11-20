@@ -452,6 +452,10 @@ type StremioConfig struct {
 	// the same NZB is re-processed on the next request.
 	// Set to 0 to disable expiry (cache forever). Defaults to 24 hours.
 	NzbTTLHours int `yaml:"nzb_ttl_hours" mapstructure:"nzb_ttl_hours" json:"nzb_ttl_hours"`
+	// NzbGrabCacheHours makes POST /api/nzb/streams reuse the import of an nzb_url
+	// requested again within this many hours, instead of fetching the NZB from the
+	// indexer once more. 0 disables it. Defaults to 24 hours.
+	NzbGrabCacheHours int `yaml:"nzb_grab_cache_hours" mapstructure:"nzb_grab_cache_hours" json:"nzb_grab_cache_hours"`
 	// FailedReleaseTTLHours controls how long a release that failed to import stays
 	// excluded from the Stremio stream list. Mirrors NzbTTLHours semantics: it filters
 	// failure records by age rather than deleting them, so it is bounded above by
@@ -2224,6 +2228,7 @@ func DefaultConfig(configDir ...string) *Config {
 		Stremio: StremioConfig{
 			Enabled:               &stremioEnabled,
 			NzbTTLHours:           24,
+			NzbGrabCacheHours:     24,
 			FailedReleaseTTLHours: 24,
 			MaxFallbackReleases:   2,
 			FastFailHeaderOnly:    &stremioFastFailHeaderOnly,
