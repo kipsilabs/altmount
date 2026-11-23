@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kipsilabs/altmount/internal/config"
 	"github.com/kipsilabs/altmount/internal/metadata"
@@ -154,5 +155,60 @@ func TestRefreshDirsFor_NoWindowsSeparatorReachesRclone(t *testing.T) {
 				t.Errorf("refreshDirsFor(%q) produced an empty directory", in)
 			}
 		}
+	}
+}
+
+type countingVFSClient struct {
+	calls  int
+	onCall func(call int)
+}
+
+func (c *countingVFSClient) RefreshDir(context.Context, string, []string) error {
+	c.calls++
+	if c.onCall != nil {
+		c.onCall(c.calls)
+	}
+	return nil
+}
+
+func (*countingVFSClient) ForgetDir(context.Context, string, []string) error { return nil }
+
+func TestNotifyVFSReRefreshesUntilVisibleOnMount(t *testing.T) {
+	oldAttempts, oldDelay := mountVisibilityAttempts, mountVisibilityRetryDelay
+	mountVisibilityAttempts, mountVisibilityRetryDelay = 4, time.Millisecond
+	t.Cleanup(func() { mountVisibilityAttempts, mountVisibilityRetryDelay = oldAttempts, oldDelay })
+
+	const release = "/complete/tv/Show.S01E02"
+	for _, tc := range []struct {
+		name      string
+		mountType config.MountType
+		appearOn  int // refresh call after which the path appears; 0 = never
+		wantCalls int
+	}{
+		{name: "visible after first refresh", mountType: config.MountTypeRClone, appearOn: 1, wantCalls: 1},
+		{name: "visible after re-refresh", mountType: config.MountTypeRClone, appearOn: 3, wantCalls: 3},
+		{name: "never visible gives up", mountType: config.MountTypeRClone, appearOn: 0, wantCalls: 4},
+		{name: "external mount not checked", mountType: config.MountTypeRCloneExternal, appearOn: 0, wantCalls: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mountPath := t.TempDir()
+			client := &countingVFSClient{onCall: func(call int) {
+				if call == tc.appearOn {
+					if err := os.MkdirAll(filepath.Join(mountPath, filepath.FromSlash(release)), 0755); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}}
+			coordinator := NewCoordinator(Config{
+				ConfigGetter: func() *config.Config {
+					return &config.Config{MountType: tc.mountType, MountPath: mountPath}
+				},
+				RcloneClient: client,
+			})
+			coordinator.NotifyVFS(context.Background(), release, false)
+			if client.calls != tc.wantCalls {
+				t.Fatalf("RefreshDir calls = %d, want %d", client.calls, tc.wantCalls)
+			}
+		})
 	}
 }
