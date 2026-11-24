@@ -174,7 +174,10 @@ func (s *Server) handleNzbStreams(c *fiber.Ctx) error {
 	var nzbData []byte
 
 	if nzbURL != "" {
-		// Download NZB from the provided URL; concurrent requests for it share one download.
+		// Download NZB from the provided URL. Concurrent requests for it share one
+		// download and so one byte slice: read it, never modify it. A request that
+		// arrives after the download but before the import is recorded below still
+		// fetches again: at worst one extra grab.
 		data, err, _ := s.nzbGrabs.fetches.Do(nzbGrabKey(nzbURL), func() (any, error) {
 			return fetchNzbURL(context.WithoutCancel(ctx), cfg, nzbURL)
 		})
