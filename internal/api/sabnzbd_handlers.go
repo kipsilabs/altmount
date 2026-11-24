@@ -69,6 +69,14 @@ func (s *Server) handleSABnzbd(c *fiber.Ctx) error {
 		}
 	}
 
+	// SABnzbd answers mode=version and mode=auth without an API key, and some
+	// clients (for example HolyArrs) probe with it before they send the key.
+	// The version string is the same fixed value for everyone, so answering
+	// it leaks nothing and every other mode still needs authentication.
+	if qf(c, "mode") == "version" {
+		return s.handleSABnzbdVersion(c)
+	}
+
 	// Extract authentication parameters
 	apiKey := qf(c, "apikey")
 	maUsername := qf(c, "ma_username") // ARR URL
