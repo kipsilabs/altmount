@@ -146,19 +146,34 @@ func (s *Server) handleNzbStreams(c *fiber.Ctx) error {
 		return RespondUnauthorized(c, "Invalid download_key", "")
 	}
 
+	// --- Resolve base URL ---
+	baseURL := resolveBaseURL(c, cfg.Stremio.BaseURL)
+	selector := stremioEpisodeSelectorFromRequest(c)
+
+	category := c.FormValue("category")
+
+	timeoutSecs := 300
+	if ts := c.FormValue("timeout"); ts != "" {
+		if n, err := strconv.Atoi(ts); err == nil && n > 0 {
+			timeoutSecs = n
+		}
+	}
+
 	// --- Accept NZB as file upload or by URL ---
 	// nzb_url allows callers (e.g. AIOStreams) to pass the NZB download URL directly
 	// instead of uploading the file bytes, avoiding an extra round-trip.
 	nzbURL := c.FormValue("nzb_url")
 
+	// Reuse a recent import of the same URL instead of fetching the NZB again.
+	if grabbed, grabbedName := s.recentNzbGrab(ctx, cfg, nzbURL); grabbed != nil {
+		slog.InfoContext(ctx, "Reusing NZB grabbed earlier from the same URL", "queue_id", grabbed.ID)
+		return s.waitAndRespond(c, grabbed.ID, baseURL, downloadKey, grabbedName, selector, timeoutSecs)
+	}
+
 	var nzbFilename string
 	var nzbData []byte
 
-	// Reuse a recent import of the same URL instead of fetching the NZB again.
-	grabbed := s.recentNzbGrab(ctx, cfg.Stremio.NzbGrabCacheHours, nzbURL)
-	if grabbed != nil {
-		nzbFilename = filepath.Base(grabbed.NzbPath)
-	} else if nzbURL != "" {
+	if nzbURL != "" {
 		// Download NZB from the provided URL; concurrent requests for it share one download.
 		data, err, _ := s.nzbGrabs.fetches.Do(nzbGrabKey(nzbURL), func() (any, error) {
 			return fetchNzbURL(context.WithoutCancel(ctx), cfg, nzbURL)
@@ -214,29 +229,11 @@ func (s *Server) handleNzbStreams(c *fiber.Ctx) error {
 		}
 	}
 
-	// --- Resolve base URL ---
-	baseURL := resolveBaseURL(c, cfg.Stremio.BaseURL)
-	selector := stremioEpisodeSelectorFromRequest(c)
-
-	category := c.FormValue("category")
-
-	timeoutSecs := 300
-	if ts := c.FormValue("timeout"); ts != "" {
-		if n, err := strconv.Atoi(ts); err == nil && n > 0 {
-			timeoutSecs = n
-		}
-	}
-
 	// --- Derive stable names before touching the filesystem ---
 	uploadDir := filepath.Join(os.TempDir(), "altmount-uploads")
 	safeFilename := filepath.Base(nzbFilename)
 	nzbName := nzbtrim.TrimNzbExtension(safeFilename)
 	tempPath := filepath.Join(uploadDir, safeFilename)
-
-	if grabbed != nil {
-		slog.InfoContext(ctx, "Reusing NZB grabbed earlier from the same URL", "queue_id", grabbed.ID)
-		return s.waitAndRespond(c, grabbed.ID, baseURL, downloadKey, nzbName, selector, timeoutSecs)
-	}
 
 	// --- Find or add NZB to queue, deduplicated per filename ---
 	// stremioPlayGroup serialises all callers with the same safeFilename: the first
@@ -314,7 +311,7 @@ func (s *Server) handleNzbStreams(c *fiber.Ctx) error {
 		return RespondInternalError(c, "Failed to process NZB", sfErr.Error())
 	}
 	if nzbURL != "" {
-		s.nzbGrabs.put(nzbGrabKey(nzbURL), rawID.(int64), cfg.Stremio.NzbGrabCacheHours)
+		s.nzbGrabs.put(nzbGrabKey(nzbURL), rawID.(int64), nzbName, cfg.Stremio.NzbGrabCacheHours)
 	}
 
 	return s.waitAndRespond(c, rawID.(int64), baseURL, downloadKey, nzbName, selector, timeoutSecs)

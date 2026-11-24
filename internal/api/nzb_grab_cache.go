@@ -30,6 +30,9 @@ type nzbGrabCache struct {
 
 type nzbGrab struct {
 	queueID int64
+	// nzbName is the release name the first request used. The import's nzb_path
+	// may not keep it: the importer can prefix the queue ID on a name collision.
+	nzbName string
 	at      time.Time
 }
 
@@ -38,18 +41,18 @@ func nzbGrabKey(nzbURL string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func (c *nzbGrabCache) get(key string, ttlHours int) (int64, bool) {
+func (c *nzbGrabCache) get(key string, ttlHours int) (nzbGrab, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	g, ok := c.entries[key]
 	if !ok || time.Since(g.at) >= time.Duration(ttlHours)*time.Hour {
-		return 0, false
+		return nzbGrab{}, false
 	}
-	return g.queueID, true
+	return g, true
 }
 
 // put records the import for key and drops expired entries.
-func (c *nzbGrabCache) put(key string, queueID int64, ttlHours int) {
+func (c *nzbGrabCache) put(key string, queueID int64, nzbName string, ttlHours int) {
 	if ttlHours <= 0 {
 		return
 	}
@@ -64,7 +67,7 @@ func (c *nzbGrabCache) put(key string, queueID int64, ttlHours int) {
 			delete(c.entries, k)
 		}
 	}
-	c.entries[key] = nzbGrab{queueID: queueID, at: time.Now()}
+	c.entries[key] = nzbGrab{queueID: queueID, nzbName: nzbName, at: time.Now()}
 }
 
 func (c *nzbGrabCache) drop(key string) {
@@ -74,29 +77,31 @@ func (c *nzbGrabCache) drop(key string) {
 }
 
 // recentNzbGrab returns the import an earlier request for nzbURL led to within
-// ttlHours, while it is still running or completed. Otherwise it returns nil and
-// the NZB is fetched again.
-func (s *Server) recentNzbGrab(ctx context.Context, ttlHours int, nzbURL string) *database.ImportQueueItem {
+// stremio.nzb_grab_cache_hours, and the release name that request used, while
+// the import is still running or completed. Otherwise it returns nil and the
+// NZB is fetched again.
+func (s *Server) recentNzbGrab(ctx context.Context, cfg *config.Config, nzbURL string) (*database.ImportQueueItem, string) {
+	ttlHours := cfg.Stremio.NzbGrabCacheHours
 	if nzbURL == "" || ttlHours <= 0 || s.queueRepo == nil {
-		return nil
+		return nil, ""
 	}
 	key := nzbGrabKey(nzbURL)
-	id, ok := s.nzbGrabs.get(key, ttlHours)
+	grab, ok := s.nzbGrabs.get(key, ttlHours)
 	if !ok {
-		return nil
+		return nil, ""
 	}
-	if item, err := s.queueRepo.GetQueueItem(ctx, id); err == nil && item != nil {
+	if item, err := s.queueRepo.GetQueueItem(ctx, grab.queueID); err == nil && item != nil {
 		switch item.Status {
 		case database.QueueStatusPending, database.QueueStatusProcessing, database.QueueStatusPaused:
-			return item
+			return item, grab.nzbName
 		case database.QueueStatusCompleted:
 			if item.StoragePath != nil && *item.StoragePath != "" {
-				return item
+				return item, grab.nzbName
 			}
 		}
 	}
 	s.nzbGrabs.drop(key)
-	return nil
+	return nil, ""
 }
 
 // fetchNzbURL downloads an NZB from an indexer URL. Errors from net/http quote
