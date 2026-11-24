@@ -737,10 +737,13 @@ type ImportConfig struct {
 
 	// FailFastOnMissingArticles, when true and
 	// health.acceptable_missing_segments_percentage is 0, fails an import as
-	// soon as the availability check finds a missing article in a media file,
-	// instead of first sweeping every file to import the undamaged ones. A
-	// season pack with one damaged episode then fails as a whole. Misses only
-	// in sidecar files (.nfo, .sfv, ...) drop those files and import the rest.
+	// soon as the availability check finds a missing article in any file
+	// other than a sidecar (.nfo, .sfv, images, ...) or PAR2 file, instead of
+	// first sweeping every file to import the undamaged ones. A season pack
+	// with one damaged episode then fails as a whole. Misses only in sidecars
+	// drop those files and import the rest; a miss in an archive set that PAR2
+	// can repair (par2_repair.repair_on_import) still defers for repair. It
+	// has no effect while acceptable_missing_segments_percentage is above 0.
 	FailFastOnMissingArticles *bool `yaml:"fail_fast_on_missing_articles" mapstructure:"fail_fast_on_missing_articles" json:"fail_fast_on_missing_articles,omitempty"`
 }
 

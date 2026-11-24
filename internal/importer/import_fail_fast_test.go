@@ -220,3 +220,99 @@ func TestImportFailFastSidecarOnlyDeadWaveStillCatchesMedia(t *testing.T) {
 		t.Fatalf("err = %v, want ErrNoFilesProcessed from the re-check of the media", err)
 	}
 }
+
+// repairableArchiveNzb is a two-volume RAR set plus PAR2 whose second volume
+// misses an article.
+func repairableArchiveNzb(client *fakepool.Client) *nzbparser.Nzb {
+	client.SetBehavior("rar2-missing", fakepool.SegmentBehavior{Err: nntppool.ErrArticleNotFound})
+	return buildTestNzb([]testNzbFile{
+		{name: "Movie.2010.part01.rar", segID: "rar1-ok"},
+		{name: "Movie.2010.part02.rar", segID: "rar2-missing"},
+		{name: "Movie.2010.par2", segID: "par2-segment"},
+	})
+}
+
+// A miss in an archive set that PAR2 can rebuild still defers for repair with
+// fail-fast on, as it does with fail-fast off.
+func TestImportFailFastDefersRepairableArchiveForPar2(t *testing.T) {
+	client := fakepool.New()
+	n := repairableArchiveNzb(client)
+	cfg := failFastConfig()
+	on := true
+	cfg.Par2Repair.Enabled = &on
+	cfg.Par2Repair.RepairOnImport = &on
+
+	_, _, _, err := failFastProc(client).preParseFastFail(context.Background(), n, cfg, 1, nil, nil)
+	var deferred *DeferredRepairError
+	if !errors.As(err, &deferred) {
+		t.Fatalf("err = %v, want DeferredRepairError: PAR2 can repair the set", err)
+	}
+}
+
+// With repair on import off there is nothing to wait for: fail-fast fails the
+// damaged archive at once.
+func TestImportFailFastFailsArchiveWhenRepairIsOff(t *testing.T) {
+	client := fakepool.New()
+	n := repairableArchiveNzb(client)
+	cfg := failFastConfig()
+	off := false
+	cfg.Par2Repair.RepairOnImport = &off
+
+	_, _, _, err := failFastProc(client).preParseFastFail(context.Background(), n, cfg, 1, nil, nil)
+	if !errors.Is(err, multifile.ErrNoFilesProcessed) {
+		t.Fatalf("err = %v, want ErrNoFilesProcessed", err)
+	}
+}
+
+// A sidecar missed and the volumes list dead articles past their end: the
+// re-check without the sidecar must hand those to the past-end trim, as the
+// normal path does, rather than fail the release.
+func TestImportFailFastSidecarRecheckTrimsPastEnd(t *testing.T) {
+	client := fakepool.New()
+	n := pastEndRelease(client)
+	n.Files = append(n.Files, nzbparser.NzbFile{
+		Filename: "Show.S01E01.nfo",
+		Segments: nzbparser.NzbSegments{{ID: "nfo-missing", Number: 1, Bytes: 100}},
+	})
+	client.SetBehavior("nfo-missing", fakepool.SegmentBehavior{Err: nntppool.ErrArticleNotFound})
+	cfg := pastEndConfig()
+	on := true
+	cfg.Import.FailFastOnMissingArticles = &on
+	cfg.Health.AcceptableMissingSegmentsPercentage = 0
+	proc := pastEndProcessor(client, cfg)
+	firstProbeReturns(t, validation.ProbeVerdict{Missing: true, MissingIDs: []string{"nfo-missing"}})
+
+	_, _, _, err := proc.preParseFastFail(context.Background(), n, cfg, 1, nil, nil)
+	var pastEnd *articlesPastEndError
+	if !errors.As(err, &pastEnd) {
+		t.Fatalf("err = %v, want articlesPastEndError from the re-check", err)
+	}
+	proc.parser.TrimArticles(context.Background(), n.Files, pastEnd.keep)
+
+	brokenIdx, _, _, err := proc.preParseFastFail(context.Background(), n, cfg, 1, nil, nil)
+	if err != nil {
+		t.Fatalf("after trimming: %v, want the release to import without the .nfo", err)
+	}
+	nfo := len(n.Files) - 1
+	if _, ok := brokenIdx[nfo]; !ok || len(brokenIdx) != 1 {
+		t.Fatalf("brokenIdx = %v, want only the .nfo (index %d)", brokenIdx, nfo)
+	}
+}
+
+// The sidecar re-check spends what is left of the check's budget, never less
+// than the smallest budget the setting accepts.
+func TestRecheckBudgetUsesWhatIsLeft(t *testing.T) {
+	def := validation.EffectiveReleaseProbeBudget(0)
+	for _, tt := range []struct {
+		configured, elapsed, want time.Duration
+	}{
+		{60 * time.Second, 20 * time.Second, 40 * time.Second},
+		{60 * time.Second, 58 * time.Second, minRecheckBudget},
+		{60 * time.Second, 90 * time.Second, minRecheckBudget},
+		{0, 10 * time.Second, def - 10*time.Second},
+	} {
+		if got := recheckBudget(tt.configured, tt.elapsed); got != tt.want {
+			t.Errorf("recheckBudget(%s, %s) = %s, want %s", tt.configured, tt.elapsed, got, tt.want)
+		}
+	}
+}

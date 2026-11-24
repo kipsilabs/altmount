@@ -346,7 +346,8 @@ func (c *Config) GetImportSegmentCheckTimeout() time.Duration {
 }
 
 // GetImportFailFastOnMissingArticles reports whether an import fails as soon
-// as the availability check finds a missing media article (default false).
+// as the availability check finds a missing article outside the sidecars and
+// PAR2 files (default false). Only effective while no damage is acceptable.
 func (c *Config) GetImportFailFastOnMissingArticles() bool {
 	return c.Import.FailFastOnMissingArticles != nil && *c.Import.FailFastOnMissingArticles
 }
