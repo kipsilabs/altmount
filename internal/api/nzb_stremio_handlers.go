@@ -252,12 +252,7 @@ func (s *Server) handleNzbStreams(c *fiber.Ctx) error {
 		// Check completed cache inside the critical section so two concurrent
 		// callers can't both miss it and both enqueue the same NZB.
 		if existing, e := s.queueRepo.ListQueueItems(workCtx, &completedStatus, safeFilename, "", 1, 0, "updated_at", "desc"); e == nil && len(existing) > 0 {
-			prev := existing[0]
-			cacheValid := prev.StoragePath != nil && *prev.StoragePath != ""
-			if cacheValid && ttlHours > 0 && prev.CompletedAt != nil {
-				cacheValid = time.Since(*prev.CompletedAt) < time.Duration(ttlHours)*time.Hour
-			}
-			if cacheValid {
+			if prev := existing[0]; reusableCompletedImport(prev, ttlHours) {
 				slog.InfoContext(workCtx, "Returning cached Stremio streams for already-processed NZB",
 					"nzb_name", nzbName, "queue_id", prev.ID)
 				return prev.ID, nil
@@ -315,6 +310,18 @@ func (s *Server) handleNzbStreams(c *fiber.Ctx) error {
 	}
 
 	return s.waitAndRespond(c, rawID.(int64), baseURL, downloadKey, nzbName, selector, timeoutSecs)
+}
+
+// reusableCompletedImport reports whether a completed import can serve a repeat
+// request without processing the NZB again: it has a storage path and, when
+// nzb_ttl_hours is set, completed within it. The filename cache and the nzb_url
+// grab cache both use it, so they agree on when a result is stale.
+func reusableCompletedImport(item *database.ImportQueueItem, nzbTTLHours int) bool {
+	if item.StoragePath == nil || *item.StoragePath == "" {
+		return false
+	}
+	return nzbTTLHours <= 0 || item.CompletedAt == nil ||
+		time.Since(*item.CompletedAt) < time.Duration(nzbTTLHours)*time.Hour
 }
 
 // waitAndRespond subscribes to the progress broadcaster and waits for the queue item to

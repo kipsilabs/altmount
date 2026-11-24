@@ -56,6 +56,7 @@ func TestRecentNzbGrab(t *testing.T) {
 	ctx := context.Background()
 	cfg := &config.Config{}
 	cfg.Stremio.NzbGrabCacheHours = 24
+	cfg.Stremio.NzbTTLHours = 24
 
 	const url = "https://indexer.example/api?t=get&id=abc&apikey=secret"
 	key := nzbGrabKey(url)
@@ -88,6 +89,16 @@ func TestRecentNzbGrab(t *testing.T) {
 	got, _ = s.recentNzbGrab(ctx, cfg, url)
 	assert.Nil(t, got, "0 disables the cache")
 	cfg.Stremio.NzbGrabCacheHours = 24
+
+	_, err := db.Connection().ExecContext(ctx, `UPDATE import_queue SET completed_at = datetime('now', '-2 hours') WHERE id = ?`, item.ID)
+	require.NoError(t, err)
+	cfg.Stremio.NzbTTLHours = 1
+	got, _ = s.recentNzbGrab(ctx, cfg, url)
+	assert.Nil(t, got, "a completed import past nzb_ttl_hours is fetched again, as by the filename cache")
+	cfg.Stremio.NzbTTLHours = 0
+	s.nzbGrabs.put(key, item.ID, "Movie.2024", 24)
+	got, _ = s.recentNzbGrab(ctx, cfg, url)
+	assert.NotNil(t, got, "nzb_ttl_hours 0 keeps completed imports")
 
 	s.nzbGrabs.backdate(key, 2*time.Hour)
 	cfg.Stremio.NzbGrabCacheHours = 1

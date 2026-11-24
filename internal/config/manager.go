@@ -454,7 +454,8 @@ type StremioConfig struct {
 	NzbTTLHours int `yaml:"nzb_ttl_hours" mapstructure:"nzb_ttl_hours" json:"nzb_ttl_hours"`
 	// NzbGrabCacheHours makes POST /api/nzb/streams reuse the import of an nzb_url
 	// requested again within this many hours, instead of fetching the NZB from the
-	// indexer once more. 0 disables it. Defaults to 24 hours.
+	// indexer once more. A completed import is reused only within NzbTTLHours.
+	// 0 disables it. Defaults to 24 hours.
 	NzbGrabCacheHours int `yaml:"nzb_grab_cache_hours" mapstructure:"nzb_grab_cache_hours" json:"nzb_grab_cache_hours"`
 	// FailedReleaseTTLHours controls how long a release that failed to import stays
 	// excluded from the Stremio stream list. Mirrors NzbTTLHours semantics: it filters

@@ -77,9 +77,10 @@ func (c *nzbGrabCache) drop(key string) {
 }
 
 // recentNzbGrab returns the import an earlier request for nzbURL led to within
-// stremio.nzb_grab_cache_hours, and the release name that request used, while
-// the import is still running or completed. Otherwise it returns nil and the
-// NZB is fetched again.
+// stremio.nzb_grab_cache_hours, and the release name that request used. The
+// import must still be running, or completed and still reusable under the same
+// rule as the filename cache (reusableCompletedImport). Otherwise it returns nil
+// and the NZB is fetched again.
 func (s *Server) recentNzbGrab(ctx context.Context, cfg *config.Config, nzbURL string) (*database.ImportQueueItem, string) {
 	ttlHours := cfg.Stremio.NzbGrabCacheHours
 	if nzbURL == "" || ttlHours <= 0 || s.queueRepo == nil {
@@ -95,7 +96,7 @@ func (s *Server) recentNzbGrab(ctx context.Context, cfg *config.Config, nzbURL s
 		case database.QueueStatusPending, database.QueueStatusProcessing, database.QueueStatusPaused:
 			return item, grab.nzbName
 		case database.QueueStatusCompleted:
-			if item.StoragePath != nil && *item.StoragePath != "" {
+			if reusableCompletedImport(item, cfg.Stremio.NzbTTLHours) {
 				return item, grab.nzbName
 			}
 		}

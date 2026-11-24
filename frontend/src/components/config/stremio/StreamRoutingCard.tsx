@@ -245,7 +245,8 @@ export function StreamRoutingCard({
 							</span>
 						</div>
 						<p className="label whitespace-normal text-[11px] text-base-content/50">
-							Reuse NZBs already grabbed from the same URL, sparing strict indexers. 0 = no cache.
+							Reuse NZBs already grabbed from the same URL, sparing strict indexers. Completed
+							imports only within NZB Cache TTL. 0 = no cache.
 						</p>
 					</fieldset>
 				</div>
