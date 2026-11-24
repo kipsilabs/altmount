@@ -452,10 +452,10 @@ func (m *Manager) RefreshDir(ctx context.Context, provider string, dirs []string
 	// vfs/forget accepts any string and reports success either way.
 	dirs = ToVFSPaths(dirs)
 
-	errs := m.forgetDirs(ctx, provider, dirs)
+	var errs []error
 
-	// Issue a vfs/refresh call for each directory individually
-	for _, dir := range dirs {
+	// No vfs/forget first: see refreshOrder for why refresh alone is correct.
+	for _, dir := range refreshOrder(dirs) {
 		if dir == "" {
 			continue
 		}

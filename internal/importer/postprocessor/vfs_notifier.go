@@ -59,9 +59,13 @@ func (c *Coordinator) notifyVFSWith(ctx context.Context, rcloneClient rclonecli.
 			slog.WarnContext(refreshCtx, "Failed to notify rclone VFS refresh",
 				"dirs", dirsToRefresh,
 				"error", err)
-		} else {
-			slog.InfoContext(refreshCtx, "Successfully notified rclone VFS refresh",
-				"dirs", dirsToRefresh)
+			return
+		}
+		slog.InfoContext(refreshCtx, "Successfully notified rclone VFS refresh",
+			"dirs", dirsToRefresh)
+
+		if cfg.MountType == config.MountTypeRClone {
+			c.ensureVisibleOnMount(refreshCtx, rcloneClient, vfsName, cfg.MountPath, path, dirsToRefresh)
 		}
 	}
 
@@ -69,6 +73,50 @@ func (c *Coordinator) notifyVFSWith(ctx context.Context, rcloneClient rclonecli.
 		go refreshFunc(resultingPath)
 	} else {
 		refreshFunc(resultingPath)
+	}
+}
+
+// Visibility check tuning. Vars so tests can shorten the wait.
+var (
+	mountVisibilityAttempts   = 4
+	mountVisibilityRetryDelay = 500 * time.Millisecond
+)
+
+// ensureVisibleOnMount confirms a freshly imported path is reachable through
+// the internal rclone mount before the import is reported complete, re-issuing
+// the refresh on a miss. rclone answering vfs/refresh with OK does not
+// guarantee the kernel-side view has caught up, and an *arr that probes the
+// path in that window fails the import even though a later manual import
+// succeeds. The check is best-effort: a path that never appears is logged and
+// the import proceeds, exactly as before.
+func (c *Coordinator) ensureVisibleOnMount(ctx context.Context, rcloneClient rclonecli.RcloneRcClient, vfsName, mountPath, resultingPath string, dirs []string) {
+	if mountPath == "" {
+		return
+	}
+	target := filepath.Join(mountPath, filepath.FromSlash(strings.TrimPrefix(rclonecli.ToVFSPath(resultingPath), "/")))
+
+	for attempt := 1; ; attempt++ {
+		if _, err := os.Stat(target); err == nil {
+			if attempt > 1 {
+				slog.InfoContext(ctx, "Imported path became visible on rclone mount after re-refresh",
+					"path", target, "attempts", attempt)
+			}
+			return
+		}
+		if attempt >= mountVisibilityAttempts {
+			slog.WarnContext(ctx, "Imported path still not visible on rclone mount after refresh",
+				"path", target, "attempts", attempt)
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(mountVisibilityRetryDelay):
+		}
+		if err := rcloneClient.RefreshDir(ctx, vfsName, dirs); err != nil {
+			slog.WarnContext(ctx, "Failed to re-refresh rclone VFS for missing path",
+				"path", target, "error", err)
+		}
 	}
 }
 

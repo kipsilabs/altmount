@@ -110,10 +110,8 @@ func (c *rcloneRcClient) RefreshDir(ctx context.Context, provider string, dirs [
 
 	var errs []error
 
-	errs = append(errs, c.forgetDirs(ctx, baseUrl, provider, dirs)...)
-
-	// Issue a vfs/refresh call for each directory to ensure all parents/children are refreshed
-	for _, dir := range dirs {
+	// No vfs/forget first: see refreshOrder for why refresh alone is correct.
+	for _, dir := range refreshOrder(dirs) {
 		if dir == "" {
 			continue
 		}
