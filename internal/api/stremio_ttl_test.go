@@ -58,8 +58,27 @@ func TestStremioFallbackFieldsZeroRoundTrip(t *testing.T) {
 	}
 }
 
+// TestStremioNzbGrabCacheHoursZeroRoundTrip guards nzb_grab_cache_hours the same
+// way: a dropped 0 would silently turn the grab cache back on at the next save.
+func TestStremioNzbGrabCacheHoursZeroRoundTrip(t *testing.T) {
+	enabled := true
+	cfg := &config.Config{Stremio: config.StremioConfig{Enabled: &enabled, NzbGrabCacheHours: 0}}
+
+	data, err := json.Marshal(ToConfigAPIResponse(cfg, "").Stremio)
+	if err != nil {
+		t.Fatalf("marshal stremio response: %v", err)
+	}
+	if !strings.Contains(string(data), `"nzb_grab_cache_hours":0`) {
+		t.Errorf("expected nzb_grab_cache_hours:0 in response JSON, got: %s", data)
+	}
+}
+
 func TestStremioDefaults(t *testing.T) {
 	cfg := config.DefaultConfig(t.TempDir())
+
+	if cfg.Stremio.NzbGrabCacheHours != 24 {
+		t.Errorf("NzbGrabCacheHours = %d; want 24", cfg.Stremio.NzbGrabCacheHours)
+	}
 
 	if cfg.Stremio.FailedReleaseTTLHours != 24 {
 		t.Errorf("FailedReleaseTTLHours = %d; want 24", cfg.Stremio.FailedReleaseTTLHours)
