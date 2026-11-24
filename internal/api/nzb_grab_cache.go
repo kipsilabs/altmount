@@ -99,22 +99,24 @@ func (s *Server) recentNzbGrab(ctx context.Context, ttlHours int, nzbURL string)
 	return nil
 }
 
-// fetchNzbURL downloads an NZB from an indexer URL.
+// fetchNzbURL downloads an NZB from an indexer URL. Errors from net/http quote
+// the URL, and indexer URLs carry API keys, so they are returned redacted.
 func fetchNzbURL(ctx context.Context, cfg *config.Config, nzbURL string) ([]byte, error) {
 	const maxNzbFetchSize = 100 * 1024 * 1024 // 100 MB
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, nzbURL, nil)
 	if err != nil {
-		return nil, fmt.Errorf("invalid nzb_url: %w", err)
+		return nil, fmt.Errorf("invalid nzb_url: %w", httpclient.RedactURLError(err))
 	}
 	// Some indexers (e.g. NZBHydra2) reject requests without a browser-like User-Agent.
 	req.Header.Set("User-Agent", cfg.GetUserAgent())
 	resp, err := httpclient.NewForExternal(cfg.Network, httpclient.LongTimeout).Do(req) //nolint:gosec // URL is provided by an authenticated caller
 	if err != nil {
-		return nil, err
+		return nil, httpclient.RedactURLError(err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
-	return io.ReadAll(io.LimitReader(resp.Body, maxNzbFetchSize))
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxNzbFetchSize))
+	return data, httpclient.RedactURLError(err)
 }

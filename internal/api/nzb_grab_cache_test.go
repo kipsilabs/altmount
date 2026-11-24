@@ -2,10 +2,13 @@ package api
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/kipsilabs/altmount/internal/config"
 	"github.com/kipsilabs/altmount/internal/database"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -45,4 +48,18 @@ func TestRecentNzbGrab(t *testing.T) {
 	require.NoError(t, repo.UpdateQueueItemStatus(ctx, item.ID, database.QueueStatusFailed, nil))
 	assert.Nil(t, s.recentNzbGrab(ctx, 24, url), "a failed import is fetched again")
 	assert.NotContains(t, s.nzbGrabs.entries, key, "and forgotten")
+}
+
+func TestFetchNzbURLRedactsTheURLFromErrors(t *testing.T) {
+	closed := httptest.NewServer(http.NotFoundHandler())
+	closed.Close()
+
+	_, err := fetchNzbURL(context.Background(), &config.Config{}, closed.URL+"/get.nzb?apikey=secret")
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "secret")
+	assert.Contains(t, err.Error(), "/get.nzb", "the path stays for diagnosis")
+
+	_, err = fetchNzbURL(context.Background(), &config.Config{}, "http://[::1/get.nzb?apikey=secret")
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "secret")
 }
