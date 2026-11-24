@@ -183,6 +183,55 @@ func (e *grabStreamsEnv) post(t *testing.T, extra url.Values) (int, StremioStrea
 	return resp.StatusCode, body
 }
 
+// TestNzbStreamsGrabsEachURLOnce drives POST /api/nzb/streams: concurrent requests
+// for one nzb_url share a single indexer request, and a repeat request reuses the
+// import without asking the indexer again.
+func TestNzbStreamsGrabsEachURLOnce(t *testing.T) {
+	e := newGrabStreamsEnv(t, "/config/.nzbs/stremio/Movie.2024.1080p.nzb",
+		"/stremio/Movie.2024.1080p/Movie.2024.1080p.mkv", "/get/Movie.2024.1080p.nzb?apikey=secret")
+
+	const n = 5
+	type result struct {
+		status int
+		body   StremioStreamsResponse
+	}
+	results := make([]result, n)
+	var started, done sync.WaitGroup
+	for i := range n {
+		started.Add(1)
+		done.Add(1)
+		go func() {
+			defer done.Done()
+			started.Done()
+			status, body := e.post(t, nil)
+			results[i] = result{status, body}
+		}()
+	}
+	started.Wait()
+	require.Eventually(t, func() bool { return e.hits.Load() > 0 }, 5*time.Second, 5*time.Millisecond)
+	time.Sleep(100 * time.Millisecond) // let the other requests join the fetch in flight
+	e.release()
+	done.Wait()
+
+	assert.Equal(t, int32(1), e.hits.Load(), "concurrent requests share one indexer request")
+	for i, r := range results {
+		assert.Equal(t, http.StatusOK, r.status, "request %d", i)
+		assert.Equal(t, e.item.ID, r.body.QueueItemID, "request %d", i)
+		assert.Len(t, r.body.Streams, 1, "request %d", i)
+	}
+
+	status, body := e.post(t, nil)
+	assert.Equal(t, http.StatusOK, status)
+	assert.Equal(t, e.item.ID, body.QueueItemID)
+	assert.Len(t, body.Streams, 1)
+	assert.Equal(t, int32(1), e.hits.Load(), "a repeat request reuses the import")
+
+	e.cfg.Stremio.NzbGrabCacheHours = 0
+	status, _ = e.post(t, nil)
+	assert.Equal(t, http.StatusOK, status)
+	assert.Equal(t, int32(2), e.hits.Load(), "with the grab cache off the indexer is asked again")
+}
+
 // TestNzbStreamsHitUsesStoredName pins that a hit matches episodes against the
 // name the first request used, not one derived from the import's nzb_path. Here
 // only the stored name carries the episode marker.
