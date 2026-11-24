@@ -70,10 +70,14 @@ func (c *nzbGrabCache) put(key string, queueID int64, nzbName string, ttlHours i
 	c.entries[key] = nzbGrab{queueID: queueID, nzbName: nzbName, at: time.Now()}
 }
 
-func (c *nzbGrabCache) drop(key string) {
+// drop forgets the grab for key if it still points at queueID, so it cannot
+// erase a newer grab recorded meanwhile.
+func (c *nzbGrabCache) drop(key string, queueID int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	delete(c.entries, key)
+	if g, ok := c.entries[key]; ok && g.queueID == queueID {
+		delete(c.entries, key)
+	}
 }
 
 // recentNzbGrab returns the import an earlier request for nzbURL led to within
@@ -91,7 +95,12 @@ func (s *Server) recentNzbGrab(ctx context.Context, cfg *config.Config, nzbURL s
 	if !ok {
 		return nil, ""
 	}
-	if item, err := s.queueRepo.GetQueueItem(ctx, grab.queueID); err == nil && item != nil {
+	item, err := s.queueRepo.GetQueueItem(ctx, grab.queueID)
+	if err != nil {
+		// Keep the grab: a database error says nothing about the import.
+		return nil, ""
+	}
+	if item != nil {
 		switch item.Status {
 		case database.QueueStatusPending, database.QueueStatusProcessing, database.QueueStatusPaused:
 			return item, grab.nzbName
@@ -101,7 +110,7 @@ func (s *Server) recentNzbGrab(ctx context.Context, cfg *config.Config, nzbURL s
 			}
 		}
 	}
-	s.nzbGrabs.drop(key)
+	s.nzbGrabs.drop(key, grab.queueID)
 	return nil, ""
 }
 

@@ -202,6 +202,34 @@ func TestNzbStreamsHitUsesStoredName(t *testing.T) {
 	assert.Equal(t, int32(0), e.hits.Load(), "hits skip the fetch")
 }
 
+func TestNzbGrabCacheDropKeepsNewerGrab(t *testing.T) {
+	var c nzbGrabCache
+	c.put("k", 1, "Old", 24)
+	c.put("k", 2, "New", 24)
+	c.drop("k", 1)
+	g, ok := c.get("k", 24)
+	require.True(t, ok, "a stale drop must not erase the newer grab")
+	assert.Equal(t, int64(2), g.queueID)
+	c.drop("k", 2)
+	_, ok = c.get("k", 24)
+	assert.False(t, ok)
+}
+
+func TestRecentNzbGrabKeepsGrabOnDatabaseError(t *testing.T) {
+	db, repo := newGrabTestDB(t)
+	s := &Server{queueRepo: repo}
+	cfg := &config.Config{}
+	cfg.Stremio.NzbGrabCacheHours = 24
+	const url = "https://indexer.example/get.nzb"
+	s.nzbGrabs.put(nzbGrabKey(url), 1, "Movie.2024", 24)
+	require.NoError(t, db.Connection().Close())
+
+	got, _ := s.recentNzbGrab(context.Background(), cfg, url)
+	assert.Nil(t, got)
+	_, ok := s.nzbGrabs.get(nzbGrabKey(url), 24)
+	assert.True(t, ok, "a database error must not forget the grab")
+}
+
 func TestFetchNzbURLRedactsTheURLFromErrors(t *testing.T) {
 	closed := httptest.NewServer(http.NotFoundHandler())
 	closed.Close()
