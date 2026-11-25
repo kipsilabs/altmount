@@ -583,6 +583,101 @@ func stremioQueueItemNameMatches(item *database.ImportQueueItem, normTarget stri
 	return false
 }
 
+// stremioCompletedRowTimestamp is the timestamp that orders completed rows:
+// when the import finished, falling back to its last update or creation for
+// rows that predate completed_at. It matches the ordering used by the
+// duplicate-lookup queries.
+func stremioCompletedRowTimestamp(item *database.ImportQueueItem) time.Time {
+	if item.CompletedAt != nil {
+		return *item.CompletedAt
+	}
+	if !item.UpdatedAt.IsZero() {
+		return item.UpdatedAt
+	}
+	return item.CreatedAt
+}
+
+// stremioNewestCompleted returns the completed row that finished last. The
+// queue id breaks ties so the choice is deterministic when rows share a
+// timestamp.
+func stremioNewestCompleted(items []*database.ImportQueueItem) *database.ImportQueueItem {
+	var newest *database.ImportQueueItem
+	for _, item := range items {
+		if newest == nil {
+			newest = item
+			continue
+		}
+		itemAt, newestAt := stremioCompletedRowTimestamp(item), stremioCompletedRowTimestamp(newest)
+		if itemAt.After(newestAt) || (itemAt.Equal(newestAt) && item.ID > newest.ID) {
+			newest = item
+		}
+	}
+	return newest
+}
+
+// stremioIndexerAgrees reports whether the request and the completed row can be
+// the same release by indexer. A side that does not know its indexer cannot
+// disagree.
+func stremioIndexerAgrees(item *database.ImportQueueItem, requestIndexer string) bool {
+	requestIndexer = strings.TrimSpace(requestIndexer)
+	if requestIndexer == "" || item.Indexer == nil {
+		return true
+	}
+	rowIndexer := strings.TrimSpace(*item.Indexer)
+	return rowIndexer == "" || strings.EqualFold(rowIndexer, requestIndexer)
+}
+
+// stremioSelectRecoveredRelease picks the completed row a play link recovered
+// from its release name alone resolves to. It returns nil when the request does
+// not name exactly one release, and the caller searches instead.
+//
+// One completed row with the normalized name is that release. With several,
+// only rows carrying a content identity can be verified: they must all agree on
+// one identity, and the newest of them wins. Distinct identities, or rows with
+// no identity at all, mean the name could refer to any of them, so the match is
+// ambiguous and is never guessed. A known indexer that disagrees with a known
+// row indexer excludes that row for the same reason.
+func stremioSelectRecoveredRelease(rows []*database.ImportQueueItem, normTarget, requestIndexer string, requestSize int64, ttlHours int) *database.ImportQueueItem {
+	matches := make([]*database.ImportQueueItem, 0, len(rows))
+	for _, item := range rows {
+		if item == nil || !reusableCompletedImport(item, ttlHours) {
+			continue
+		}
+		if !stremioQueueItemNameMatches(item, normTarget) || !stremioIndexerAgrees(item, requestIndexer) {
+			continue
+		}
+		if requestSize > 0 && item.FileSize != nil && *item.FileSize != requestSize {
+			continue
+		}
+		matches = append(matches, item)
+	}
+
+	switch len(matches) {
+	case 0:
+		return nil
+	case 1:
+		return matches[0]
+	}
+
+	var identity string
+	verified := make([]*database.ImportQueueItem, 0, len(matches))
+	for _, item := range matches {
+		if item.ContentIdentity == nil || *item.ContentIdentity == "" {
+			continue
+		}
+		if identity == "" {
+			identity = *item.ContentIdentity
+		} else if *item.ContentIdentity != identity {
+			return nil
+		}
+		verified = append(verified, item)
+	}
+	if len(verified) == 0 {
+		return nil
+	}
+	return stremioNewestCompleted(verified)
+}
+
 func (s *Server) findActiveStremioContent(ctx context.Context, contentKey string) (*database.ImportQueueItem, error) {
 	if s.queueRepo == nil || contentKey == "" {
 		return nil, nil
@@ -1283,34 +1378,40 @@ func (s *Server) handleStremioAddonPlay(c *fiber.Ctx) error {
 	// Reuse cached bytes only for the release a request names. A live token or
 	// a recovered link carrying its NZB URL names an exact release through its
 	// release key. A link recovered from the release name alone names the
-	// release by name, so a completed row is served only when that stored name
-	// is the same release; it still never attaches to a different release
-	// merely because both sanitize alike.
+	// release by name, so a completed row is served only when that name and its
+	// verified identity resolve to one release; an ambiguous name still
+	// searches instead of guessing between same-titled rows.
 	if normTarget != "" && (explicitRelease || recoveredByName) {
 		if cachedItems, err := s.queueRepo.GetCachedStremioQueueItems(ctx, cfg.Stremio.EffectiveIncludeLibraryStreams(), cfg.Stremio.NzbTTLHours); err == nil {
-			for _, prev := range cachedItems {
-				if prev == nil || prev.StoragePath == nil || *prev.StoragePath == "" {
-					continue
+			if recoveredByName {
+				prev := stremioSelectRecoveredRelease(cachedItems, normTarget,
+					strings.TrimSpace(c.Query("indexer")), cand.Size, ttlHours)
+				if prev != nil {
+					if streams, err := s.buildStremioStreams(ctx, prev, baseURL, key, cand.SafeTitle, selector); err == nil && len(streams) > 0 {
+						slog.InfoContext(ctx, "Returning cached Stremio stream",
+							"nzb_name", cand.SafeTitle, "matched_path", prev.NzbPath, "indexer", prev.Indexer,
+							"recovered_by_name", true)
+						return c.Redirect(streams[0].URL, fiber.StatusFound)
+					}
 				}
-				if ttlHours > 0 && prev.CompletedAt != nil && time.Since(*prev.CompletedAt) >= time.Duration(ttlHours)*time.Hour {
-					continue
-				}
-				if explicitRelease {
+			} else {
+				for _, prev := range cachedItems {
+					if prev == nil || !reusableCompletedImport(prev, ttlHours) {
+						continue
+					}
 					// Rows written before release keys existed cannot prove
 					// which release they hold, so they are skipped as well.
 					storedKey, keyed := stremioQueueItemReleaseKey(prev)
 					if !keyed || storedKey != releaseKey {
 						continue
 					}
-				} else if !stremioQueueItemNameMatches(prev, normTarget) {
-					continue
-				}
 
-				if streams, err := s.buildStremioStreams(ctx, prev, baseURL, key, cand.SafeTitle, selector); err == nil && len(streams) > 0 {
-					slog.InfoContext(ctx, "Returning cached Stremio stream",
-						"nzb_name", cand.SafeTitle, "matched_path", prev.NzbPath, "indexer", cand.Indexer,
-						"recovered_by_name", recoveredByName)
-					return c.Redirect(streams[0].URL, fiber.StatusFound)
+					if streams, err := s.buildStremioStreams(ctx, prev, baseURL, key, cand.SafeTitle, selector); err == nil && len(streams) > 0 {
+						slog.InfoContext(ctx, "Returning cached Stremio stream",
+							"nzb_name", cand.SafeTitle, "matched_path", prev.NzbPath, "indexer", cand.Indexer,
+							"recovered_by_name", false)
+						return c.Redirect(streams[0].URL, fiber.StatusFound)
+					}
 				}
 			}
 		}
@@ -1671,11 +1772,7 @@ func (s *Server) enqueueStremioRelease(
 					case database.QueueStatusPending, database.QueueStatusProcessing, database.QueueStatusPaused:
 						return it.ID, nil
 					case database.QueueStatusCompleted:
-						reusable := it.StoragePath != nil && *it.StoragePath != ""
-						if reusable && ttlHours > 0 && it.CompletedAt != nil {
-							reusable = time.Since(*it.CompletedAt) < time.Duration(ttlHours)*time.Hour
-						}
-						if reusable {
+						if reusableCompletedImport(it, ttlHours) {
 							return it.ID, nil
 						}
 					}

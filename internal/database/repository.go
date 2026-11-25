@@ -2420,7 +2420,7 @@ func (r *Repository) GetFailedStremioQueueItems(ctx context.Context) ([]*ImportQ
 // size, which matters because this runs on every Stremio stream request.
 func (r *Repository) GetCachedStremioQueueItems(ctx context.Context, reuseLibrary bool, ttlHours int) ([]*ImportQueueItem, error) {
 	const columns = `SELECT id, download_id, nzb_path, relative_path, category, priority, status, created_at, updated_at,
-			       started_at, completed_at, retry_count, max_retries, error_message, batch_id, metadata, file_size, storage_path, target_path
+			       started_at, completed_at, retry_count, max_retries, error_message, batch_id, metadata, file_size, storage_path, target_path, indexer, content_identity
 			FROM import_queue
 			WHERE status = 'completed'
 			  AND storage_path IS NOT NULL
@@ -2454,6 +2454,7 @@ func (r *Repository) GetCachedStremioQueueItems(ctx context.Context, reuseLibrar
 			&item.ID, &item.DownloadID, &item.NzbPath, &item.RelativePath, &item.Category, &item.Priority, &item.Status,
 			&item.CreatedAt, &item.UpdatedAt, &item.StartedAt, &item.CompletedAt,
 			&item.RetryCount, &item.MaxRetries, &item.ErrorMessage, &item.BatchID, &item.Metadata, &item.FileSize, &item.StoragePath, &item.TargetPath,
+			&item.Indexer, &item.ContentIdentity,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan cached stremio queue item: %w", err)
