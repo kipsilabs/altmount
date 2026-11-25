@@ -3,6 +3,8 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -20,6 +22,7 @@ import (
 	"github.com/kipsilabs/altmount/internal/progress"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sync/singleflight"
 )
 
 // backdate moves the grab recorded for key d into the past.
@@ -72,6 +75,11 @@ func TestRecentNzbGrab(t *testing.T) {
 	require.NotNil(t, got, "a running import is joined")
 	assert.Equal(t, item.ID, got.ID)
 	assert.Equal(t, "Movie.2024", name, "with the name the first request used, not the stored nzb_path")
+
+	require.NoError(t, repo.UpdateQueueItemStatus(ctx, item.ID, database.QueueStatusWaitingRepair, nil))
+	got, _ = s.recentNzbGrab(ctx, cfg, url)
+	require.NotNil(t, got, "an import waiting for repair is still active")
+	assert.Equal(t, item.ID, got.ID)
 
 	require.NoError(t, repo.UpdateQueueItemStatus(ctx, item.ID, database.QueueStatusCompleted, nil))
 	got, _ = s.recentNzbGrab(ctx, cfg, url)
@@ -209,7 +217,6 @@ func TestNzbStreamsGrabsEachURLOnce(t *testing.T) {
 	}
 	started.Wait()
 	require.Eventually(t, func() bool { return e.hits.Load() > 0 }, 5*time.Second, 5*time.Millisecond)
-	time.Sleep(100 * time.Millisecond) // let the other requests join the fetch in flight
 	e.release()
 	done.Wait()
 
@@ -251,6 +258,81 @@ func TestNzbStreamsHitUsesStoredName(t *testing.T) {
 	assert.Equal(t, int32(0), e.hits.Load(), "hits skip the fetch")
 }
 
+// grabPublicationBarrier pauses queue resolution after the download has
+// completed but before the URL cache entry is published.
+type grabPublicationBarrier struct {
+	slog.Handler
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (b *grabPublicationBarrier) Handle(ctx context.Context, record slog.Record) error {
+	if record.Message == "Returning cached Stremio streams for already-processed NZB" {
+		b.once.Do(func() {
+			close(b.entered)
+			<-b.release
+		})
+	}
+	return b.Handler.Handle(ctx, record)
+}
+
+func TestNzbURLRequestAfterDownloadBeforeCachePublication(t *testing.T) {
+	e := newGrabStreamsEnv(t, "/config/.nzbs/stremio/Movie.2024.1080p.nzb",
+		"/stremio/Movie.2024.1080p.mkv", "/get/Movie.2024.1080p.nzb")
+	e.release()
+	original := slog.Default()
+	barrier := &grabPublicationBarrier{Handler: slog.NewTextHandler(io.Discard, nil), entered: make(chan struct{}), release: make(chan struct{})}
+	slog.SetDefault(slog.New(barrier))
+	t.Cleanup(func() { slog.SetDefault(original) })
+	var release sync.Once
+	unblock := func() { release.Do(func() { close(barrier.release) }) }
+	t.Cleanup(unblock)
+
+	first := e.server.resolveNzbURL(context.Background(), e.cfg, e.nzbURL, "")
+	select {
+	case <-barrier.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first request did not reach queue resolution after downloading")
+	}
+	_, cached := e.server.nzbGrabs.get(nzbGrabKey(e.nzbURL), 24)
+	require.False(t, cached, "the first request has not published its cache entry")
+	require.Equal(t, int32(1), e.hits.Load(), "the first download has completed")
+
+	// Registration is synchronous: this second URL request joins before the
+	// first can publish, rather than relying on a goroutine being scheduled.
+	second := e.server.resolveNzbURL(context.Background(), e.cfg, e.nzbURL, "")
+	unblock()
+	for _, result := range []<-chan singleflight.Result{first, second} {
+		select {
+		case got := <-result:
+			require.NoError(t, got.Err)
+			assert.True(t, got.Shared, "queue resolution and publication must still be shared")
+			assert.Equal(t, e.item.ID, got.Val.(nzbGrab).queueID)
+		case <-time.After(5 * time.Second):
+			t.Fatal("URL resolution did not complete")
+		}
+	}
+	assert.Equal(t, int32(1), e.hits.Load(), "both requests must share one upstream grab")
+	grab, ok := e.server.nzbGrabs.get(nzbGrabKey(e.nzbURL), 24)
+	require.True(t, ok)
+	assert.Equal(t, e.item.ID, grab.queueID)
+}
+
+func TestNzbURLRechecksCacheAfterStaleMiss(t *testing.T) {
+	e := newGrabStreamsEnv(t, "/config/.nzbs/stremio/Movie.2024.1080p.nzb",
+		"/stremio/Movie.2024.1080p.mkv", "/get/Movie.2024.1080p.nzb")
+	e.release()
+	item, _ := e.server.recentNzbGrab(context.Background(), e.cfg, e.nzbURL)
+	require.Nil(t, item)
+	// Another request publishes between the outer miss and coalescing.
+	e.server.nzbGrabs.put(nzbGrabKey(e.nzbURL), e.item.ID, "Movie.2024.1080p", 24)
+	result := <-e.server.resolveNzbURL(context.Background(), e.cfg, e.nzbURL, "")
+	require.NoError(t, result.Err)
+	assert.Equal(t, e.item.ID, result.Val.(nzbGrab).queueID)
+	assert.Zero(t, e.hits.Load())
+}
+
 func TestNzbGrabCacheDropKeepsNewerGrab(t *testing.T) {
 	var c nzbGrabCache
 	c.put("k", 1, "Old", 24)
@@ -262,6 +344,60 @@ func TestNzbGrabCacheDropKeepsNewerGrab(t *testing.T) {
 	c.drop("k", 2)
 	_, ok = c.get("k", 24)
 	assert.False(t, ok)
+}
+
+func TestNzbGrabCacheOwnsReleaseName(t *testing.T) {
+	ctx, release := withQuery(t, "name=Show.S01E05")
+	defer release()
+	var cache nzbGrabCache
+	cache.put("key", 1, ctx.Query("name"), 24)
+	// Fiber strings borrow request buffers, which are reused after the handler.
+	copy(ctx.Request().URI().QueryArgs().Peek("name"), "Show.S02E06")
+	grab, ok := cache.get("key", 24)
+	require.True(t, ok)
+	assert.Equal(t, "Show.S01E05", grab.nzbName)
+}
+
+func TestNzbStreamsDoesNotCacheSubstringMatch(t *testing.T) {
+	e := newGrabStreamsEnv(t, "/config/.nzbs/stremio/Other.Movie.2024.1080p.nzb",
+		"/stremio/Other.Movie.2024.1080p.mkv", "/get/Movie.2024.1080p.nzb")
+	e.release()
+	status, _ := e.post(t, nil)
+	// With no matching import or importer service, resolution must fail instead
+	// of returning the unrelated import found by the broad database search.
+	assert.Equal(t, http.StatusInternalServerError, status)
+	_, ok := e.server.nzbGrabs.get(nzbGrabKey(e.nzbURL), 24)
+	assert.False(t, ok)
+}
+
+func TestQueueNzbStreamsReusesWaitingRepair(t *testing.T) {
+	_, repo := newGrabTestDB(t)
+	item := &database.ImportQueueItem{
+		NzbPath: "/config/.nzbs/stremio/Movie.2024.nzb",
+		Status:  database.QueueStatusWaitingRepair, Priority: database.QueuePriorityHigh,
+	}
+	require.NoError(t, repo.AddToQueue(context.Background(), item))
+	s := &Server{queueRepo: repo}
+	grab, err := s.queueNzbStreams(context.Background(), &config.Config{}, "Movie.2024.nzb", nil, "")
+	require.NoError(t, err, "waiting for repair must not enqueue a duplicate")
+	assert.Equal(t, item.ID, grab.queueID)
+}
+
+func TestNzbStreamsExactMatchBehindNewerSubstringMatch(t *testing.T) {
+	e := newGrabStreamsEnv(t, "/config/.nzbs/stremio/Movie.2024.1080p.nzb",
+		"/stremio/Movie.2024.1080p.mkv", "/get/Movie.2024.1080p.nzb")
+	e.release()
+	other := &database.ImportQueueItem{
+		NzbPath: "/config/.nzbs/stremio/Other.Movie.2024.1080p.nzb",
+		Status:  database.QueueStatusProcessing, Priority: database.QueuePriorityHigh,
+	}
+	require.NoError(t, e.server.queueRepo.AddToQueue(context.Background(), other))
+	status, body := e.post(t, nil)
+	assert.Equal(t, http.StatusOK, status)
+	assert.Equal(t, e.item.ID, body.QueueItemID)
+	grab, ok := e.server.nzbGrabs.get(nzbGrabKey(e.nzbURL), 24)
+	require.True(t, ok)
+	assert.Equal(t, e.item.ID, grab.queueID)
 }
 
 func TestRecentNzbGrabKeepsGrabOnDatabaseError(t *testing.T) {

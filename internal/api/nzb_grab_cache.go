@@ -7,12 +7,15 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/kipsilabs/altmount/internal/config"
 	"github.com/kipsilabs/altmount/internal/database"
 	"github.com/kipsilabs/altmount/internal/httpclient"
+	"github.com/kipsilabs/altmount/internal/importer/utils/nzbtrim"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -24,7 +27,7 @@ import (
 type nzbGrabCache struct {
 	mu      sync.Mutex
 	entries map[string]nzbGrab
-	// fetches makes concurrent requests for the same URL share one download.
+	// fetches shares download, queue resolution and cache publication by URL.
 	fetches singleflight.Group
 }
 
@@ -67,7 +70,7 @@ func (c *nzbGrabCache) put(key string, queueID int64, nzbName string, ttlHours i
 			delete(c.entries, k)
 		}
 	}
-	c.entries[key] = nzbGrab{queueID: queueID, nzbName: nzbName, at: time.Now()}
+	c.entries[key] = nzbGrab{queueID: queueID, nzbName: strings.Clone(nzbName), at: time.Now()}
 }
 
 // drop forgets the grab for key if it still points at queueID, so it cannot
@@ -102,7 +105,7 @@ func (s *Server) recentNzbGrab(ctx context.Context, cfg *config.Config, nzbURL s
 	}
 	if item != nil {
 		switch item.Status {
-		case database.QueueStatusPending, database.QueueStatusProcessing, database.QueueStatusPaused:
+		case database.QueueStatusPending, database.QueueStatusProcessing, database.QueueStatusPaused, database.QueueStatusWaitingRepair:
 			return item, grab.nzbName
 		case database.QueueStatusCompleted:
 			if reusableCompletedImport(item, cfg.Stremio.NzbTTLHours) {
@@ -112,6 +115,42 @@ func (s *Server) recentNzbGrab(ctx context.Context, cfg *config.Config, nzbURL s
 	}
 	s.nzbGrabs.drop(key, grab.queueID)
 	return nil, ""
+}
+
+type nzbFetchError struct{ error }
+
+// resolveNzbURL registers a caller before returning its result channel. The
+// operation stays shared until the queue item is known and its cache entry is
+// published; response construction and waiting remain per request.
+func (s *Server) resolveNzbURL(ctx context.Context, cfg *config.Config, nzbURL, category string) <-chan singleflight.Result {
+	// Fiber values borrow request buffers. Own the strings before starting work
+	// that can be shared with other handlers.
+	nzbURL, category = strings.Clone(nzbURL), strings.Clone(category)
+	return s.nzbGrabs.fetches.DoChan(nzbGrabKey(nzbURL), func() (any, error) {
+		workCtx := context.WithoutCancel(ctx)
+		// A caller may have missed the cache before another operation published
+		// and finished. Recheck under coalescing before contacting the indexer.
+		if item, name := s.recentNzbGrab(workCtx, cfg, nzbURL); item != nil {
+			return nzbGrab{queueID: item.ID, nzbName: name}, nil
+		}
+		data, err := fetchNzbURL(workCtx, cfg, nzbURL)
+		if err != nil {
+			return nil, &nzbFetchError{err}
+		}
+		filename := filepath.Base(nzbURL)
+		if idx := strings.Index(filename, "?"); idx >= 0 {
+			filename = filename[:idx]
+		}
+		if !nzbtrim.HasNzbExtension(filename) {
+			filename += ".nzb"
+		}
+		grab, err := s.queueNzbStreams(workCtx, cfg, filename, data, category)
+		if err != nil {
+			return nil, err
+		}
+		s.nzbGrabs.put(nzbGrabKey(nzbURL), grab.queueID, grab.nzbName, cfg.Stremio.NzbGrabCacheHours)
+		return grab, nil
+	})
 }
 
 // fetchNzbURL downloads an NZB from an indexer URL. Errors from net/http quote

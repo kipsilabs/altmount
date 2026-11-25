@@ -16,11 +16,12 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/javi11/nzbparser"
 	"github.com/kipsilabs/altmount/internal/auth"
+	"github.com/kipsilabs/altmount/internal/config"
 	"github.com/kipsilabs/altmount/internal/database"
 	"github.com/kipsilabs/altmount/internal/importer/parser/fileinfo"
 	"github.com/kipsilabs/altmount/internal/importer/utils/nzbtrim"
-	"github.com/javi11/nzbparser"
 )
 
 // mediaExtensions lists common video/media file extensions for Stremio stream filtering.
@@ -174,25 +175,16 @@ func (s *Server) handleNzbStreams(c *fiber.Ctx) error {
 	var nzbData []byte
 
 	if nzbURL != "" {
-		// Download NZB from the provided URL. Concurrent requests for it share one
-		// download and so one byte slice: read it, never modify it. A request that
-		// arrives after the download but before the import is recorded below still
-		// fetches again: at worst one extra grab.
-		data, err, _ := s.nzbGrabs.fetches.Do(nzbGrabKey(nzbURL), func() (any, error) {
-			return fetchNzbURL(context.WithoutCancel(ctx), cfg, nzbURL)
-		})
-		if err != nil {
-			return RespondBadRequest(c, "Failed to fetch NZB from URL", err.Error())
+		result := <-s.resolveNzbURL(ctx, cfg, nzbURL, category)
+		if result.Err != nil {
+			var fetchErr *nzbFetchError
+			if errors.As(result.Err, &fetchErr) {
+				return RespondBadRequest(c, "Failed to fetch NZB from URL", fetchErr.Error())
+			}
+			return RespondInternalError(c, "Failed to process NZB", result.Err.Error())
 		}
-		nzbData = data.([]byte)
-		// Derive filename from URL path
-		nzbFilename = filepath.Base(nzbURL)
-		if idx := strings.Index(nzbFilename, "?"); idx >= 0 {
-			nzbFilename = nzbFilename[:idx]
-		}
-		if !nzbtrim.HasNzbExtension(nzbFilename) {
-			nzbFilename = nzbFilename + ".nzb"
-		}
+		grab := result.Val.(nzbGrab)
+		return s.waitAndRespond(c, grab.queueID, baseURL, downloadKey, grab.nzbName, selector, timeoutSecs)
 	} else {
 		// Require file upload
 		file, err := c.FormFile("file")
@@ -219,6 +211,16 @@ func (s *Server) handleNzbStreams(c *fiber.Ctx) error {
 		}
 	}
 
+	grab, err := s.queueNzbStreams(ctx, cfg, nzbFilename, nzbData, category)
+	if err != nil {
+		return RespondInternalError(c, "Failed to process NZB", err.Error())
+	}
+	return s.waitAndRespond(c, grab.queueID, baseURL, downloadKey, grab.nzbName, selector, timeoutSecs)
+}
+
+// queueNzbStreams resolves the import independently of each caller's response
+// URL, credentials, episode selector and wait timeout.
+func (s *Server) queueNzbStreams(ctx context.Context, cfg *config.Config, nzbFilename string, nzbData []byte, category string) (nzbGrab, error) {
 	// --- Recover a real release name when the transport name is generic ---
 	// AIOStreams uploads/links the NZB as "download.nzb" (multipart part name or a
 	// download-endpoint URL like ".../download?..."), which loses the real title. That
@@ -250,25 +252,39 @@ func (s *Server) handleNzbStreams(c *fiber.Ctx) error {
 		// does not abort work that other concurrent callers are also waiting on.
 		workCtx := context.WithoutCancel(ctx)
 
-		completedStatus := database.QueueStatusCompleted
-
-		// Check completed cache inside the critical section so two concurrent
-		// callers can't both miss it and both enqueue the same NZB.
-		if existing, e := s.queueRepo.ListQueueItems(workCtx, &completedStatus, safeFilename, "", 1, 0, "updated_at", "desc"); e == nil && len(existing) > 0 {
-			if prev := existing[0]; reusableCompletedImport(prev, ttlHours) {
-				slog.InfoContext(workCtx, "Returning cached Stremio streams for already-processed NZB",
-					"nzb_name", nzbName, "queue_id", prev.ID)
-				return prev.ID, nil
+		// ListQueueItems searches path substrings (and SQL LIKE wildcards).
+		// Compare basenames before reusing an import, and inspect all candidates
+		// so a newer unrelated item cannot hide the exact filename match.
+		const pageSize = 100
+		var active *database.ImportQueueItem
+		for offset := 0; ; offset += pageSize {
+			items, err := s.queueRepo.ListQueueItems(workCtx, nil, safeFilename, "", pageSize, offset, "updated_at", "desc")
+			if err != nil {
+				return nil, err
+			}
+			for _, item := range items {
+				if filepath.Base(item.NzbPath) != safeFilename {
+					continue
+				}
+				switch item.Status {
+				case database.QueueStatusCompleted:
+					if reusableCompletedImport(item, ttlHours) {
+						slog.InfoContext(workCtx, "Returning cached Stremio streams for already-processed NZB",
+							"nzb_name", nzbName, "queue_id", item.ID)
+						return item.ID, nil
+					}
+				case database.QueueStatusPending, database.QueueStatusProcessing, database.QueueStatusPaused, database.QueueStatusWaitingRepair:
+					if active == nil {
+						active = item
+					}
+				}
+			}
+			if len(items) < pageSize {
+				break
 			}
 		}
-
-		// Join an existing active queue item instead of re-adding.
-		if activeItems, e := s.queueRepo.ListQueueItems(workCtx, nil, safeFilename, "", 1, 0, "updated_at", "desc"); e == nil && len(activeItems) > 0 {
-			it := activeItems[0]
-			switch it.Status {
-			case database.QueueStatusPending, database.QueueStatusProcessing, database.QueueStatusPaused:
-				return it.ID, nil
-			}
+		if active != nil {
+			return active.ID, nil
 		}
 
 		// --- Save NZB to temp directory and add to queue ---
@@ -301,18 +317,14 @@ func (s *Server) handleNzbStreams(c *fiber.Ctx) error {
 		slog.InfoContext(workCtx, "NZB added to queue for Stremio stream processing",
 			"queue_id", item.ID,
 			"nzb_path", tempPath,
-			"timeout_secs", timeoutSecs)
+			"nzb_name", nzbName)
 
 		return item.ID, nil
 	})
 	if sfErr != nil {
-		return RespondInternalError(c, "Failed to process NZB", sfErr.Error())
+		return nzbGrab{}, sfErr
 	}
-	if nzbURL != "" {
-		s.nzbGrabs.put(nzbGrabKey(nzbURL), rawID.(int64), nzbName, cfg.Stremio.NzbGrabCacheHours)
-	}
-
-	return s.waitAndRespond(c, rawID.(int64), baseURL, downloadKey, nzbName, selector, timeoutSecs)
+	return nzbGrab{queueID: rawID.(int64), nzbName: nzbName}, nil
 }
 
 // reusableCompletedImport reports whether a completed import can serve a repeat
