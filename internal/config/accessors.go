@@ -345,6 +345,13 @@ func (c *Config) GetImportSegmentCheckTimeout() time.Duration {
 	return time.Duration(*c.Import.SegmentCheckTimeoutSeconds) * time.Second
 }
 
+// GetImportFailFastOnMissingArticles reports whether an import fails as soon
+// as the availability check finds a missing article outside the sidecars and
+// PAR2 files (default false). Only effective while no damage is acceptable.
+func (c *Config) GetImportFailFastOnMissingArticles() bool {
+	return c.Import.FailFastOnMissingArticles != nil && *c.Import.FailFastOnMissingArticles
+}
+
 // GetHealthVerifyContent returns whether health checks should probe media
 // files for a valid container signature.
 func (c *Config) GetHealthVerifyContent() bool {

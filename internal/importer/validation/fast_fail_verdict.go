@@ -33,6 +33,15 @@ type ProbeVerdict struct {
 	MissingIDs []string
 }
 
+// EffectiveReleaseProbeBudget resolves a release probe's check budget: d, or
+// the default when d is not positive.
+func EffectiveReleaseProbeBudget(d time.Duration) time.Duration {
+	if d <= 0 {
+		return releaseProbeBudget
+	}
+	return d
+}
+
 // FastFailReleaseProbeVerdict runs the release probe in two waves: a small
 // first wave whose misses can already prove the post dead, then — only when
 // that wave was clean — the rest of the sample, cancelled on the first miss.
@@ -50,9 +59,7 @@ func FastFailReleaseProbeVerdict(
 	articleDate time.Time,
 	checkBudget time.Duration,
 ) (verdict ProbeVerdict, err error) {
-	if checkBudget <= 0 {
-		checkBudget = releaseProbeBudget
-	}
+	checkBudget = EffectiveReleaseProbeBudget(checkBudget)
 	var segments []*metapb.SegmentData
 	for _, file := range files {
 		for _, segment := range file.Segments {

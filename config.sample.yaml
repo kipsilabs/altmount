@@ -181,6 +181,7 @@ import:
   max_concurrent_imports: 0 # Cap on NZB imports running at once (0 = unlimited). NNTP connections are balanced automatically: imports use the pool's full capacity and always yield to streaming.
   segment_sample_percentage: 1 # Segments to sample during import-phase validation (RAR extraction, archive integrity) as a percentage 1-100; lower is faster (default: 1)
   # segment_check_timeout_seconds: 45 # Time limit for the import segment check (5-300, default: 45). A check that runs out of time with nothing missing among at least 64 checked segments passes on what it covered.
+  # fail_fast_on_missing_articles: false # When health.acceptable_missing_segments_percentage is 0, fail an import as soon as the segment check finds a missing article in any file other than sidecars (.nfo, .sfv, images) and PAR2, instead of importing the undamaged files of a pack. A PAR2-repairable archive still defers for repair (default: false)
   import_strategy: 'NONE' # Import strategy: NONE (direct import), SYMLINK (create symlinks), STRM (create .strm files)
   import_dir: '' # Import directory (required when import_strategy is SYMLINK or STRM, must be absolute path)
                  # Windows example: 'C:\Users\user\Videos'

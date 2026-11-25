@@ -17,6 +17,8 @@ export function ImportConfigSection({
 	isUpdating = false,
 }: ImportConfigSectionProps) {
 	const [formData, setFormData] = useState<ImportConfig>(config.import);
+	// import.fail_fast_on_missing_articles only acts when no damage is acceptable.
+	const toleratesDamage = (config.health?.acceptable_missing_segments_percentage ?? 0) > 0;
 	const [hasChanges, setHasChanges] = useState(false);
 	const [extensionInput, setExtensionInput] = useState("");
 
@@ -363,6 +365,37 @@ export function ImportConfigSection({
 										fail the import if no recognized media container signature is found. Catches
 										releases assembled in the wrong order.
 									</span>
+								</div>
+							</label>
+
+							<label className="flex min-w-0 cursor-pointer items-start gap-3 rounded-xl border border-base-300/60 bg-base-100/40 p-4">
+								<input
+									type="checkbox"
+									className="toggle toggle-primary toggle-sm mt-0.5 shrink-0"
+									checked={formData.fail_fast_on_missing_articles ?? false}
+									disabled={
+										isReadOnly || (toleratesDamage && !formData.fail_fast_on_missing_articles)
+									}
+									onChange={(e) =>
+										handleInputChange("fail_fast_on_missing_articles", e.target.checked)
+									}
+								/>
+								<div className="min-w-0">
+									<span className="block break-words font-bold text-xs">
+										Fail Fast on Missing Articles
+									</span>
+									<span className="mt-0.5 block break-words text-[11px] text-base-content/50 leading-snug">
+										Fail the import as soon as the segment check finds a missing article in any file
+										other than sidecars (.nfo, .sfv, images) and PAR2, instead of checking every
+										file to import the undamaged ones. A season pack with one damaged episode fails
+										as a whole; an archive that PAR2 can repair still waits for the repair.
+									</span>
+									{toleratesDamage && (
+										<span className="mt-1 block break-words text-[11px] text-warning leading-snug">
+											Has no effect while Acceptable Missing Segments (Health) is above 0%. Set it
+											to 0% to use this.
+										</span>
+									)}
 								</div>
 							</label>
 
