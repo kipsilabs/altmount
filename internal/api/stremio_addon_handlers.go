@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
@@ -396,6 +395,7 @@ type stremioPlayCandidate struct {
 	Source      string
 	IndexerID   string
 	GUID        string
+	Size        int64 // indexer-reported size, used only when there is no GUID
 }
 
 type stremioReleaseRef struct {
@@ -403,12 +403,29 @@ type stremioReleaseRef struct {
 	ExpiresAt time.Time
 }
 
-func (s *Server) storeStremioReleaseRef(candidate stremioPlayCandidate) (string, error) {
-	var raw [32]byte
-	if _, err := rand.Read(raw[:]); err != nil {
-		return "", fmt.Errorf("generate Stremio release reference: %w", err)
+// stremioReleaseToken derives a play link's release token from the release
+// itself instead of from the listing that offered it. Every listing, every
+// reopened link and every process therefore presents the same token for the
+// same release, so a client that saved one play link keeps naming that release.
+//
+// The indexer and its GUID identify the release. An indexer that reports no
+// GUID falls back to the normalized release name and size. Tokens minted before
+// this scheme were random; they still resolve through the stored reference, and
+// a link whose token is unknown takes the same recovery path either way.
+func stremioReleaseToken(candidate stremioPlayCandidate) string {
+	identity := strings.ToLower(strings.TrimSpace(candidate.Source)) + "\x00" +
+		strings.ToLower(strings.TrimSpace(candidate.Indexer)) + "\x00"
+	if guid := strings.TrimSpace(candidate.GUID); guid != "" {
+		identity += strings.ToLower(guid)
+	} else {
+		identity += normalizeTitleForMatching(candidate.SafeTitle) + "\x00" + strconv.FormatInt(candidate.Size, 10)
 	}
-	token := fmt.Sprintf("%x", raw[:])
+	sum := sha256.Sum256([]byte(identity))
+	return fmt.Sprintf("r2-%x", sum[:16])
+}
+
+func (s *Server) storeStremioReleaseRef(candidate stremioPlayCandidate) (string, error) {
+	token := stremioReleaseToken(candidate)
 	s.stremioReleaseMu.Lock()
 	defer s.stremioReleaseMu.Unlock()
 	if s.stremioReleaseRefs == nil {
@@ -736,6 +753,7 @@ func stremioCandidates(results []prowlarr.NZBResult, fallbackID string) []stremi
 			Source:      r.Source,
 			IndexerID:   strconv.Itoa(r.IndexerID),
 			GUID:        r.GUID,
+			Size:        r.Size,
 		})
 	}
 	return cands
@@ -1078,7 +1096,7 @@ func buildStremioStreamEntries(
 		candidate := stremioPlayCandidate{
 			Title: r.Title, SafeTitle: safeTitle, DownloadURL: r.DownloadURL,
 			Indexer: r.Indexer, IndexerID: strconv.Itoa(r.IndexerID), GUID: r.GUID,
-			Source: resultSource(r),
+			Source: resultSource(r), Size: r.Size,
 		}
 		releaseToken := ""
 		if len(releaseStores) > 0 {
@@ -1264,10 +1282,10 @@ func (s *Server) handleStremioAddonPlay(c *fiber.Ctx) error {
 	}
 
 	if cand.DownloadURL == "" {
-		// A recovered link has no release to download: find it again. This is
-		// preferred over serving a title-matched cached file, whose release
-		// cannot be verified.
-		found, _ := s.findStremioCandidate(ctx, cfg, streamType, imdbID, selector, cand.SafeTitle)
+		// A recovered link has no release to download: find it again. The
+		// stable token, when present, identifies the exact release; otherwise
+		// the release name does.
+		found, _ := s.findStremioCandidate(ctx, cfg, streamType, imdbID, selector, cand.SafeTitle, releaseToken)
 		if found == nil {
 			return RespondServiceUnavailable(c, "No playable release found", "the play link expired and a new search found nothing")
 		}
@@ -1286,12 +1304,14 @@ func (s *Server) handleStremioAddonPlay(c *fiber.Ctx) error {
 // findStremioCandidate searches again for a content id and returns the
 // release named safeTitle when the search still offers it (matched true),
 // otherwise the top-ranked release, or nil when the search finds nothing.
+// releaseToken, when it belongs to the stable token scheme, wins over the name:
+// it identifies the release even if the indexer renamed it between listings.
 func (s *Server) findStremioCandidate(
 	ctx context.Context,
 	cfg *config.Config,
 	streamType, imdbID string,
 	selector *stremioEpisodeSelector,
-	safeTitle string,
+	safeTitle, releaseToken string,
 ) (cand *stremioPlayCandidate, matched bool) {
 	prowlarrType := "search"
 	switch streamType {
@@ -1308,12 +1328,19 @@ func (s *Server) findStremioCandidate(
 	if err != nil {
 		slog.WarnContext(ctx, "Stremio search for an expired play link failed", "error", err, "imdb_id", imdbID)
 	}
-	return pickStremioCandidate(stremioCandidates(results, imdbID), safeTitle)
+	return pickStremioCandidate(stremioCandidates(results, imdbID), safeTitle, releaseToken)
 }
 
-// pickStremioCandidate returns the candidate named safeTitle (matched true),
-// else the first, else nil.
-func pickStremioCandidate(cands []stremioPlayCandidate, safeTitle string) (*stremioPlayCandidate, bool) {
+// pickStremioCandidate returns the release the play link names, then the
+// release named safeTitle, then the first release, else nil.
+func pickStremioCandidate(cands []stremioPlayCandidate, safeTitle, releaseToken string) (*stremioPlayCandidate, bool) {
+	if releaseToken != "" && strings.HasPrefix(releaseToken, "r2-") {
+		for i := range cands {
+			if stremioReleaseToken(cands[i]) == releaseToken {
+				return &cands[i], true
+			}
+		}
+	}
 	if safeTitle != "" {
 		for i := range cands {
 			if cands[i].SafeTitle == safeTitle {
