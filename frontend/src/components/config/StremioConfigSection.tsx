@@ -69,6 +69,7 @@ function initializeStremioFormData(config: ConfigResponse): StremioConfig {
 		max_retries: stremio?.max_retries ?? 2,
 		stream_ttl_seconds: stremio?.stream_ttl_seconds ?? 86400,
 		nzb_ttl_hours: stremio?.nzb_ttl_hours ?? 24,
+		nzb_grab_cache_hours: stremio?.nzb_grab_cache_hours ?? 24,
 		failed_release_ttl_hours: stremio?.failed_release_ttl_hours ?? 24,
 		max_fallback_releases: stremio?.max_fallback_releases ?? 2,
 		fast_fail_header_only: stremio?.fast_fail_header_only ?? true,

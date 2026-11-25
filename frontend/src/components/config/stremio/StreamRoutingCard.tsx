@@ -18,6 +18,7 @@ export function StreamRoutingCard({
 	const skipSearchWhenCached = config.skip_search_when_cached ?? false;
 	const fallbackTimeout = config.fallback_timeout_ms ?? 3500;
 	const nzbTtlHours = config.nzb_ttl_hours ?? 24;
+	const grabCacheHours = config.nzb_grab_cache_hours ?? 24;
 	const failedTtlHours = config.failed_release_ttl_hours ?? 24;
 	const maxFallbacks = config.max_fallback_releases ?? 2;
 	const fastFailHeader = config.fast_fail_header_only ?? true;
@@ -148,7 +149,7 @@ export function StreamRoutingCard({
 				</div>
 
 				{/* Timeouts & TTL Controls */}
-				<div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+				<div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
 					<fieldset className="fieldset min-w-0">
 						<legend className="fieldset-legend font-semibold text-xs">
 							Stream Fallback Timeout
@@ -171,7 +172,7 @@ export function StreamRoutingCard({
 								ms
 							</span>
 						</div>
-						<p className="label text-[11px] text-base-content/50">
+						<p className="label whitespace-normal text-[11px] text-base-content/50">
 							Max wait time before auto-switching to candidate release on stall.
 						</p>
 					</fieldset>
@@ -195,7 +196,7 @@ export function StreamRoutingCard({
 								Hours
 							</span>
 						</div>
-						<p className="label text-[11px] text-base-content/50">
+						<p className="label whitespace-normal text-[11px] text-base-content/50">
 							Duration to retain parsed NZB streams. 0 = keep forever.
 						</p>
 					</fieldset>
@@ -219,8 +220,33 @@ export function StreamRoutingCard({
 								Hours
 							</span>
 						</div>
-						<p className="label text-[11px] text-base-content/50">
+						<p className="label whitespace-normal text-[11px] text-base-content/50">
 							Duration to hide dead / DMCAed NZB candidates from stream search.
+						</p>
+					</fieldset>
+
+					<fieldset className="fieldset min-w-0">
+						<legend className="fieldset-legend font-semibold text-xs">NZB Grab Cache</legend>
+						<div className="relative">
+							<input
+								type="number"
+								className="input input-bordered w-full min-w-0 text-xs"
+								min={0}
+								value={grabCacheHours}
+								disabled={isReadOnly}
+								onChange={(e) =>
+									onChange({
+										nzb_grab_cache_hours: Math.max(0, Number(e.target.value) || 0),
+									})
+								}
+							/>
+							<span className="pointer-events-none absolute inset-y-0 right-0 flex items-center pr-3 text-base-content/40 text-xs">
+								Hours
+							</span>
+						</div>
+						<p className="label whitespace-normal text-[11px] text-base-content/50">
+							Reuse NZBs already grabbed from the same URL, sparing strict indexers. Completed
+							imports only within NZB Cache TTL. 0 = no cache.
 						</p>
 					</fieldset>
 				</div>

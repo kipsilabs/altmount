@@ -91,6 +91,8 @@ type Server struct {
 
 	// stremioPlayGroup coalesces concurrent Stremio plays of the same release (download once).
 	stremioPlayGroup singleflight.Group
+	// nzbGrabs lets repeat /api/nzb/streams requests for an nzb_url reuse its import.
+	nzbGrabs nzbGrabCache
 	// stremioContentGroup closes the check-then-enqueue race for the same release
 	// of the same movie or episode.
 	stremioContentGroup singleflight.Group

@@ -1,0 +1,176 @@
+package api
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"io"
+	"net/http"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/kipsilabs/altmount/internal/config"
+	"github.com/kipsilabs/altmount/internal/database"
+	"github.com/kipsilabs/altmount/internal/httpclient"
+	"github.com/kipsilabs/altmount/internal/importer/utils/nzbtrim"
+	"golang.org/x/sync/singleflight"
+)
+
+// nzbGrabCache remembers which import an nzb_url led to, so a repeat request
+// within stremio.nzb_grab_cache_hours reuses it instead of fetching the NZB from
+// the indexer again. It holds only SHA-256 hashes of the URLs (indexer URLs
+// carry API keys) and lives in memory: after a restart a release is fetched
+// once more. The zero value is ready to use.
+type nzbGrabCache struct {
+	mu      sync.Mutex
+	entries map[string]nzbGrab
+	// fetches shares download, queue resolution and cache publication by URL.
+	fetches singleflight.Group
+}
+
+type nzbGrab struct {
+	queueID int64
+	// nzbName is the release name the first request used. The import's nzb_path
+	// may not keep it: the importer can prefix the queue ID on a name collision.
+	nzbName string
+	at      time.Time
+}
+
+func nzbGrabKey(nzbURL string) string {
+	sum := sha256.Sum256([]byte(nzbURL))
+	return hex.EncodeToString(sum[:])
+}
+
+func (c *nzbGrabCache) get(key string, ttlHours int) (nzbGrab, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	g, ok := c.entries[key]
+	if !ok || time.Since(g.at) >= time.Duration(ttlHours)*time.Hour {
+		return nzbGrab{}, false
+	}
+	return g, true
+}
+
+// put records the import for key and drops expired entries.
+func (c *nzbGrabCache) put(key string, queueID int64, nzbName string, ttlHours int) {
+	if ttlHours <= 0 {
+		return
+	}
+	ttl := time.Duration(ttlHours) * time.Hour
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.entries == nil {
+		c.entries = make(map[string]nzbGrab)
+	}
+	for k, g := range c.entries {
+		if time.Since(g.at) >= ttl {
+			delete(c.entries, k)
+		}
+	}
+	c.entries[key] = nzbGrab{queueID: queueID, nzbName: strings.Clone(nzbName), at: time.Now()}
+}
+
+// drop forgets the grab for key if it still points at queueID, so it cannot
+// erase a newer grab recorded meanwhile.
+func (c *nzbGrabCache) drop(key string, queueID int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if g, ok := c.entries[key]; ok && g.queueID == queueID {
+		delete(c.entries, key)
+	}
+}
+
+// recentNzbGrab returns the import an earlier request for nzbURL led to within
+// stremio.nzb_grab_cache_hours, and the release name that request used. The
+// import must still be running, or completed and still reusable under the same
+// rule as the filename cache (reusableCompletedImport). Otherwise it returns nil
+// and the NZB is fetched again.
+func (s *Server) recentNzbGrab(ctx context.Context, cfg *config.Config, nzbURL string) (*database.ImportQueueItem, string) {
+	ttlHours := cfg.Stremio.NzbGrabCacheHours
+	if nzbURL == "" || ttlHours <= 0 || s.queueRepo == nil {
+		return nil, ""
+	}
+	key := nzbGrabKey(nzbURL)
+	grab, ok := s.nzbGrabs.get(key, ttlHours)
+	if !ok {
+		return nil, ""
+	}
+	item, err := s.queueRepo.GetQueueItem(ctx, grab.queueID)
+	if err != nil {
+		// Keep the grab: a database error says nothing about the import.
+		return nil, ""
+	}
+	if item != nil {
+		switch item.Status {
+		case database.QueueStatusPending, database.QueueStatusProcessing, database.QueueStatusPaused, database.QueueStatusWaitingRepair:
+			return item, grab.nzbName
+		case database.QueueStatusCompleted:
+			if reusableCompletedImport(item, cfg.Stremio.NzbTTLHours) {
+				return item, grab.nzbName
+			}
+		}
+	}
+	s.nzbGrabs.drop(key, grab.queueID)
+	return nil, ""
+}
+
+type nzbFetchError struct{ error }
+
+// resolveNzbURL registers a caller before returning its result channel. The
+// operation stays shared until the queue item is known and its cache entry is
+// published; response construction and waiting remain per request.
+func (s *Server) resolveNzbURL(ctx context.Context, cfg *config.Config, nzbURL, category string) <-chan singleflight.Result {
+	// Fiber values borrow request buffers. Own the strings before starting work
+	// that can be shared with other handlers.
+	nzbURL, category = strings.Clone(nzbURL), strings.Clone(category)
+	return s.nzbGrabs.fetches.DoChan(nzbGrabKey(nzbURL), func() (any, error) {
+		workCtx := context.WithoutCancel(ctx)
+		// A caller may have missed the cache before another operation published
+		// and finished. Recheck under coalescing before contacting the indexer.
+		if item, name := s.recentNzbGrab(workCtx, cfg, nzbURL); item != nil {
+			return nzbGrab{queueID: item.ID, nzbName: name}, nil
+		}
+		data, err := fetchNzbURL(workCtx, cfg, nzbURL)
+		if err != nil {
+			return nil, &nzbFetchError{err}
+		}
+		filename := filepath.Base(nzbURL)
+		if idx := strings.Index(filename, "?"); idx >= 0 {
+			filename = filename[:idx]
+		}
+		if !nzbtrim.HasNzbExtension(filename) {
+			filename += ".nzb"
+		}
+		grab, err := s.queueNzbStreams(workCtx, cfg, filename, data, category)
+		if err != nil {
+			return nil, err
+		}
+		s.nzbGrabs.put(nzbGrabKey(nzbURL), grab.queueID, grab.nzbName, cfg.Stremio.NzbGrabCacheHours)
+		return grab, nil
+	})
+}
+
+// fetchNzbURL downloads an NZB from an indexer URL. Errors from net/http quote
+// the URL, and indexer URLs carry API keys, so they are returned redacted.
+func fetchNzbURL(ctx context.Context, cfg *config.Config, nzbURL string) ([]byte, error) {
+	const maxNzbFetchSize = 100 * 1024 * 1024 // 100 MB
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, nzbURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("invalid nzb_url: %w", httpclient.RedactURLError(err))
+	}
+	// Some indexers (e.g. NZBHydra2) reject requests without a browser-like User-Agent.
+	req.Header.Set("User-Agent", cfg.GetUserAgent())
+	resp, err := httpclient.NewForExternal(cfg.Network, httpclient.LongTimeout).Do(req) //nolint:gosec // URL is provided by an authenticated caller
+	if err != nil {
+		return nil, httpclient.RedactURLError(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxNzbFetchSize))
+	return data, httpclient.RedactURLError(err)
+}
