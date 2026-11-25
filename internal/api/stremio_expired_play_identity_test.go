@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/kipsilabs/altmount/internal/auth"
@@ -165,16 +166,26 @@ func TestStremioPlayExpiredTokenWithURLKeepsReleaseIdentity(t *testing.T) {
 }
 
 // An expired play link that only carries the release name has no release
-// identity, so it must search again rather than redirect to a cached file whose
-// release it cannot verify.
-func TestStremioPlayExpiredTokenWithoutURLDoesNotServeTitleMatch(t *testing.T) {
+// identity, but a completed import stored under that same release name is the
+// release the client is asking for. Serving it avoids searching and grabbing
+// the release again; a name that matches nothing still searches.
+func TestStremioPlayExpiredTokenWithoutURLServesCompletedRelease(t *testing.T) {
 	f := newExpiredPlayFixture(t)
 
 	resp := f.play(t, "release=expired0123456789&title="+url.QueryEscape(f.candA.SafeTitle)+
 		"&type=movie&id=tt123&indexer=Indexer&source=prowlarr")
-	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode,
-		"a title-only recovery must search instead of serving an unverified cached file")
-	require.Empty(t, resp.Header.Get("Location"),
-		"no redirect may be issued to a title-matched file")
-	require.Positive(t, f.searches.Load(), "the recovery must search again")
+	require.Equal(t, http.StatusFound, resp.StatusCode,
+		"a title-only recovery must serve the completed import it names")
+	location, err := url.Parse(resp.Header.Get("Location"))
+	require.NoError(t, err)
+	require.Equal(t, "/api/files/stream", location.Path)
+	require.Contains(t, []string{f.pathA, f.pathB}, location.Query().Get("path"),
+		"the completed release is served from storage, not searched again")
+	assert.Zero(t, f.searches.Load(), "a completed release must not be searched or grabbed again")
+
+	// A release name with no completed import still falls through to search.
+	resp = f.play(t, "release=expired0123456789&title="+url.QueryEscape("Another.Film.2024.1080p")+
+		"&type=movie&id=tt123&indexer=Indexer&source=prowlarr")
+	require.NotEqual(t, http.StatusFound, resp.StatusCode)
+	require.Positive(t, f.searches.Load(), "an unknown release name must search")
 }

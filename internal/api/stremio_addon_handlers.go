@@ -560,6 +560,29 @@ func stremioQueueMetadataMatches(item *database.ImportQueueItem, contentKey, rel
 	return metadata.ContentKey == contentKey && metadata.ReleaseKey == releaseKey
 }
 
+// stremioQueueItemNameMatches reports whether a completed row holds the release
+// whose normalized name is normTarget. A recovered play link that carries only
+// the release name can still resolve to the bytes already imported under that
+// name instead of searching and grabbing the release a second time.
+func stremioQueueItemNameMatches(item *database.ImportQueueItem, normTarget string) bool {
+	if item == nil || normTarget == "" {
+		return false
+	}
+	names := []string{item.NzbPath}
+	if item.StoragePath != nil {
+		names = append(names, *item.StoragePath)
+	}
+	if item.RelativePath != nil {
+		names = append(names, *item.RelativePath)
+	}
+	for _, name := range names {
+		if normalizeTitleForMatching(name) == normTarget {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Server) findActiveStremioContent(ctx context.Context, contentKey string) (*database.ImportQueueItem, error) {
 	if s.queueRepo == nil || contentKey == "" {
 		return nil, nil
@@ -1193,6 +1216,9 @@ func (s *Server) handleStremioAddonPlay(c *fiber.Ctx) error {
 	imdbID := c.Query("id")
 	streamType := c.Query("type")
 	cand, ok := s.consumeStremioReleaseRef(releaseToken)
+	// A link recovered from its release name alone carries no release
+	// identity, only content and the name the release was listed under.
+	recoveredByName := false
 	if !ok {
 		// Stremio saves the stream a title was played with and replays that
 		// link on resume, long after its release token expired. Recover from
@@ -1214,6 +1240,8 @@ func (s *Server) handleStremioAddonPlay(c *fiber.Ctx) error {
 			cand.DownloadURL = downloadURL
 			cand.Indexer = c.Query("indexer")
 			cand.Source = c.Query("source")
+		} else {
+			recoveredByName = cand.SafeTitle != ""
 		}
 		slog.InfoContext(ctx, "Recovering Stremio play link with an expired release token",
 			"imdb_id", imdbID, "title", cand.SafeTitle, "has_release_url", cand.DownloadURL != "")
@@ -1224,8 +1252,9 @@ func (s *Server) handleStremioAddonPlay(c *fiber.Ctx) error {
 
 	// A live release token names one exact release, and so does a recovered
 	// link that still carries its NZB URL. A link recovered from the release
-	// name alone names only the content, so it has no release identity to
-	// match a cached file against.
+	// name alone names the release by name; the cached-row lookup below matches
+	// that name exactly after normalisation instead of treating the title as a
+	// release key.
 	explicitRelease := cand.DownloadURL != ""
 	releaseKey := stremioReleaseKey(cand)
 
@@ -1251,12 +1280,13 @@ func (s *Server) handleStremioAddonPlay(c *fiber.Ctx) error {
 			}
 		}
 	}
-	// Only a request with release identity may reuse cached bytes: the queued
-	// file of the exact release it names, matched by the release key stored on
-	// the row. A sanitized title is not identity (mirrored releases share it
-	// while serving different files), so a link recovered from its title alone
-	// searches again instead of redirecting to a title-matched file.
-	if normTarget != "" && explicitRelease {
+	// Reuse cached bytes only for the release a request names. A live token or
+	// a recovered link carrying its NZB URL names an exact release through its
+	// release key. A link recovered from the release name alone names the
+	// release by name, so a completed row is served only when that stored name
+	// is the same release; it still never attaches to a different release
+	// merely because both sanitize alike.
+	if normTarget != "" && (explicitRelease || recoveredByName) {
 		if cachedItems, err := s.queueRepo.GetCachedStremioQueueItems(ctx, cfg.Stremio.EffectiveIncludeLibraryStreams(), cfg.Stremio.NzbTTLHours); err == nil {
 			for _, prev := range cachedItems {
 				if prev == nil || prev.StoragePath == nil || *prev.StoragePath == "" {
@@ -1265,16 +1295,21 @@ func (s *Server) handleStremioAddonPlay(c *fiber.Ctx) error {
 				if ttlHours > 0 && prev.CompletedAt != nil && time.Since(*prev.CompletedAt) >= time.Duration(ttlHours)*time.Hour {
 					continue
 				}
-				// Rows written before release keys existed cannot prove which
-				// release they hold, so they are skipped as well.
-				storedKey, keyed := stremioQueueItemReleaseKey(prev)
-				if !keyed || storedKey != releaseKey {
+				if explicitRelease {
+					// Rows written before release keys existed cannot prove
+					// which release they hold, so they are skipped as well.
+					storedKey, keyed := stremioQueueItemReleaseKey(prev)
+					if !keyed || storedKey != releaseKey {
+						continue
+					}
+				} else if !stremioQueueItemNameMatches(prev, normTarget) {
 					continue
 				}
 
 				if streams, err := s.buildStremioStreams(ctx, prev, baseURL, key, cand.SafeTitle, selector); err == nil && len(streams) > 0 {
 					slog.InfoContext(ctx, "Returning cached Stremio stream",
-						"nzb_name", cand.SafeTitle, "matched_path", prev.NzbPath, "indexer", cand.Indexer)
+						"nzb_name", cand.SafeTitle, "matched_path", prev.NzbPath, "indexer", cand.Indexer,
+						"recovered_by_name", recoveredByName)
 					return c.Redirect(streams[0].URL, fiber.StatusFound)
 				}
 			}
@@ -1282,9 +1317,8 @@ func (s *Server) handleStremioAddonPlay(c *fiber.Ctx) error {
 	}
 
 	if cand.DownloadURL == "" {
-		// A recovered link has no release to download: find it again. The
-		// stable token, when present, identifies the exact release; otherwise
-		// the release name does.
+		// Nothing completed matches the recovered release name: find the
+		// release again, by its stable token when it has one, else by name.
 		found, _ := s.findStremioCandidate(ctx, cfg, streamType, imdbID, selector, cand.SafeTitle, releaseToken)
 		if found == nil {
 			return RespondServiceUnavailable(c, "No playable release found", "the play link expired and a new search found nothing")
