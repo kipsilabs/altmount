@@ -17,10 +17,11 @@ import (
 )
 
 // Two indexer URLs can carry the same release title while serving different
-// NZB bytes. Their play links must never resolve to the same queued file: the
-// cached short-circuit may only reuse a row whose stored release key matches
-// the explicitly requested release.
-func TestStremioPlayDoesNotServeDifferentReleaseWithSameTitle(t *testing.T) {
+// NZB bytes. When both are already imported under different content identities,
+// a live play link whose release key misses must not guess between them: it
+// keeps searching rather than serving either cached file. The release whose
+// key does match still short-circuits to its own file.
+func TestStremioPlayDoesNotGuessBetweenSameTitledReleases(t *testing.T) {
 	title := "Same.Release.Title.2024.1080p.WEB-DL"
 	candA := stremioPlayCandidate{
 		Title:       title,
@@ -46,22 +47,28 @@ func TestStremioPlayDoesNotServeDifferentReleaseWithSameTitle(t *testing.T) {
 	apiKey := "test-api-key"
 	require.NoError(t, userRepo.CreateUser(ctx, &database.User{UserID: "admin", Provider: "local", APIKey: &apiKey}))
 
-	// Release A is already imported. Its queue row keeps the title-only NZB
-	// filename older rows used, which is exactly what made title matching
-	// resolve release B to release A's file.
-	metadata, err := encodeStremioQueueMetadata(stremioQueueMetadata{
-		ContentKey: "movie:tt123:0:0",
-		ReleaseKey: stremioReleaseKey(candA),
-		IMDbID:     "tt123",
-		Type:       "movie",
-	})
-	require.NoError(t, err)
+	// Two same-titled releases are already imported with different content
+	// identities. Release A's row keeps the title-only NZB filename older rows
+	// used, so only its release key and verified identity can tell it apart.
+	insertCompleted := func(cand stremioPlayCandidate, identity, dir, storagePath string) {
+		metadata, err := encodeStremioQueueMetadata(stremioQueueMetadata{
+			ContentKey: "movie:tt123:0:0",
+			ReleaseKey: stremioReleaseKey(cand),
+			IMDbID:     "tt123",
+			Type:       "movie",
+		})
+		require.NoError(t, err)
+		_, err = db.Connection().ExecContext(ctx,
+			`INSERT INTO import_queue (nzb_path, download_id, category, priority, status, retry_count, max_retries, metadata, storage_path, completed_at, content_identity)
+			 VALUES (?, 'stremio:test', 'Movies', 1, 'completed', 0, 3, ?, ?, ?, ?)`,
+			"/config/.nzbs/Movies/"+dir+"/"+cand.SafeTitle+".nzb", metadata, storagePath, time.Now(), identity)
+		require.NoError(t, err)
+	}
+	other := candA
+	other.DownloadURL = "https://indexer.example/api?t=get&id=release-other"
 	storagePath := "/storage/" + candA.SafeTitle + ".mkv"
-	_, err = db.Connection().ExecContext(ctx,
-		`INSERT INTO import_queue (nzb_path, download_id, category, priority, status, retry_count, max_retries, metadata, storage_path, completed_at)
-		 VALUES (?, 'stremio:test', 'Movies', 1, 'completed', 0, 3, ?, ?, ?)`,
-		"/config/.nzbs/Movies/"+candA.SafeTitle+".nzb", metadata, storagePath, time.Now())
-	require.NoError(t, err)
+	insertCompleted(candA, "identity-a", "a", storagePath)
+	insertCompleted(other, "identity-other", "other", "/storage/other/"+candA.SafeTitle+".mkv")
 
 	cfg := &config.Config{}
 	cfg.Stremio.Enabled = boolPtr(true)

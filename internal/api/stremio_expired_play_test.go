@@ -89,17 +89,28 @@ func TestStremioPlayRecoversExpiredReleaseToken(t *testing.T) {
 func TestPickStremioCandidate(t *testing.T) {
 	cands := []stremioPlayCandidate{{SafeTitle: "Top.Ranked"}, {SafeTitle: "Original.Choice"}}
 
-	got, matched := pickStremioCandidate(cands, "Original.Choice")
+	got, matched := pickStremioCandidate(cands, "Original.Choice", "")
 	require.NotNil(t, got)
 	assert.Equal(t, "Original.Choice", got.SafeTitle)
 	assert.True(t, matched, "the release the link named is preferred")
 
-	got, matched = pickStremioCandidate(cands, "Gone.From.Search")
+	got, matched = pickStremioCandidate(cands, "Gone.From.Search", "")
 	require.NotNil(t, got)
 	assert.Equal(t, "Top.Ranked", got.SafeTitle)
 	assert.False(t, matched)
 
-	got, _ = pickStremioCandidate(nil, "Anything")
+	// A stable token identifies the release even when the indexer renamed it.
+	got, matched = pickStremioCandidate(cands, "Gone.From.Search", stremioReleaseToken(cands[0]))
+	require.NotNil(t, got)
+	assert.Equal(t, "Top.Ranked", got.SafeTitle)
+	assert.True(t, matched, "the token names the release, not the title")
+
+	// A legacy random token cannot name a release; the title decides.
+	got, matched = pickStremioCandidate(cands, "Original.Choice", "0123456789abcdef0123456789abcdef")
+	assert.Equal(t, "Original.Choice", got.SafeTitle)
+	assert.True(t, matched)
+
+	got, _ = pickStremioCandidate(nil, "Anything", "")
 	assert.Nil(t, got)
 }
 

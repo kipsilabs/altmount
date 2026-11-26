@@ -819,8 +819,17 @@ func (s *Server) handleSABnzbdHistory(c *fiber.Ctx) error {
 			limit = val
 		}
 	}
-	// Cap the page size so a client cannot force a huge materialization.
-	const maxSABnzbdHistoryLimit = 1000
+	// Cap the page size so a client cannot force a huge materialization. The
+	// ceiling is the largest page an *arr requests while reconciling completed
+	// downloads: clamping it lower silently hides older completions, and the
+	// client treats a download it cannot find as never completed. Rows are
+	// still selected and paginated in SQL, so the cap bounds one response, not
+	// the query cost.
+	const maxSABnzbdHistoryLimit = 10000
+	// maxSABnzbdFailedRows bounds the failed rows appended to the first page.
+	// It is not the client's page size: the supplement only has to cover the
+	// failed downloads still inside FailedItemRetentionHours.
+	const maxSABnzbdFailedRows = 1000
 	if limit > maxSABnzbdHistoryLimit {
 		limit = maxSABnzbdHistoryLimit
 	}
@@ -858,7 +867,7 @@ func (s *Server) handleSABnzbdHistory(c *fiber.Ctx) error {
 	// failed row can therefore appear both here and at its own position on a
 	// later page.
 	if start == 0 {
-		failedRows, err := s.queueRepo.ListSABnzbdFailedHistory(ctx, categoryFilter, maxSABnzbdHistoryLimit)
+		failedRows, err := s.queueRepo.ListSABnzbdFailedHistory(ctx, categoryFilter, maxSABnzbdFailedRows)
 		if err != nil {
 			return s.writeSABnzbdErrorFiber(c, "Failed to get history")
 		}

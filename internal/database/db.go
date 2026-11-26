@@ -144,6 +144,10 @@ func runMigrations(db *sql.DB, d Dialect) error {
 
 	fixDevBranchMigrationConflict(db, d)
 
+	if err := reconcilePreAppliedMigrations(db, d); err != nil {
+		return fmt.Errorf("failed to reconcile pre-applied migrations: %w", err)
+	}
+
 	if err := goose.Up(db, migrationsDir); err != nil {
 		return fmt.Errorf("failed to run migrations: %w", err)
 	}
@@ -388,6 +392,64 @@ func fixDevBranchMigrationConflict(db *sql.DB, d Dialect) {
 			}
 		}
 	}
+}
+
+// reconcilePreAppliedMigrations records migrations whose schema change is already
+// present but whose goose version row is missing. A pre-release build can create a
+// column without recording its migration; goose then runs the same ALTER again,
+// fails with "duplicate column name", and never reaches later migrations. Doing
+// this before goose.Up keeps the plain SQL migration for clean installs while
+// letting a drifted database continue from where it already is.
+func reconcilePreAppliedMigrations(db *sql.DB, d Dialect) error {
+	if !hasTable(db, d, "goose_db_version") {
+		return nil
+	}
+
+	// Migration 066 adds import_queue.content_identity and
+	// idx_queue_content_identity. They are the only schema objects this branch
+	// adds, so a partially applied identity build cannot wedge anything else.
+	if err := reconcileContentIdentityMigration(db, d); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// reconcileContentIdentityMigration marks migration 066 as applied when its
+// column already exists. The index is created idempotently because goose skips
+// the migration file once the version is recorded, and the pre-applied build may
+// not have created it.
+func reconcileContentIdentityMigration(db *sql.DB, d Dialect) error {
+	const version int64 = 66
+
+	if !hasColumn(db, d, "import_queue", "content_identity") {
+		return nil
+	}
+
+	current, err := goose.GetDBVersion(db)
+	if err != nil {
+		return fmt.Errorf("read goose version: %w", err)
+	}
+	if current >= version {
+		return nil
+	}
+
+	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS idx_queue_content_identity ON import_queue(content_identity, file_size)"); err != nil {
+		return fmt.Errorf("create idx_queue_content_identity: %w", err)
+	}
+
+	var query string
+	if d == DialectPostgres {
+		query = "INSERT INTO goose_db_version (version_id, is_applied, tstamp) VALUES ($1, $2, CURRENT_TIMESTAMP)"
+	} else {
+		query = "INSERT INTO goose_db_version (version_id, is_applied, tstamp) VALUES (?, ?, CURRENT_TIMESTAMP)"
+	}
+	if _, err := db.Exec(query, version, true); err != nil {
+		return fmt.Errorf("record migration %d as applied: %w", version, err)
+	}
+
+	slog.Info("Recorded pre-applied migration", "version", version, "column", "import_queue.content_identity")
+	return nil
 }
 
 // Dialect returns the dialect helper for this database.

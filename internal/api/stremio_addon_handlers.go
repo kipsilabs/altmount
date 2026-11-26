@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
@@ -12,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -396,6 +396,7 @@ type stremioPlayCandidate struct {
 	Source      string
 	IndexerID   string
 	GUID        string
+	Size        int64 // indexer-reported size, used only when there is no GUID
 }
 
 type stremioReleaseRef struct {
@@ -403,12 +404,55 @@ type stremioReleaseRef struct {
 	ExpiresAt time.Time
 }
 
-func (s *Server) storeStremioReleaseRef(candidate stremioPlayCandidate) (string, error) {
-	var raw [32]byte
-	if _, err := rand.Read(raw[:]); err != nil {
-		return "", fmt.Errorf("generate Stremio release reference: %w", err)
+// stremioReleaseToken derives a play link's release token from the release
+// itself instead of from the listing that offered it. Every listing, every
+// reopened link and every process therefore presents the same token for the
+// same release, so a client that saved one play link keeps naming that release.
+//
+// The indexer and its GUID identify the release. An indexer that reports no
+// GUID falls back to the normalized release name and size. Tokens minted before
+// this scheme were random; they still resolve through the stored reference, and
+// a link whose token is unknown takes the same recovery path either way.
+func stremioReleaseToken(candidate stremioPlayCandidate) string {
+	identity := strings.ToLower(strings.TrimSpace(candidate.Source)) + "\x00" +
+		strings.ToLower(strings.TrimSpace(candidate.Indexer)) + "\x00"
+	if guid := strings.TrimSpace(candidate.GUID); guid != "" {
+		identity += strings.ToLower(guid)
+	} else {
+		identity += normalizeTitleForMatching(candidate.SafeTitle) + "\x00" + strconv.FormatInt(candidate.Size, 10)
 	}
-	token := fmt.Sprintf("%x", raw[:])
+	sum := sha256.Sum256([]byte(identity))
+	return fmt.Sprintf("r2-%x", sum[:16])
+}
+
+// stremioFailureKey is the process-local failure cache key for a release. The
+// stable release token is preferred because it does not change when a listing
+// renames the release; a candidate without one is remembered by its name.
+func stremioFailureKey(candidate stremioPlayCandidate) string {
+	if token := stremioReleaseToken(candidate); token != "" {
+		return token
+	}
+	return candidate.SafeTitle
+}
+
+// stremioFailureRemembered checks the process-local half of the exclusion set.
+// The stable token is the primary key; the sanitized name is still read because
+// records written by the older name-keyed paths remain valid until their TTL.
+func (s *Server) stremioFailureRemembered(candidate stremioPlayCandidate, ttl time.Duration) bool {
+	if s.stremioFailures.Has(stremioFailureKey(candidate), ttl) {
+		return true
+	}
+	return candidate.SafeTitle != "" && s.stremioFailures.Has(candidate.SafeTitle, ttl)
+}
+
+// stremioForgetFailure clears both keys a release may have been remembered under.
+func (s *Server) stremioForgetFailure(candidate stremioPlayCandidate) {
+	s.stremioFailures.Forget(stremioFailureKey(candidate))
+	s.stremioFailures.Forget(candidate.SafeTitle)
+}
+
+func (s *Server) storeStremioReleaseRef(candidate stremioPlayCandidate) (string, error) {
+	token := stremioReleaseToken(candidate)
 	s.stremioReleaseMu.Lock()
 	defer s.stremioReleaseMu.Unlock()
 	if s.stremioReleaseRefs == nil {
@@ -465,12 +509,20 @@ func (s *Server) consumeStremioReleaseRef(token string) (stremioPlayCandidate, b
 type stremioQueueMetadata struct {
 	ContentKey string `json:"content_key"`
 	ReleaseKey string `json:"release_key"`
-	IMDbID     string `json:"imdb_id,omitempty"`
-	Type       string `json:"type,omitempty"`
-	Season     int    `json:"season,omitempty"`
-	Episode    int    `json:"episode,omitempty"`
-	TMDBID     int    `json:"tmdbId,omitempty"`
-	TVDBID     int    `json:"tvdbId,omitempty"`
+	// ReleaseToken is the stable play-link token derived from the release. It
+	// outlives the listing's URL, so a play link whose URL-derived release key
+	// no longer matches can still find the import it names.
+	ReleaseToken string `json:"release_token,omitempty"`
+	// IndexerSize is the release size the indexer advertised when the row was
+	// admitted. It is the same quantity as a later listing's size, unlike
+	// import_queue.file_size, which records an NZB's encoded payload size.
+	IndexerSize int64  `json:"indexer_size,omitempty"`
+	IMDbID      string `json:"imdb_id,omitempty"`
+	Type        string `json:"type,omitempty"`
+	Season      int    `json:"season,omitempty"`
+	Episode     int    `json:"episode,omitempty"`
+	TMDBID      int    `json:"tmdbId,omitempty"`
+	TVDBID      int    `json:"tvdbId,omitempty"`
 }
 
 func stremioContentKey(streamType, imdbID string, selector *stremioEpisodeSelector) string {
@@ -543,7 +595,256 @@ func stremioQueueMetadataMatches(item *database.ImportQueueItem, contentKey, rel
 	return metadata.ContentKey == contentKey && metadata.ReleaseKey == releaseKey
 }
 
-func (s *Server) findActiveStremioContent(ctx context.Context, contentKey string) (*database.ImportQueueItem, error) {
+// stremioQueueItemReleaseToken returns the stable release token stored on a
+// queue item, when the row has one. Rows written before the token was stored
+// carry only the URL-derived release key and report false.
+func stremioQueueItemReleaseToken(item *database.ImportQueueItem) (string, bool) {
+	if item == nil || item.Metadata == nil || *item.Metadata == "" {
+		return "", false
+	}
+	var metadata stremioQueueMetadata
+	if json.Unmarshal([]byte(*item.Metadata), &metadata) != nil || metadata.ReleaseToken == "" {
+		return "", false
+	}
+	return metadata.ReleaseToken, true
+}
+
+// stremioSelectTokenRelease returns the completed row an exact stable release
+// token names. A stable token is derived from the release itself, so every
+// listing of that release produces the same one; several rows can share it
+// (for example a re-import), and the newest is the answer.
+func stremioSelectTokenRelease(rows []*database.ImportQueueItem, releaseToken string, ttlHours int) *database.ImportQueueItem {
+	if releaseToken == "" {
+		return nil
+	}
+	matches := make([]*database.ImportQueueItem, 0, 1)
+	for _, item := range rows {
+		if item == nil || !reusableCompletedImport(item, ttlHours) {
+			continue
+		}
+		storedToken, ok := stremioQueueItemReleaseToken(item)
+		if !ok || storedToken != releaseToken {
+			continue
+		}
+		matches = append(matches, item)
+	}
+	if len(matches) == 0 {
+		return nil
+	}
+	return stremioNewestCompleted(matches)
+}
+
+// stremioQueueItemNameMatches reports whether a completed row holds the release
+// whose normalized name is normTarget. A recovered play link that carries only
+// the release name can still resolve to the bytes already imported under that
+// name instead of searching and grabbing the release a second time.
+//
+// The importer's URL-hash suffix is removed from each basename first, so rows
+// written before the stable token existed -- whose nzb, target and storage names
+// all end in "-<url-hash>" -- are matched by the title the play link carries.
+func stremioQueueItemNameMatches(item *database.ImportQueueItem, normTarget string) bool {
+	if item == nil || normTarget == "" {
+		return false
+	}
+	names := []string{item.NzbPath}
+	for _, path := range []*string{item.TargetPath, item.StoragePath, item.RelativePath} {
+		if path != nil && *path != "" {
+			names = append(names, *path)
+		}
+	}
+	for _, name := range names {
+		if normalizeReleaseNameForMatching(name) == normTarget {
+			return true
+		}
+	}
+	return false
+}
+
+// stremioCompletedRowTimestamp is the timestamp that orders completed rows:
+// when the import finished, falling back to its last update or creation for
+// rows that predate completed_at. It matches the ordering used by the
+// duplicate-lookup queries.
+func stremioCompletedRowTimestamp(item *database.ImportQueueItem) time.Time {
+	if item.CompletedAt != nil {
+		return *item.CompletedAt
+	}
+	if !item.UpdatedAt.IsZero() {
+		return item.UpdatedAt
+	}
+	return item.CreatedAt
+}
+
+// stremioNewestCompleted returns the completed row that finished last. The
+// queue id breaks ties so the choice is deterministic when rows share a
+// timestamp.
+func stremioNewestCompleted(items []*database.ImportQueueItem) *database.ImportQueueItem {
+	var newest *database.ImportQueueItem
+	for _, item := range items {
+		if newest == nil {
+			newest = item
+			continue
+		}
+		itemAt, newestAt := stremioCompletedRowTimestamp(item), stremioCompletedRowTimestamp(newest)
+		if itemAt.After(newestAt) || (itemAt.Equal(newestAt) && item.ID > newest.ID) {
+			newest = item
+		}
+	}
+	return newest
+}
+
+// stremioIndexerAgrees reports whether the request and the completed row can be
+// the same release by indexer. A side that does not know its indexer cannot
+// disagree.
+func stremioIndexerAgrees(item *database.ImportQueueItem, requestIndexer string) bool {
+	requestIndexer = strings.TrimSpace(requestIndexer)
+	if requestIndexer == "" || item.Indexer == nil {
+		return true
+	}
+	rowIndexer := strings.TrimSpace(*item.Indexer)
+	return rowIndexer == "" || strings.EqualFold(rowIndexer, requestIndexer)
+}
+
+// stremioSelectRecoveredRelease picks the completed row a play link recovered
+// from its release name alone resolves to. It returns nil when the request does
+// not name exactly one release, and the caller searches instead.
+//
+// One completed row with the normalized name is that release. With several,
+// only rows carrying a content identity can be verified: they must all agree on
+// one identity, and the newest of them wins. Distinct identities, or rows with
+// no identity at all, mean the name could refer to any of them, so the match is
+// ambiguous and is never guessed. A known indexer that disagrees with a known
+// row indexer excludes that row for the same reason. Size only corroborates a
+// match between like-for-like values and never rejects a row whose recorded size
+// measures something else.
+func stremioSelectRecoveredRelease(rows []*database.ImportQueueItem, normTarget, requestIndexer string, requestSize int64, ttlHours int) *database.ImportQueueItem {
+	matches := make([]*database.ImportQueueItem, 0, len(rows))
+	for _, item := range rows {
+		if item == nil || !reusableCompletedImport(item, ttlHours) {
+			continue
+		}
+		if !stremioQueueItemNameMatches(item, normTarget) || !stremioIndexerAgrees(item, requestIndexer) {
+			continue
+		}
+		matches = append(matches, item)
+	}
+
+	switch len(matches) {
+	case 0:
+		return nil
+	case 1:
+		if !stremioSizeAgrees(matches[0], requestSize) {
+			return nil
+		}
+		return matches[0]
+	}
+
+	var identity string
+	verified := make([]*database.ImportQueueItem, 0, len(matches))
+	for _, item := range matches {
+		if item.ContentIdentity == nil || *item.ContentIdentity == "" {
+			continue
+		}
+		if identity == "" {
+			identity = *item.ContentIdentity
+		} else if *item.ContentIdentity != identity {
+			return nil
+		}
+		verified = append(verified, item)
+	}
+	if len(verified) == 0 {
+		return nil
+	}
+	verified = stremioSizeTieBreak(verified, requestSize)
+	if len(verified) == 0 {
+		return nil
+	}
+	return stremioNewestCompleted(verified)
+}
+
+// stremioQueueItemIndexerSize returns the indexer-declared release size stored on
+// a completed row, when the row was admitted after that value was recorded.
+// import_queue.file_size cannot be used for this: for an NZB it is the total
+// encoded payload of the articles (PAR2 recovery files excluded), while an
+// indexer reports the release as posted, which commonly includes PAR2. Those are
+// different quantities, so comparing them would reject the same release.
+func stremioQueueItemIndexerSize(item *database.ImportQueueItem) (int64, bool) {
+	if item == nil || item.Metadata == nil || *item.Metadata == "" {
+		return 0, false
+	}
+	var metadata stremioQueueMetadata
+	if json.Unmarshal([]byte(*item.Metadata), &metadata) != nil || metadata.IndexerSize <= 0 {
+		return 0, false
+	}
+	return metadata.IndexerSize, true
+}
+
+// stremioQueueItemDeclaredSize returns the completed row's release size when it
+// measures the same quantity as a listing's size. A recorded indexer size is the
+// indexer's own value. A STRM import's file_size is the media file's declared
+// length, which is also what an indexer advertises. An NZB row's file_size is
+// not: it is the encoded payload size, so it is never used here. A row written
+// before either value existed has no comparable size and reports false.
+func stremioQueueItemDeclaredSize(item *database.ImportQueueItem) (int64, bool) {
+	if item == nil {
+		return 0, false
+	}
+	if size, ok := stremioQueueItemIndexerSize(item); ok {
+		return size, true
+	}
+	if item.FileSize != nil && *item.FileSize > 0 &&
+		strings.HasSuffix(strings.ToLower(item.NzbPath), ".strm") {
+		return *item.FileSize, true
+	}
+	return 0, false
+}
+
+// stremioSizeAgrees reports whether a completed row can be the release the
+// request names by size. Size only corroborates a name-and-identity match: when
+// either side has no comparable size the check is skipped, so a legacy row whose
+// payload size differs from the listing's release size is still served.
+func stremioSizeAgrees(item *database.ImportQueueItem, requestSize int64) bool {
+	if requestSize <= 0 {
+		return true
+	}
+	size, ok := stremioQueueItemDeclaredSize(item)
+	return !ok || size == requestSize
+}
+
+// stremioSizeTieBreak chooses among rows that share one normalized name and one
+// content identity. Rows whose recorded release size matches the listing are
+// the strongest candidates; rows without a comparable size cannot disagree and
+// remain eligible. When every row records a comparable size and none matches,
+// the name does not resolve to the listing and the caller searches instead.
+func stremioSizeTieBreak(rows []*database.ImportQueueItem, requestSize int64) []*database.ImportQueueItem {
+	if requestSize <= 0 {
+		return rows
+	}
+	corroborated := make([]*database.ImportQueueItem, 0, len(rows))
+	unknown := make([]*database.ImportQueueItem, 0, len(rows))
+	for _, item := range rows {
+		size, ok := stremioQueueItemDeclaredSize(item)
+		switch {
+		case !ok:
+			unknown = append(unknown, item)
+		case size == requestSize:
+			corroborated = append(corroborated, item)
+		}
+	}
+	if len(corroborated) > 0 {
+		return corroborated
+	}
+	if len(unknown) > 0 {
+		return unknown
+	}
+	return nil
+}
+
+// findActiveStremioRelease returns the active Stremio import of contentKey that
+// is the release the request names, matched by its release key or its stable
+// token. A different active release of the same content is never returned: the
+// caller queues the requested release instead, so /play can only redirect to
+// the bytes the client asked for.
+func (s *Server) findActiveStremioRelease(ctx context.Context, contentKey, releaseKey, releaseToken string) (*database.ImportQueueItem, error) {
 	if s.queueRepo == nil || contentKey == "" {
 		return nil, nil
 	}
@@ -555,11 +856,18 @@ func (s *Server) findActiveStremioContent(ctx context.Context, contentKey string
 		if item == nil || item.DownloadID == nil || !strings.HasPrefix(*item.DownloadID, stremioDownloadIDPrefix) {
 			continue
 		}
-		if item.Metadata != nil {
-			var metadata stremioQueueMetadata
-			if json.Unmarshal([]byte(*item.Metadata), &metadata) == nil && metadata.ContentKey == contentKey {
-				return item, nil
-			}
+		if item.Metadata == nil {
+			continue
+		}
+		var metadata stremioQueueMetadata
+		if json.Unmarshal([]byte(*item.Metadata), &metadata) != nil || metadata.ContentKey != contentKey {
+			continue
+		}
+		if releaseKey != "" && metadata.ReleaseKey == releaseKey {
+			return item, nil
+		}
+		if releaseToken != "" && metadata.ReleaseToken == releaseToken {
+			return item, nil
 		}
 	}
 	return nil, nil
@@ -571,19 +879,7 @@ func (s *Server) findActiveStremioContent(ctx context.Context, contentKey string
 func normalizeTitleForMatching(s string) string {
 	s = strings.ReplaceAll(s, "\\", "/")
 	s = filepath.Base(s)
-	for {
-		orig := s
-		s = strings.TrimSuffix(s, ".gz")
-		s = strings.TrimSuffix(s, ".nzb")
-		s = strings.TrimSuffix(s, ".mkv")
-		s = strings.TrimSuffix(s, ".mp4")
-		s = strings.TrimSuffix(s, ".avi")
-		s = strings.TrimSuffix(s, ".iso")
-		s = strings.TrimSuffix(s, ".rar")
-		if s == orig {
-			break
-		}
-	}
+	s = stripMediaExtensions(s)
 
 	s = strings.ToLower(s)
 	var b strings.Builder
@@ -595,15 +891,89 @@ func normalizeTitleForMatching(s string) string {
 	return b.String()
 }
 
+// matchingExtensions are the wrappers normalizeTitleForMatching removes,
+// innermost last, so "release.nzb.gz" normalises to "release".
+var matchingExtensions = []string{".gz", ".nzb", ".mkv", ".mp4", ".avi", ".iso", ".rar"}
+
+func stripMediaExtensions(s string) string {
+	for {
+		orig := s
+		for _, ext := range matchingExtensions {
+			s = strings.TrimSuffix(s, ext)
+		}
+		if s == orig {
+			return s
+		}
+	}
+}
+
+// stremioImporterHashSuffix matches the "-<hex>" suffix stremioPlayNzbFilename
+// appends to a queued NZB (8 bytes of SHA-256 rendered as 16 hex digits), on a
+// basename whose media extension was already removed. The 8..64 length window
+// accepts the importer's hash and older or future hash lengths while refusing to
+// strip a short hex run that belongs to the release name, such as "-2024" or
+// "-1080". A non-hex or separately punctuated suffix is not the importer's.
+var stremioImporterHashSuffix = regexp.MustCompile(`-[0-9a-fA-F]{8,64}$`)
+
+// stremioQueueIDPrefix matches the queue id uniqueFailedNzbPath/persistentNzbPath
+// prepend when two imports share a basename: "<id>-<name>.nzb".
+var stremioQueueIDPrefix = regexp.MustCompile(`^\d+-`)
+
+// stripReleasePathDecorations removes everything the importer appends to a
+// stored basename: directory wrappers, media extensions, and the trailing
+// "-<url-hash>" suffix.
+func stripReleasePathDecorations(s string) string {
+	s = strings.ReplaceAll(s, "\\", "/")
+	s = filepath.Base(s)
+	s = stripMediaExtensions(s)
+	return stremioImporterHashSuffix.ReplaceAllString(s, "")
+}
+
+// normalizeReleaseNameForMatching normalises a stored path for comparison with
+// a recovered play link's release name.
+//
+// Legacy Stremio rows were named "<title>-<url-hash>.nzb", and their target and
+// storage basenames repeated the hashed name. normalizeTitleForMatching keeps
+// that hash as trailing alphanumerics, so the name can never equal the title the
+// play link carries. Removing the importer's "-<hex>" suffix first makes those
+// rows findable without loosening the strict name-and-identity rule.
+func normalizeReleaseNameForMatching(s string) string {
+	return normalizeTitleForMatching(stripReleasePathDecorations(s))
+}
+
+// normalizeStoredReleasePathForMatching returns the normalized names a stored
+// queue path can match. Failed and colliding rows can also carry a leading
+// "<queue-id>-", which is not part of the release name. Both forms are returned
+// because a release title may itself begin with digits and a dash, so stripping
+// the prefix must not be the only comparison.
+func normalizeStoredReleasePathForMatching(s string) []string {
+	name := stripReleasePathDecorations(s)
+	norm := normalizeTitleForMatching(name)
+	if norm == "" {
+		return nil
+	}
+	variants := []string{norm}
+	if withoutID := stremioQueueIDPrefix.ReplaceAllString(name, ""); withoutID != name {
+		if prefixNorm := normalizeTitleForMatching(withoutID); prefixNorm != "" && prefixNorm != norm {
+			variants = append(variants, prefixNorm)
+		}
+	}
+	return variants
+}
+
 // stremioNzbPathMatches checks if an NZB path matches a candidate title regardless of
 // case, punctuation, extensions, or directory wrappers using exact normalized equality.
 func stremioNzbPathMatches(nzbPath, safeTitle string) bool {
-	normA := normalizeTitleForMatching(nzbPath)
-	normB := normalizeTitleForMatching(safeTitle)
-	if normA == "" || normB == "" {
+	normB := normalizeReleaseNameForMatching(safeTitle)
+	if normB == "" {
 		return false
 	}
-	return normA == normB
+	for _, normA := range normalizeStoredReleasePathForMatching(nzbPath) {
+		if normA == normB {
+			return true
+		}
+	}
+	return false
 }
 
 // stremioCachedPredicate returns a test for "already imported and still usable":
@@ -620,23 +990,23 @@ func stremioCachedPredicate(cached []*database.ImportQueueItem, ttlHours int, no
 				continue
 			}
 		}
-		if norm := normalizeTitleForMatching(item.NzbPath); norm != "" {
+		for _, norm := range normalizeStoredReleasePathForMatching(item.NzbPath) {
 			normalizedCache[norm] = struct{}{}
 		}
 		if item.StoragePath != nil {
-			if norm := normalizeTitleForMatching(*item.StoragePath); norm != "" {
+			for _, norm := range normalizeStoredReleasePathForMatching(*item.StoragePath) {
 				normalizedCache[norm] = struct{}{}
 			}
 		}
 		if item.RelativePath != nil && *item.RelativePath != "" {
-			if norm := normalizeTitleForMatching(*item.RelativePath); norm != "" {
+			for _, norm := range normalizeStoredReleasePathForMatching(*item.RelativePath) {
 				normalizedCache[norm] = struct{}{}
 			}
 		}
 	}
 
 	return func(safeTitle string) bool {
-		target := normalizeTitleForMatching(safeTitle)
+		target := normalizeReleaseNameForMatching(safeTitle)
 		if target == "" {
 			return false
 		}
@@ -736,6 +1106,7 @@ func stremioCandidates(results []prowlarr.NZBResult, fallbackID string) []stremi
 			Source:      r.Source,
 			IndexerID:   strconv.Itoa(r.IndexerID),
 			GUID:        r.GUID,
+			Size:        r.Size,
 		})
 	}
 	return cands
@@ -949,10 +1320,22 @@ func (s *Server) searchStremioReleases(
 	var filtered []prowlarr.NZBResult
 	for _, sr := range scoredReleases {
 		safeTitle := sanitizeFilename(sr.Title)
-		if isFailed != nil && isFailed(safeTitle) {
+		idxID, _ := strconv.Atoi(sr.IndexerID)
+		candidate := stremioPlayCandidate{
+			Title:       sr.Title,
+			SafeTitle:   safeTitle,
+			DownloadURL: sr.DownloadURL,
+			Indexer:     sr.Indexer,
+			Source:      sr.Source,
+			IndexerID:   strconv.Itoa(idxID),
+			GUID:        sr.GUID,
+			Size:        sr.Size,
+		}
+		// The name carries the durable failed-row match; the stable token carries
+		// an import failure remembered after the listing changed.
+		if isFailed != nil && (isFailed(safeTitle) || isFailed(stremioFailureKey(candidate))) {
 			continue
 		}
-		idxID, _ := strconv.Atoi(sr.IndexerID)
 		filtered = append(filtered, prowlarr.NZBResult{
 			Title:       sr.Title,
 			DownloadURL: sr.DownloadURL,
@@ -1078,7 +1461,7 @@ func buildStremioStreamEntries(
 		candidate := stremioPlayCandidate{
 			Title: r.Title, SafeTitle: safeTitle, DownloadURL: r.DownloadURL,
 			Indexer: r.Indexer, IndexerID: strconv.Itoa(r.IndexerID), GUID: r.GUID,
-			Source: resultSource(r),
+			Source: resultSource(r), Size: r.Size,
 		}
 		releaseToken := ""
 		if len(releaseStores) > 0 {
@@ -1175,6 +1558,14 @@ func (s *Server) handleStremioAddonPlay(c *fiber.Ctx) error {
 	imdbID := c.Query("id")
 	streamType := c.Query("type")
 	cand, ok := s.consumeStremioReleaseRef(releaseToken)
+	// A link recovered from its release name alone carries no release
+	// identity, only content and the name the release was listed under.
+	recoveredByName := false
+	// recoveredToken is the stable token a recovered link still carries. A
+	// stable token is deterministic, so it names the release across a restart
+	// even though the in-memory reference is gone. A token minted by the old
+	// random scheme is not deterministic and falls through to name matching.
+	recoveredToken := ""
 	if !ok {
 		// Stremio saves the stream a title was played with and replays that
 		// link on resume, long after its release token expired. Recover from
@@ -1182,6 +1573,9 @@ func (s *Server) handleStremioAddonPlay(c *fiber.Ctx) error {
 		// instead of failing.
 		if imdbID == "" {
 			return RespondBadRequest(c, "Invalid or expired release parameter", "")
+		}
+		if strings.HasPrefix(releaseToken, "r2-") {
+			recoveredToken = releaseToken
 		}
 		cand = stremioPlayCandidate{}
 		if title := c.Query("title"); title != "" {
@@ -1196,6 +1590,8 @@ func (s *Server) handleStremioAddonPlay(c *fiber.Ctx) error {
 			cand.DownloadURL = downloadURL
 			cand.Indexer = c.Query("indexer")
 			cand.Source = c.Query("source")
+		} else {
+			recoveredByName = cand.SafeTitle != ""
 		}
 		slog.InfoContext(ctx, "Recovering Stremio play link with an expired release token",
 			"imdb_id", imdbID, "title", cand.SafeTitle, "has_release_url", cand.DownloadURL != "")
@@ -1206,8 +1602,9 @@ func (s *Server) handleStremioAddonPlay(c *fiber.Ctx) error {
 
 	// A live release token names one exact release, and so does a recovered
 	// link that still carries its NZB URL. A link recovered from the release
-	// name alone names only the content, so it has no release identity to
-	// match a cached file against.
+	// name alone names the release by name; the cached-row lookup below matches
+	// that name exactly after normalisation instead of treating the title as a
+	// release key.
 	explicitRelease := cand.DownloadURL != ""
 	releaseKey := stremioReleaseKey(cand)
 
@@ -1233,41 +1630,115 @@ func (s *Server) handleStremioAddonPlay(c *fiber.Ctx) error {
 			}
 		}
 	}
-	// Only a request with release identity may reuse cached bytes: the queued
-	// file of the exact release it names, matched by the release key stored on
-	// the row. A sanitized title is not identity (mirrored releases share it
-	// while serving different files), so a link recovered from its title alone
-	// searches again instead of redirecting to a title-matched file.
-	if normTarget != "" && explicitRelease {
-		if cachedItems, err := s.queueRepo.GetCachedStremioQueueItems(ctx, cfg.Stremio.EffectiveIncludeLibraryStreams(), cfg.Stremio.NzbTTLHours); err == nil {
-			for _, prev := range cachedItems {
-				if prev == nil || prev.StoragePath == nil || *prev.StoragePath == "" {
-					continue
-				}
-				if ttlHours > 0 && prev.CompletedAt != nil && time.Since(*prev.CompletedAt) >= time.Duration(ttlHours)*time.Hour {
-					continue
-				}
-				// Rows written before release keys existed cannot prove which
-				// release they hold, so they are skipped as well.
-				storedKey, keyed := stremioQueueItemReleaseKey(prev)
-				if !keyed || storedKey != releaseKey {
-					continue
-				}
+	// The request's indexer is the live release's own when the token is live or
+	// the link still carries its NZB URL, and the query parameter otherwise.
+	requestIndexer := strings.TrimSpace(cand.Indexer)
+	if requestIndexer == "" {
+		requestIndexer = strings.TrimSpace(c.Query("indexer"))
+	}
+	// A stable token names the release across listings even when the URL that
+	// produced its release key has changed.
+	stableReleaseToken := stremioReleaseToken(cand)
+	tryServe := func(prev *database.ImportQueueItem, matchedBy string) (bool, error) {
+		if prev == nil {
+			return false, nil
+		}
+		streams, err := s.buildStremioStreams(ctx, prev, baseURL, key, cand.SafeTitle, selector)
+		if err != nil || len(streams) == 0 {
+			return false, nil
+		}
+		slog.InfoContext(ctx, "Returning cached Stremio stream",
+			"nzb_name", cand.SafeTitle, "matched_path", prev.NzbPath, "indexer", prev.Indexer,
+			"matched_by", matchedBy, "recovered_by_name", matchedBy == "release_name")
+		return true, c.Redirect(streams[0].URL, fiber.StatusFound)
+	}
 
-				if streams, err := s.buildStremioStreams(ctx, prev, baseURL, key, cand.SafeTitle, selector); err == nil && len(streams) > 0 {
-					slog.InfoContext(ctx, "Returning cached Stremio stream",
-						"nzb_name", cand.SafeTitle, "matched_path", prev.NzbPath, "indexer", cand.Indexer)
-					return c.Redirect(streams[0].URL, fiber.StatusFound)
+	// Reuse cached bytes only for the release a request names. A live token or
+	// a recovered link carrying its NZB URL names an exact release through its
+	// release key. A recovered link's own stable token names the release across
+	// a restart even when its URL key no longer matches. A link recovered from
+	// the release name alone names the release by name, so a completed row is
+	// served only when that name and its verified identity resolve to one
+	// release; an ambiguous name still searches instead of guessing between
+	// same-titled rows.
+	if recoveredToken != "" || (normTarget != "" && (explicitRelease || recoveredByName)) {
+		if cachedItems, err := s.queueRepo.GetCachedStremioQueueItems(ctx, cfg.Stremio.EffectiveIncludeLibraryStreams(), cfg.Stremio.NzbTTLHours); err == nil {
+			if recoveredToken != "" {
+				// The saved link still names its release. Check the token
+				// before the name rule: a legacy row's hashed basenames defeat
+				// the name, while a token minted by the old random scheme simply
+				// misses here and falls through.
+				prev := stremioSelectTokenRelease(cachedItems, recoveredToken, ttlHours)
+				if served, err := tryServe(prev, "release_token"); served {
+					return err
+				}
+			}
+			if recoveredByName {
+				prev := stremioSelectRecoveredRelease(cachedItems, normTarget,
+					requestIndexer, cand.Size, ttlHours)
+				if served, err := tryServe(prev, "release_name"); served {
+					return err
+				}
+			} else if explicitRelease {
+				keyMatched := false
+				for _, prev := range cachedItems {
+					if prev == nil || !reusableCompletedImport(prev, ttlHours) {
+						continue
+					}
+					// Rows written before release keys existed cannot prove
+					// which release they hold, so they are skipped as well.
+					storedKey, keyed := stremioQueueItemReleaseKey(prev)
+					if !keyed || storedKey != releaseKey {
+						continue
+					}
+					keyMatched = true
+					if served, err := tryServe(prev, "release_key"); served {
+						return err
+					}
+				}
+				if !keyMatched {
+					// The URL changed while the release did not. Try the stable
+					// token first, then the strict name-and-identity rule, so an
+					// already-completed release is not fetched again.
+					prev := stremioSelectTokenRelease(cachedItems, stableReleaseToken, ttlHours)
+					if served, err := tryServe(prev, "release_token"); served {
+						return err
+					}
+					prev = stremioSelectRecoveredRelease(cachedItems, normTarget,
+						requestIndexer, cand.Size, ttlHours)
+					if served, err := tryServe(prev, "release_name"); served {
+						return err
+					}
+				}
+			}
+		}
+		if recoveredToken != "" {
+			// An import already running for this exact release is awaited
+			// instead of being queued a second time.
+			contentKey := stremioContentKey(streamType, imdbID, selector)
+			active, err := s.findActiveStremioRelease(ctx, contentKey, "", recoveredToken)
+			if err != nil {
+				slog.WarnContext(ctx, "Failed to look up the recovered release's active import",
+					"error", err, "release_token", recoveredToken)
+			} else if active != nil {
+				out := s.waitForStream(ctx, active.ID, baseURL, key, cand.SafeTitle, selector, stremioPlayBudget)
+				switch out.Kind {
+				case streamOutcomeReady:
+					return c.Redirect(out.StreamURL, fiber.StatusFound)
+				case streamOutcomeFailed, streamOutcomeNoStreams:
+					// The active import ended without playable bytes; search
+					// again instead of attaching to a dead row.
+				default:
+					return respondStreamOutcome(c, out)
 				}
 			}
 		}
 	}
 
 	if cand.DownloadURL == "" {
-		// A recovered link has no release to download: find it again. This is
-		// preferred over serving a title-matched cached file, whose release
-		// cannot be verified.
-		found, _ := s.findStremioCandidate(ctx, cfg, streamType, imdbID, selector, cand.SafeTitle)
+		// Nothing completed matches the recovered release name: find the
+		// release again, by its stable token when it has one, else by name.
+		found, _ := s.findStremioCandidate(ctx, cfg, streamType, imdbID, selector, cand.SafeTitle, releaseToken)
 		if found == nil {
 			return RespondServiceUnavailable(c, "No playable release found", "the play link expired and a new search found nothing")
 		}
@@ -1286,12 +1757,14 @@ func (s *Server) handleStremioAddonPlay(c *fiber.Ctx) error {
 // findStremioCandidate searches again for a content id and returns the
 // release named safeTitle when the search still offers it (matched true),
 // otherwise the top-ranked release, or nil when the search finds nothing.
+// releaseToken, when it belongs to the stable token scheme, wins over the name:
+// it identifies the release even if the indexer renamed it between listings.
 func (s *Server) findStremioCandidate(
 	ctx context.Context,
 	cfg *config.Config,
 	streamType, imdbID string,
 	selector *stremioEpisodeSelector,
-	safeTitle string,
+	safeTitle, releaseToken string,
 ) (cand *stremioPlayCandidate, matched bool) {
 	prowlarrType := "search"
 	switch streamType {
@@ -1308,12 +1781,19 @@ func (s *Server) findStremioCandidate(
 	if err != nil {
 		slog.WarnContext(ctx, "Stremio search for an expired play link failed", "error", err, "imdb_id", imdbID)
 	}
-	return pickStremioCandidate(stremioCandidates(results, imdbID), safeTitle)
+	return pickStremioCandidate(stremioCandidates(results, imdbID), safeTitle, releaseToken)
 }
 
-// pickStremioCandidate returns the candidate named safeTitle (matched true),
-// else the first, else nil.
-func pickStremioCandidate(cands []stremioPlayCandidate, safeTitle string) (*stremioPlayCandidate, bool) {
+// pickStremioCandidate returns the release the play link names, then the
+// release named safeTitle, then the first release, else nil.
+func pickStremioCandidate(cands []stremioPlayCandidate, safeTitle, releaseToken string) (*stremioPlayCandidate, bool) {
+	if releaseToken != "" && strings.HasPrefix(releaseToken, "r2-") {
+		for i := range cands {
+			if stremioReleaseToken(cands[i]) == releaseToken {
+				return &cands[i], true
+			}
+		}
+	}
 	if safeTitle != "" {
 		for i := range cands {
 			if cands[i].SafeTitle == safeTitle {
@@ -1345,6 +1825,63 @@ const (
 	// stremioMinAttemptBudget is the minimum time left worth starting another attempt.
 	stremioMinAttemptBudget = 20 * time.Second
 )
+
+// stremioPlayAttempts records the release tokens one /play request has already
+// tried to fetch. Its scope is one playStremioWithFallback call -- one fallback
+// burst -- so a fallback list that repeats a release fetches it once. A later,
+// separate /play request starts empty and may try that release once more; the
+// active and completed row lookups decide whether that becomes another fetch.
+type stremioPlayAttempts map[string]struct{}
+
+// begin reports whether the token may be fetched and records the attempt. An
+// empty token cannot identify a release, so it is never deduplicated.
+func (a stremioPlayAttempts) begin(token string) bool {
+	if token == "" {
+		return true
+	}
+	if _, tried := a[token]; tried {
+		return false
+	}
+	a[token] = struct{}{}
+	return true
+}
+
+// stremioServeCompletedToken redirects to a completed import that already holds
+// the candidate's stable release token. It runs before each fallback attempt, so
+// a candidate whose import finished while an earlier candidate was being waited
+// on is served from storage instead of being fetched a second time.
+func (s *Server) stremioServeCompletedToken(
+	c *fiber.Ctx,
+	cfg *config.Config,
+	cand stremioPlayCandidate,
+	req playRequest,
+) (bool, error) {
+	ctx := c.Context()
+	if s.queueRepo == nil {
+		return false, nil
+	}
+	token := stremioReleaseToken(cand)
+	if token == "" {
+		return false, nil
+	}
+	rows, err := s.queueRepo.GetCachedStremioQueueItems(ctx,
+		cfg.Stremio.EffectiveIncludeLibraryStreams(), cfg.Stremio.NzbTTLHours)
+	if err != nil {
+		return false, nil
+	}
+	prev := stremioSelectTokenRelease(rows, token, cfg.Stremio.NzbTTLHours)
+	if prev == nil {
+		return false, nil
+	}
+	streams, err := s.buildStremioStreams(ctx, prev, req.baseURL, req.key, cand.SafeTitle, req.selector)
+	if err != nil || len(streams) == 0 {
+		return false, nil
+	}
+	slog.InfoContext(ctx, "Returning completed Stremio release instead of fetching the release again",
+		"title", cand.SafeTitle, "queue_id", prev.ID, "matched_by", "release_token")
+	s.stremioForgetFailure(cand)
+	return true, c.Redirect(streams[0].URL, fiber.StatusFound)
+}
 
 // playStremioWithFallback queues the requested release and waits for it, advancing to
 // the next candidate release when one fails. Without this, a release that fails is
@@ -1412,31 +1949,54 @@ func (s *Server) playStremioWithFallback(
 	deadline := time.Now().Add(stremioPlayBudget)
 	maxAttempts := 1 + cfg.Stremio.EffectiveMaxFallbackReleases()
 	attempts := 0
-
-	// A stale client-cached stream list can point straight at a release we already know
-	// is bad. Skip the download entirely and start from the next candidate.
-	if s.stremioIsFailed(ctx, cfg, cand.SafeTitle) {
-		slog.InfoContext(ctx, "Skipping known-failed Stremio release", "title", cand.SafeTitle)
-		if !advance() {
-			season, episode := 0, 0
-			if req.selector != nil {
-				season, episode = req.selector.Season, req.selector.Episode
-			}
-			if libraryStreams := s.findHealthyLibraryStreams(ctx, cfg, req.streamType, req.imdbID, req.baseURL, req.key, season, episode); len(libraryStreams) > 0 {
-				if libURL, ok := libraryStreams[0]["url"].(string); ok && libURL != "" {
-					slog.InfoContext(ctx, "Falling back to healthy local library stream",
-						"imdb_id", req.imdbID, "library_url", libURL)
-					return c.Redirect(libURL, fiber.StatusFound)
-				}
-			}
-			return RespondServiceUnavailable(c, "No playable release found", "release previously failed")
-		}
-	}
+	// attempted lives for this one /play request: a fallback burst fetches each
+	// release token at most once, while a later request starts a new burst.
+	attempted := make(stremioPlayAttempts)
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		remaining := time.Until(deadline)
 		if attempt > 1 && remaining < stremioMinAttemptBudget {
 			break
+		}
+
+		// A candidate whose import already completed under its stable token is
+		// served, never fetched again. It runs before the failed-release check so
+		// a genuinely playable file always wins over a stale failure record.
+		if served, err := s.stremioServeCompletedToken(c, cfg, cand, req); served || err != nil {
+			return err
+		}
+
+		// A stale client-cached stream list, or a fallback search, can point at a
+		// release we already know is bad. Check every candidate -- not only the
+		// first -- before anything is fetched. A candidate this burst already
+		// tried is skipped too: retrying the same release inside one play cannot
+		// succeed when the request that just tried it did not, and a fallback list
+		// can repeat the same release.
+		if s.stremioIsFailed(ctx, cfg, cand) {
+			slog.InfoContext(ctx, "Skipping known-failed Stremio release", "title", cand.SafeTitle)
+			if !advance() {
+				season, episode := 0, 0
+				if req.selector != nil {
+					season, episode = req.selector.Season, req.selector.Episode
+				}
+				if libraryStreams := s.findHealthyLibraryStreams(ctx, cfg, req.streamType, req.imdbID, req.baseURL, req.key, season, episode); len(libraryStreams) > 0 {
+					if libURL, ok := libraryStreams[0]["url"].(string); ok && libURL != "" {
+						slog.InfoContext(ctx, "Falling back to healthy local library stream",
+							"imdb_id", req.imdbID, "library_url", libURL)
+						return c.Redirect(libURL, fiber.StatusFound)
+					}
+				}
+				return RespondServiceUnavailable(c, "No playable release found", "release previously failed")
+			}
+			continue
+		}
+		if !attempted.begin(stremioReleaseToken(cand)) {
+			slog.InfoContext(ctx, "Skipping a Stremio release already attempted in this play",
+				"imdb_id", req.imdbID, "title", cand.SafeTitle)
+			if !advance() {
+				break
+			}
+			continue
 		}
 		attempts++
 
@@ -1468,7 +2028,7 @@ func (s *Server) playStremioWithFallback(
 		switch out.Kind {
 		case streamOutcomeReady:
 			// Self-healing: a release that plays is no longer excluded.
-			s.stremioFailures.Forget(cand.SafeTitle)
+			s.stremioForgetFailure(cand)
 			return c.Redirect(out.StreamURL, fiber.StatusFound)
 
 		case streamOutcomeNoStreams:
@@ -1491,7 +2051,11 @@ func (s *Server) playStremioWithFallback(
 			}
 
 		case streamOutcomeFailed:
-			// The failed import_queue row already records this durably.
+			// The failed import_queue row records this durably, but its path can
+			// carry the importer's URL hash and a queue-id prefix. Remember the
+			// release by its stable token too, so a later request matches it
+			// without depending on the filename.
+			s.stremioFailures.Record(stremioFailureKey(cand))
 			if !advance() {
 				season, episode := 0, 0
 				if req.selector != nil {
@@ -1533,8 +2097,8 @@ func (s *Server) playStremioWithFallback(
 
 // stremioIsFailed reports whether a release is currently excluded, consulting both the
 // durable (import_queue) and process-local halves of the exclusion set.
-func (s *Server) stremioIsFailed(ctx context.Context, cfg *config.Config, safeTitle string) bool {
-	if s.stremioFailures.Has(safeTitle, stremioFailedTTL(cfg)) {
+func (s *Server) stremioIsFailed(ctx context.Context, cfg *config.Config, cand stremioPlayCandidate) bool {
+	if s.stremioFailureRemembered(cand, stremioFailedTTL(cfg)) {
 		return true
 	}
 	if s.queueRepo == nil {
@@ -1544,7 +2108,7 @@ func (s *Server) stremioIsFailed(ctx context.Context, cfg *config.Config, safeTi
 	if err != nil {
 		return false
 	}
-	return stremioFailedPredicate(failed, nil, cfg.Stremio.FailedReleaseTTLHours, time.Now())(safeTitle)
+	return stremioFailedPredicate(failed, nil, cfg.Stremio.FailedReleaseTTLHours, time.Now())(cand.SafeTitle)
 }
 
 // enqueueStremioRelease downloads the NZB and adds it to the import queue, coalescing
@@ -1565,6 +2129,7 @@ func (s *Server) enqueueStremioRelease(
 	ttlHours := cfg.Stremio.NzbTTLHours
 	contentKey := stremioContentKey(streamType, imdbID, selector)
 	releaseKey := stremioReleaseKey(cand)
+	releaseToken := stremioReleaseToken(cand)
 
 	var indexerPtr *string
 	if cand.Indexer != "" {
@@ -1574,11 +2139,11 @@ func (s *Server) enqueueStremioRelease(
 
 	queue := func() (interface{}, error) {
 		if contentKey != "" {
-			active, findErr := s.findActiveStremioContent(ctx, contentKey)
+			active, findErr := s.findActiveStremioRelease(ctx, contentKey, releaseKey, releaseToken)
 			if findErr != nil {
-				return nil, fmt.Errorf("find active Stremio content: %w", findErr)
+				return nil, fmt.Errorf("find active Stremio release: %w", findErr)
 			}
-			if active != nil && stremioQueueMetadataMatches(active, contentKey, releaseKey) {
+			if active != nil {
 				return active.ID, nil
 			}
 			// Another release of this content is importing. Never attach this
@@ -1610,11 +2175,7 @@ func (s *Server) enqueueStremioRelease(
 					case database.QueueStatusPending, database.QueueStatusProcessing, database.QueueStatusPaused:
 						return it.ID, nil
 					case database.QueueStatusCompleted:
-						reusable := it.StoragePath != nil && *it.StoragePath != ""
-						if reusable && ttlHours > 0 && it.CompletedAt != nil {
-							reusable = time.Since(*it.CompletedAt) < time.Duration(ttlHours)*time.Hour
-						}
-						if reusable {
+						if reusableCompletedImport(it, ttlHours) {
 							return it.ID, nil
 						}
 					}
@@ -1671,12 +2232,14 @@ func (s *Server) enqueueStremioRelease(
 			}
 			stremioDownloadID := stremioDownloadIDPrefix + uuid.NewString()
 			metaJSONPtr, metadataErr := encodeStremioQueueMetadata(stremioQueueMetadata{
-				ContentKey: contentKey,
-				ReleaseKey: releaseKey,
-				IMDbID:     imdbID,
-				Type:       streamType,
-				TMDBID:     tmdbID,
-				TVDBID:     tvdbID,
+				ContentKey:   contentKey,
+				ReleaseKey:   releaseKey,
+				ReleaseToken: releaseToken,
+				IndexerSize:  cand.Size,
+				IMDbID:       imdbID,
+				Type:         streamType,
+				TMDBID:       tmdbID,
+				TVDBID:       tvdbID,
 			})
 			if metadataErr != nil {
 				return nil, fmt.Errorf("failed to encode Stremio queue metadata: %w", metadataErr)

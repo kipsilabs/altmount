@@ -63,3 +63,43 @@ func TestStremioReleaseLifetime(t *testing.T) {
 	assert.Equal(t, time.Hour, releaseRefServer(60).stremioReleaseLifetime(), "never below an hour")
 	assert.Equal(t, 24*time.Hour, (&Server{}).stremioReleaseLifetime(), "no config manager")
 }
+
+// A release token is derived from the release, so a listing, a reopened play
+// link and a restart all present the same value for the same release.
+func TestStremioReleaseTokenIsStable(t *testing.T) {
+	s := releaseRefServer(0)
+	cand := stremioPlayCandidate{
+		Title:     "Film.2024.1080p.WEB-DL-GRP",
+		SafeTitle: sanitizeFilename("Film.2024.1080p.WEB-DL-GRP"),
+		Indexer:   "Idx",
+		Source:    "prowlarr",
+		GUID:      "guid-a",
+		Size:      100,
+	}
+
+	first, err := s.storeStremioReleaseRef(cand)
+	require.NoError(t, err)
+	second, err := s.storeStremioReleaseRef(cand)
+	require.NoError(t, err)
+	assert.Equal(t, first, second, "the same release presents the same token to every listing")
+	assert.Equal(t, first, stremioReleaseToken(cand), "the token does not depend on the listing")
+
+	other := cand
+	other.GUID = "guid-b"
+	assert.NotEqual(t, first, stremioReleaseToken(other), "a different GUID is a different release")
+
+	// An indexer that reports no GUID falls back to the release name and size.
+	noGUID := cand
+	noGUID.GUID = ""
+	assert.Equal(t, stremioReleaseToken(noGUID), stremioReleaseToken(noGUID))
+	bySize := noGUID
+	bySize.Size = 200
+	assert.NotEqual(t, stremioReleaseToken(noGUID), stremioReleaseToken(bySize))
+
+	// A token minted by the previous scheme still resolves while it lives.
+	legacy := "0123456789abcdef0123456789abcdef"
+	s.stremioReleaseRefs[legacy] = stremioReleaseRef{Candidate: cand, ExpiresAt: time.Now().Add(time.Hour)}
+	got, ok := s.consumeStremioReleaseRef(legacy)
+	require.True(t, ok)
+	assert.Equal(t, cand.Title, got.Title)
+}
