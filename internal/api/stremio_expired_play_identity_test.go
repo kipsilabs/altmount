@@ -21,6 +21,7 @@ import (
 	"github.com/kipsilabs/altmount/internal/auth"
 	"github.com/kipsilabs/altmount/internal/config"
 	"github.com/kipsilabs/altmount/internal/database"
+	"github.com/kipsilabs/altmount/internal/progress"
 )
 
 const expiredPlayTitle = "Same.Release.Title.2024.1080p.WEB-DL"
@@ -95,10 +96,11 @@ func newExpiredPlayServer(t *testing.T) *expiredPlayServer {
 	cfg.Stremio.NzbTTLHours = 24
 
 	server := &Server{
-		configManager:   &mockConfigManager{cfg: cfg},
-		userRepo:        userRepo,
-		queueRepo:       database.NewRepository(db.Connection(), database.DialectSQLite),
-		stremioFailures: newStremioFailureCache(),
+		configManager:       &mockConfigManager{cfg: cfg},
+		userRepo:            userRepo,
+		queueRepo:           database.NewRepository(db.Connection(), database.DialectSQLite),
+		stremioFailures:     newStremioFailureCache(),
+		progressBroadcaster: progress.NewProgressBroadcaster(),
 	}
 	app := fiber.New()
 	app.Get("/stremio/:key/play", server.handleStremioAddonPlay)
