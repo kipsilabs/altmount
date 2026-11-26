@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -36,12 +37,13 @@ type expiredPlayRow struct {
 // expiredPlayServer is a Stremio server whose indexer answers every search with
 // one same-titled release, plus the database used to seed completed imports.
 type expiredPlayServer struct {
-	app      *fiber.App
-	key      string
-	db       *sql.DB
-	ctx      context.Context
-	searches *atomic.Int32
-	server   *Server
+	app         *fiber.App
+	key         string
+	db          *sql.DB
+	ctx         context.Context
+	searches    *atomic.Int32
+	indexerBody *atomic.Value
+	server      *Server
 }
 
 func newExpiredPlayServer(t *testing.T) *expiredPlayServer {
@@ -64,10 +66,12 @@ func newExpiredPlayServer(t *testing.T) *expiredPlayServer {
 	t.Cleanup(resetSeriesMetadataCaches)
 
 	searches := &atomic.Int32{}
+	indexerBody := &atomic.Value{}
+	indexerBody.Store(`[{"title":"` + expiredPlayTitle + `","downloadUrl":"https://indexer.example/release-c.nzb","protocol":"usenet"}]`)
 	indexer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		searches.Add(1)
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`[{"title":"` + expiredPlayTitle + `","downloadUrl":"https://indexer.example/release-c.nzb","protocol":"usenet"}]`))
+		_, _ = w.Write([]byte(indexerBody.Load().(string)))
 	}))
 	t.Cleanup(indexer.Close)
 
@@ -98,13 +102,19 @@ func newExpiredPlayServer(t *testing.T) *expiredPlayServer {
 	app.Get("/stremio/:key/play", server.handleStremioAddonPlay)
 
 	return &expiredPlayServer{
-		app:      app,
-		key:      auth.HashAPIKey(apiKey),
-		db:       db.Connection(),
-		ctx:      ctx,
-		searches: searches,
-		server:   server,
+		app:         app,
+		key:         auth.HashAPIKey(apiKey),
+		db:          db.Connection(),
+		ctx:         ctx,
+		searches:    searches,
+		indexerBody: indexerBody,
+		server:      server,
 	}
+}
+
+// setIndexerResults replaces the JSON body the fixture's indexer returns.
+func (s *expiredPlayServer) setIndexerResults(body string) {
+	s.indexerBody.Store(body)
 }
 
 func (s *expiredPlayServer) insertCompleted(t *testing.T, row expiredPlayRow) {
@@ -255,6 +265,22 @@ func TestStremioPlayExpiredTokenWithoutURLSelectsOneCompletedRelease(t *testing.
 			wantServed:     storagePath("only"),
 		},
 		{
+			// Rows written before the stable token existed name every path
+			// basename "<title>-<url-hash>"; the recovered title does not carry
+			// that hash. The importer suffix is normalised away, so the row is
+			// still the one release the play link names.
+			name:           "legacy row with the importer url hash in its basenames is served",
+			requestIndexer: requestIndexer,
+			rows: []expiredPlayRow{{
+				nzbPath:         "/config/.nzbs/Movies/" + sanitizeFilename(expiredPlayTitle) + "-71ceade2e434b5dd.nzb",
+				storagePath:     "/complete/" + sanitizeFilename(expiredPlayTitle) + "-71ceade2e434b5dd/" + sanitizeFilename(expiredPlayTitle) + "-71ceade2e434b5dd.mkv",
+				completedAt:     now,
+				contentIdentity: strPtr("identity-1"),
+				indexer:         strPtr(requestIndexer),
+			}},
+			wantServed: "/complete/" + sanitizeFilename(expiredPlayTitle) + "-71ceade2e434b5dd/" + sanitizeFilename(expiredPlayTitle) + "-71ceade2e434b5dd.mkv",
+		},
+		{
 			name:           "newest row with one shared identity is served",
 			requestIndexer: requestIndexer,
 			rows: []expiredPlayRow{
@@ -322,6 +348,107 @@ func TestStremioPlayExpiredTokenWithoutURLSelectsOneCompletedRelease(t *testing.
 			require.Equal(t, tt.wantServed, location.Query().Get("path"),
 				"the completed release is served from storage, not searched again")
 			assert.Zero(t, s.searches.Load(), "a resolved completed release must not search")
+		})
+	}
+}
+
+// A play link saved before a restart still carries its stable release token.
+// Recovery must compare that token with the stored release_token before falling
+// back to the release name: the in-memory reference is gone, and a legacy row's
+// hashed basenames cannot match the title. A token minted by the old random
+// scheme is not stable and falls through to the name rule instead.
+func TestStremioPlayRecoveredTokenSurvivesRestart(t *testing.T) {
+	s := newExpiredPlayServer(t)
+
+	cand := stremioPlayCandidate{
+		Title:       expiredPlayTitle,
+		SafeTitle:   sanitizeFilename(expiredPlayTitle),
+		DownloadURL: "https://indexer.example/api?t=get&id=release-restart",
+		Indexer:     "Indexer",
+		Source:      "prowlarr",
+		GUID:        "release-restart-guid",
+	}
+	token := stremioReleaseToken(cand)
+	require.True(t, strings.HasPrefix(token, "r2-"))
+
+	// The row was imported under the same release, but its URL-derived release
+	// key is stale and its basenames carry the importer's url hash.
+	metadataJSON, err := encodeStremioQueueMetadata(stremioQueueMetadata{
+		ContentKey:   "movie:tt123:0:0",
+		ReleaseKey:   "stale-url-derived-key",
+		ReleaseToken: token,
+		IMDbID:       "tt123",
+		Type:         "movie",
+	})
+	require.NoError(t, err)
+	storage := "/complete/" + cand.SafeTitle + "-71ceade2e434b5dd/" + cand.SafeTitle + "-71ceade2e434b5dd.mkv"
+	s.insertCompleted(t, expiredPlayRow{
+		nzbPath:     "/config/.nzbs/Movies/" + cand.SafeTitle + "-71ceade2e434b5dd.nzb",
+		storagePath: storage,
+		metadata:    metadataJSON,
+		completedAt: time.Now(),
+	})
+
+	// No title and no url: only the saved token can name the release. This is
+	// exactly the state after an Altmount restart, when stremioReleaseRefs is
+	// empty and the link's token is no longer resolvable in memory.
+	resp := s.play(t, "release="+url.QueryEscape(token)+"&type=movie&id=tt123")
+	require.Equal(t, http.StatusFound, resp.StatusCode,
+		"a saved stable token must find its completed release after a restart")
+	location, err := url.Parse(resp.Header.Get("Location"))
+	require.NoError(t, err)
+	require.Equal(t, "/api/files/stream", location.Path)
+	require.Equal(t, storage, location.Query().Get("path"))
+	assert.Zero(t, s.searches.Load(), "the recovered release must not be searched or fetched again")
+}
+
+// A short hex run that belongs to the release name, or a suffix the importer
+// did not append, stays part of the name. Only the importer's trailing
+// "-<url-hash>" is removed.
+func TestNormalizeReleaseNameForMatchingSuffix(t *testing.T) {
+	title := normalizeTitleForMatching(expiredPlayTitle)
+	year := normalizeTitleForMatching("Blade.Runner.2049")
+
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "importer hash on an nzb basename is removed",
+			in:   "/complete/" + expiredPlayTitle + "-71ceade2e434b5dd.nzb",
+			want: title,
+		},
+		{
+			name: "importer hash on a media basename is removed",
+			in:   "/complete/" + expiredPlayTitle + "-71ceade2e434b5dd/" + expiredPlayTitle + "-71ceade2e434b5dd.mkv",
+			want: title,
+		},
+		{
+			name: "a year before the importer hash is kept",
+			in:   "/complete/Blade.Runner.2049-71ceade2e434b5dd.mkv",
+			want: year,
+		},
+		{
+			name: "a short hex run is part of the release name",
+			in:   "/complete/Film-2024.mkv",
+			want: normalizeTitleForMatching("Film-2024"),
+		},
+		{
+			name: "an underscore suffix is not the importer's",
+			in:   "/complete/" + expiredPlayTitle + "_71ceade2e434b5dd.mkv",
+			want: normalizeTitleForMatching(expiredPlayTitle + "_71ceade2e434b5dd"),
+		},
+		{
+			name: "a suffix away from the end is not stripped",
+			in:   "/complete/Film-71ceade2e434b5dd-Extended.mkv",
+			want: normalizeTitleForMatching("Film-71ceade2e434b5dd-Extended"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, normalizeReleaseNameForMatching(tt.in))
 		})
 	}
 }
