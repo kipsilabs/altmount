@@ -487,12 +487,16 @@ type stremioQueueMetadata struct {
 	// outlives the listing's URL, so a play link whose URL-derived release key
 	// no longer matches can still find the import it names.
 	ReleaseToken string `json:"release_token,omitempty"`
-	IMDbID       string `json:"imdb_id,omitempty"`
-	Type         string `json:"type,omitempty"`
-	Season       int    `json:"season,omitempty"`
-	Episode      int    `json:"episode,omitempty"`
-	TMDBID       int    `json:"tmdbId,omitempty"`
-	TVDBID       int    `json:"tvdbId,omitempty"`
+	// IndexerSize is the release size the indexer advertised when the row was
+	// admitted. It is the same quantity as a later listing's size, unlike
+	// import_queue.file_size, which records an NZB's encoded payload size.
+	IndexerSize int64  `json:"indexer_size,omitempty"`
+	IMDbID      string `json:"imdb_id,omitempty"`
+	Type        string `json:"type,omitempty"`
+	Season      int    `json:"season,omitempty"`
+	Episode     int    `json:"episode,omitempty"`
+	TMDBID      int    `json:"tmdbId,omitempty"`
+	TVDBID      int    `json:"tvdbId,omitempty"`
 }
 
 func stremioContentKey(streamType, imdbID string, selector *stremioEpisodeSelector) string {
@@ -683,7 +687,9 @@ func stremioIndexerAgrees(item *database.ImportQueueItem, requestIndexer string)
 // one identity, and the newest of them wins. Distinct identities, or rows with
 // no identity at all, mean the name could refer to any of them, so the match is
 // ambiguous and is never guessed. A known indexer that disagrees with a known
-// row indexer excludes that row for the same reason.
+// row indexer excludes that row for the same reason. Size only corroborates a
+// match between like-for-like values and never rejects a row whose recorded size
+// measures something else.
 func stremioSelectRecoveredRelease(rows []*database.ImportQueueItem, normTarget, requestIndexer string, requestSize int64, ttlHours int) *database.ImportQueueItem {
 	matches := make([]*database.ImportQueueItem, 0, len(rows))
 	for _, item := range rows {
@@ -693,9 +699,6 @@ func stremioSelectRecoveredRelease(rows []*database.ImportQueueItem, normTarget,
 		if !stremioQueueItemNameMatches(item, normTarget) || !stremioIndexerAgrees(item, requestIndexer) {
 			continue
 		}
-		if requestSize > 0 && item.FileSize != nil && *item.FileSize != requestSize {
-			continue
-		}
 		matches = append(matches, item)
 	}
 
@@ -703,6 +706,9 @@ func stremioSelectRecoveredRelease(rows []*database.ImportQueueItem, normTarget,
 	case 0:
 		return nil
 	case 1:
+		if !stremioSizeAgrees(matches[0], requestSize) {
+			return nil
+		}
 		return matches[0]
 	}
 
@@ -722,7 +728,89 @@ func stremioSelectRecoveredRelease(rows []*database.ImportQueueItem, normTarget,
 	if len(verified) == 0 {
 		return nil
 	}
+	verified = stremioSizeTieBreak(verified, requestSize)
+	if len(verified) == 0 {
+		return nil
+	}
 	return stremioNewestCompleted(verified)
+}
+
+// stremioQueueItemIndexerSize returns the indexer-declared release size stored on
+// a completed row, when the row was admitted after that value was recorded.
+// import_queue.file_size cannot be used for this: for an NZB it is the total
+// encoded payload of the articles (PAR2 recovery files excluded), while an
+// indexer reports the release as posted, which commonly includes PAR2. Those are
+// different quantities, so comparing them would reject the same release.
+func stremioQueueItemIndexerSize(item *database.ImportQueueItem) (int64, bool) {
+	if item == nil || item.Metadata == nil || *item.Metadata == "" {
+		return 0, false
+	}
+	var metadata stremioQueueMetadata
+	if json.Unmarshal([]byte(*item.Metadata), &metadata) != nil || metadata.IndexerSize <= 0 {
+		return 0, false
+	}
+	return metadata.IndexerSize, true
+}
+
+// stremioQueueItemDeclaredSize returns the completed row's release size when it
+// measures the same quantity as a listing's size. A recorded indexer size is the
+// indexer's own value. A STRM import's file_size is the media file's declared
+// length, which is also what an indexer advertises. An NZB row's file_size is
+// not: it is the encoded payload size, so it is never used here. A row written
+// before either value existed has no comparable size and reports false.
+func stremioQueueItemDeclaredSize(item *database.ImportQueueItem) (int64, bool) {
+	if item == nil {
+		return 0, false
+	}
+	if size, ok := stremioQueueItemIndexerSize(item); ok {
+		return size, true
+	}
+	if item.FileSize != nil && *item.FileSize > 0 &&
+		strings.HasSuffix(strings.ToLower(item.NzbPath), ".strm") {
+		return *item.FileSize, true
+	}
+	return 0, false
+}
+
+// stremioSizeAgrees reports whether a completed row can be the release the
+// request names by size. Size only corroborates a name-and-identity match: when
+// either side has no comparable size the check is skipped, so a legacy row whose
+// payload size differs from the listing's release size is still served.
+func stremioSizeAgrees(item *database.ImportQueueItem, requestSize int64) bool {
+	if requestSize <= 0 {
+		return true
+	}
+	size, ok := stremioQueueItemDeclaredSize(item)
+	return !ok || size == requestSize
+}
+
+// stremioSizeTieBreak chooses among rows that share one normalized name and one
+// content identity. Rows whose recorded release size matches the listing are
+// the strongest candidates; rows without a comparable size cannot disagree and
+// remain eligible. When every row records a comparable size and none matches,
+// the name does not resolve to the listing and the caller searches instead.
+func stremioSizeTieBreak(rows []*database.ImportQueueItem, requestSize int64) []*database.ImportQueueItem {
+	if requestSize <= 0 {
+		return rows
+	}
+	corroborated := make([]*database.ImportQueueItem, 0, len(rows))
+	unknown := make([]*database.ImportQueueItem, 0, len(rows))
+	for _, item := range rows {
+		size, ok := stremioQueueItemDeclaredSize(item)
+		switch {
+		case !ok:
+			unknown = append(unknown, item)
+		case size == requestSize:
+			corroborated = append(corroborated, item)
+		}
+	}
+	if len(corroborated) > 0 {
+		return corroborated
+	}
+	if len(unknown) > 0 {
+		return unknown
+	}
+	return nil
 }
 
 // findActiveStremioRelease returns the active Stremio import of contentKey that
@@ -2068,6 +2156,7 @@ func (s *Server) enqueueStremioRelease(
 				ContentKey:   contentKey,
 				ReleaseKey:   releaseKey,
 				ReleaseToken: releaseToken,
+				IndexerSize:  cand.Size,
 				IMDbID:       imdbID,
 				Type:         streamType,
 				TMDBID:       tmdbID,

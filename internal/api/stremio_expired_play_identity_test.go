@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -31,6 +32,7 @@ type expiredPlayRow struct {
 	metadata        *string
 	indexer         *string
 	contentIdentity *string
+	fileSize        *int64
 	completedAt     time.Time
 }
 
@@ -120,9 +122,9 @@ func (s *expiredPlayServer) setIndexerResults(body string) {
 func (s *expiredPlayServer) insertCompleted(t *testing.T, row expiredPlayRow) {
 	t.Helper()
 	_, err := s.db.ExecContext(s.ctx,
-		`INSERT INTO import_queue (nzb_path, download_id, category, priority, status, retry_count, max_retries, metadata, storage_path, completed_at, indexer, content_identity)
-		 VALUES (?, 'stremio:test', 'Movies', 1, 'completed', 0, 3, ?, ?, ?, ?, ?)`,
-		row.nzbPath, row.metadata, row.storagePath, row.completedAt, row.indexer, row.contentIdentity)
+		`INSERT INTO import_queue (nzb_path, download_id, category, priority, status, retry_count, max_retries, metadata, storage_path, completed_at, indexer, content_identity, file_size)
+		 VALUES (?, 'stremio:test', 'Movies', 1, 'completed', 0, 3, ?, ?, ?, ?, ?, ?)`,
+		row.nzbPath, row.metadata, row.storagePath, row.completedAt, row.indexer, row.contentIdentity, row.fileSize)
 	require.NoError(t, err)
 }
 
@@ -470,6 +472,7 @@ func TestStremioPlayLiveTokenFallsBackBeforeFetch(t *testing.T) {
 		Indexer:     requestIndexer,
 		Source:      "prowlarr",
 		GUID:        "release-live-guid",
+		Size:        int64(9_390_000_000),
 	}
 	stableToken := stremioReleaseToken(cand)
 	other := cand
@@ -500,6 +503,41 @@ func TestStremioPlayLiveTokenFallsBackBeforeFetch(t *testing.T) {
 		}
 		return result
 	}
+	// withIndexerSize records the size the indexer advertised at admission, the
+	// only row-side value that is the same quantity as the listing's size.
+	withIndexerSize := func(result expiredPlayRow, size int64) expiredPlayRow {
+		var metadata stremioQueueMetadata
+		require.NoError(t, json.Unmarshal([]byte(*result.metadata), &metadata))
+		metadata.IndexerSize = size
+		encoded, err := encodeStremioQueueMetadata(metadata)
+		require.NoError(t, err)
+		result.metadata = encoded
+		return result
+	}
+	payloadSize := int64(8_521_189_764)
+
+	legacyPayload := row("legacy-payload-size", "", "identity-1")
+	legacyPayload.nzbPath = "/config/.nzbs/Movies/" + title + "-71ceade2e434b5dd.nzb"
+	legacyPayload.storagePath = "/complete/" + title + "-71ceade2e434b5dd/" + title + "-71ceade2e434b5dd.mkv"
+	legacyPayload.fileSize = &payloadSize
+
+	// A STRM row's file_size is the media file's declared length, so unlike an
+	// NZB payload it is the same quantity as the listing's size.
+	mediaSize := int64(8_000_000_000)
+	strmMismatch := expiredPlayRow{
+		nzbPath:     "/library/" + title + ".strm",
+		storagePath: storagePath("strm-size-mismatch"),
+		completedAt: now,
+		fileSize:    &mediaSize,
+	}
+
+	comparableMismatch := withIndexerSize(
+		row("comparable-size-mismatch", "", "identity-1"), payloadSize)
+	comparableMatch := withIndexerSize(
+		row("comparable-size-match", "", "identity-1"), cand.Size)
+	comparableNewerMismatch := withIndexerSize(
+		row("comparable-size-newer-mismatch", "", "identity-1"), payloadSize)
+	comparableNewerMismatch.completedAt = now.Add(time.Hour)
 
 	tests := []struct {
 		name       string
@@ -515,6 +553,33 @@ func TestStremioPlayLiveTokenFallsBackBeforeFetch(t *testing.T) {
 			name:       "name and shared identity hit serves without fetching",
 			rows:       []expiredPlayRow{row("named", "", "identity-1")},
 			wantServed: storagePath("named"),
+		},
+		{
+			// A legacy row stores the NZB payload size, not the indexer's
+			// release size. The two are different quantities, so the mismatch
+			// must not reject a row the name and identity resolve to.
+			name:       "legacy payload size differing from the listing is served",
+			rows:       []expiredPlayRow{legacyPayload},
+			wantServed: legacyPayload.storagePath,
+		},
+		{
+			// An indexer size recorded at admission is the same quantity as
+			// the listing's size: a disagreement means the row is a different
+			// release and must fetch again.
+			name: "a comparable indexer size that disagrees fetches",
+			rows: []expiredPlayRow{comparableMismatch},
+		},
+		{
+			name: "a comparable STRM size that disagrees fetches",
+			rows: []expiredPlayRow{strmMismatch},
+		},
+		{
+			name: "a matching indexer size breaks the identity tie",
+			rows: []expiredPlayRow{
+				comparableNewerMismatch,
+				comparableMatch,
+			},
+			wantServed: storagePath("comparable-size-match"),
 		},
 		{
 			name: "ambiguous identities fetch again",
