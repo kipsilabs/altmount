@@ -41,6 +41,7 @@ type expiredPlayServer struct {
 	db       *sql.DB
 	ctx      context.Context
 	searches *atomic.Int32
+	server   *Server
 }
 
 func newExpiredPlayServer(t *testing.T) *expiredPlayServer {
@@ -102,6 +103,7 @@ func newExpiredPlayServer(t *testing.T) *expiredPlayServer {
 		db:       db.Connection(),
 		ctx:      ctx,
 		searches: searches,
+		server:   server,
 	}
 }
 
@@ -320,6 +322,116 @@ func TestStremioPlayExpiredTokenWithoutURLSelectsOneCompletedRelease(t *testing.
 			require.Equal(t, tt.wantServed, location.Query().Get("path"),
 				"the completed release is served from storage, not searched again")
 			assert.Zero(t, s.searches.Load(), "a resolved completed release must not search")
+		})
+	}
+}
+
+// A live play token names the release even when the URL-derived release key
+// stored on its queue rows no longer matches. Before fetching the NZB again,
+// /play must try the release's stable token and then the strict name-and-
+// identity rule. Ambiguity still fetches rather than guessing.
+func TestStremioPlayLiveTokenFallsBackBeforeFetch(t *testing.T) {
+	const requestIndexer = "Indexer"
+
+	now := time.Now()
+	strPtr := func(value string) *string { return &value }
+	title := sanitizeFilename(expiredPlayTitle)
+	cand := stremioPlayCandidate{
+		Title:       expiredPlayTitle,
+		SafeTitle:   title,
+		DownloadURL: "https://indexer.example/api?t=get&id=release-live",
+		Indexer:     requestIndexer,
+		Source:      "prowlarr",
+		GUID:        "release-live-guid",
+	}
+	stableToken := stremioReleaseToken(cand)
+	other := cand
+	other.DownloadURL = "https://indexer.example/api?t=get&id=release-old"
+	storedKey := stremioReleaseKey(other)
+
+	storagePath := func(suffix string) string {
+		return "/storage/" + suffix + "/" + title + ".mkv"
+	}
+	row := func(suffix, releaseToken, identity string) expiredPlayRow {
+		metadataJSON, err := encodeStremioQueueMetadata(stremioQueueMetadata{
+			ContentKey:   "movie:tt123:0:0",
+			ReleaseKey:   storedKey,
+			ReleaseToken: releaseToken,
+			IMDbID:       "tt123",
+			Type:         "movie",
+		})
+		require.NoError(t, err)
+		result := expiredPlayRow{
+			nzbPath:     fmt.Sprintf("/config/.nzbs/Movies/%s-%s.nzb", title, suffix),
+			storagePath: storagePath(suffix),
+			metadata:    metadataJSON,
+			indexer:     strPtr(requestIndexer),
+			completedAt: now,
+		}
+		if identity != "" {
+			result.contentIdentity = strPtr(identity)
+		}
+		return result
+	}
+
+	tests := []struct {
+		name       string
+		rows       []expiredPlayRow
+		wantServed string
+	}{
+		{
+			name:       "stable token hit serves without fetching",
+			rows:       []expiredPlayRow{row("token", stableToken, "")},
+			wantServed: storagePath("token"),
+		},
+		{
+			name:       "name and shared identity hit serves without fetching",
+			rows:       []expiredPlayRow{row("named", "", "identity-1")},
+			wantServed: storagePath("named"),
+		},
+		{
+			name: "ambiguous identities fetch again",
+			rows: []expiredPlayRow{
+				row("first", "", "identity-1"),
+				row("second", "", "identity-2"),
+			},
+		},
+		{
+			name: "a genuinely new release fetches",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newExpiredPlayServer(t)
+			for _, importRow := range tt.rows {
+				s.insertCompleted(t, importRow)
+			}
+
+			token, err := s.server.storeStremioReleaseRef(cand)
+			require.NoError(t, err)
+			resp := s.play(t, "release="+url.QueryEscape(token)+"&type=movie&id=tt123")
+
+			if tt.wantServed == "" {
+				require.NotEqual(t, http.StatusFound, resp.StatusCode,
+					"a release the request cannot verify must fetch instead of serving a row")
+				require.Empty(t, resp.Header.Get("Location"),
+					"no redirect may be issued for an unresolved release")
+				// No importer is wired here, so the fallback to the fetch path
+				// fails closed after recording the attempt.
+				require.True(t, s.server.stremioFailures.Has(cand.SafeTitle, time.Hour),
+					"the miss must reach the NZB fetch path")
+				return
+			}
+
+			require.Equal(t, http.StatusFound, resp.StatusCode,
+				"a completed release the live token names must be served")
+			location, err := url.Parse(resp.Header.Get("Location"))
+			require.NoError(t, err)
+			require.Equal(t, "/api/files/stream", location.Path)
+			require.Equal(t, tt.wantServed, location.Query().Get("path"),
+				"the completed release is served from storage, not fetched again")
+			assert.Zero(t, s.searches.Load(), "a resolved completed release must not fetch")
 		})
 	}
 }
