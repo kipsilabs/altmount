@@ -60,6 +60,7 @@ export interface QueueItem {
 export interface ImportHistoryItem {
 	id: number;
 	nzb_name: string;
+	nzb_display_name: string;
 	file_name: string;
 	virtual_path: string;
 	library_path?: string;

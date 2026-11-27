@@ -415,7 +415,7 @@ export function ActivityHub() {
 															<History className="h-3 w-3" />
 															<span>NZB:</span>
 														</div>
-														<div className="break-all font-mono opacity-80">{item.nzb_name}</div>
+														<div className="break-all font-mono opacity-80">{item.nzb_display_name}</div>
 
 														<div className="flex items-center gap-1.5 font-semibold text-base-content/60">
 															<Play className="h-3 w-3" />
