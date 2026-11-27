@@ -538,6 +538,8 @@ definitions:
         type: string
       metadata:
         type: string
+      nzb_display_name:
+        type: string
       nzb_id:
         type: integer
       nzb_name:

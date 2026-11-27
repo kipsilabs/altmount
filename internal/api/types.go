@@ -702,17 +702,18 @@ type QueueHistoryRange struct {
 
 // ImportHistoryResponse represents a persistent import record in API responses
 type ImportHistoryResponse struct {
-	ID          int64     `json:"id"`
-	NzbID       *int64    `json:"nzb_id"`
-	NzbName     string    `json:"nzb_name"`
-	FileName    string    `json:"file_name"`
-	FileSize    int64     `json:"file_size"`
-	VirtualPath string    `json:"virtual_path"`
-	LibraryPath *string   `json:"library_path,omitempty"`
-	Category    *string   `json:"category"`
-	Indexer     *string   `json:"indexer,omitempty"` // Added indexer
-	Metadata    *string   `json:"metadata,omitempty"`
-	CompletedAt time.Time `json:"completed_at"`
+	ID             int64     `json:"id"`
+	NzbID          *int64    `json:"nzb_id"`
+	NzbName        string    `json:"nzb_name"`
+	NzbDisplayName string    `json:"nzb_display_name"`
+	FileName       string    `json:"file_name"`
+	FileSize       int64     `json:"file_size"`
+	VirtualPath    string    `json:"virtual_path"`
+	LibraryPath    *string   `json:"library_path,omitempty"`
+	Category       *string   `json:"category"`
+	Indexer        *string   `json:"indexer,omitempty"` // Added indexer
+	Metadata       *string   `json:"metadata,omitempty"`
+	CompletedAt    time.Time `json:"completed_at"`
 }
 
 // DailyStat represents statistics for a single day
@@ -909,10 +910,7 @@ func ToQueueItemResponse(item *database.ImportQueueItem) *QueueItemResponse {
 		}
 	}
 
-	nzbDisplayName := filepath.Base(item.NzbPath)
-	if strings.HasSuffix(strings.ToLower(nzbDisplayName), ".gz") {
-		nzbDisplayName = nzbDisplayName[:len(nzbDisplayName)-3]
-	}
+	nzbDisplayName := queueItemDisplayName(item)
 
 	// Transform error message for better user understanding
 	errorMessage := transformQueueError(item.ErrorMessage)
@@ -1031,17 +1029,18 @@ func ToImportHistoryResponse(h *database.ImportHistory) *ImportHistoryResponse {
 		return nil
 	}
 	return &ImportHistoryResponse{
-		ID:          h.ID,
-		NzbID:       h.NzbID,
-		NzbName:     h.NzbName,
-		FileName:    h.FileName,
-		FileSize:    h.FileSize,
-		VirtualPath: h.VirtualPath,
-		LibraryPath: h.LibraryPath,
-		Category:    h.Category,
-		Indexer:     h.Indexer, // Fixed: use pointer directly
-		Metadata:    h.Metadata,
-		CompletedAt: h.CompletedAt,
+		ID:             h.ID,
+		NzbID:          h.NzbID,
+		NzbName:        h.NzbName,
+		NzbDisplayName: importHistoryDisplayName(h),
+		FileName:       h.FileName,
+		FileSize:       h.FileSize,
+		VirtualPath:    h.VirtualPath,
+		LibraryPath:    h.LibraryPath,
+		Category:       h.Category,
+		Indexer:        h.Indexer, // Fixed: use pointer directly
+		Metadata:       h.Metadata,
+		CompletedAt:    h.CompletedAt,
 	}
 }
 
