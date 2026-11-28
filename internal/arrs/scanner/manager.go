@@ -78,22 +78,53 @@ func (m *Manager) findInstanceForFilePath(ctx context.Context, filePath string, 
 	// instance rooted at "/media/tv" whenever that one happened to be listed
 	// first, and the same applies to a nested root such as "/media/tv/anime"
 	// (issue #749).
-	bestScore, bestType, bestName := 0, "", ""
+	//
+	// Two instances can have the same root folder, for example two Sonarr
+	// instances for different qualities. Their scores tie, and the
+	// first one listed used to win even when the file belongs to the other.
+	// A tie is resolved by asking each tied instance whether it holds the file
+	// (resolveRootFolderTie), and refused when that does not pick exactly one.
+	//
+	// An instance that cannot be scored (no client, or its root folders could
+	// not be read) might share the winning root folder, so it must not drop out
+	// silently: when it is of the same type as the winner, the lookup is refused.
+	bestScore := 0
+	var tied []rootCandidate
+	var unscored []unscoredInstance
 	for _, instance := range allInstances {
 		if !instance.Enabled {
 			continue
 		}
 
-		if client, err := m.clients.GetOrCreateClient(instance); err == nil {
-			if score := m.managesFile(ctx, instance.Type, client, filePath); score > bestScore {
-				bestScore, bestType, bestName = score, instance.Type, instance.Name
-			}
+		client, err := m.clients.GetOrCreateClient(instance)
+		if err != nil {
+			unscored = append(unscored, unscoredInstance{instanceType: instance.Type, instanceName: instance.Name, err: err})
+			continue
+		}
+		score, err := m.managesFile(ctx, instance.Type, client, filePath)
+		if err != nil {
+			unscored = append(unscored, unscoredInstance{instanceType: instance.Type, instanceName: instance.Name, err: err})
+			continue
+		}
+		candidate := rootCandidate{instanceType: instance.Type, instanceName: instance.Name, client: client}
+		switch {
+		case score > bestScore:
+			bestScore = score
+			tied = []rootCandidate{candidate}
+		case score > 0 && score == bestScore:
+			tied = append(tied, candidate)
 		}
 	}
 	if bestScore > 0 {
-		slog.DebugContext(ctx, "Found managing instance by root folder",
-			"instance", bestName, "type", bestType, "root_len", bestScore)
-		return bestType, bestName, nil
+		if err := refuseIfUnscoredPeer(ctx, tied, unscored, filePath); err != nil {
+			return "", "", err
+		}
+		if len(tied) == 1 {
+			slog.DebugContext(ctx, "Found managing instance by root folder",
+				"instance", tied[0].instanceName, "type", tied[0].instanceType, "root_len", bestScore)
+			return tied[0].instanceType, tied[0].instanceName, nil
+		}
+		return m.resolveRootFolderTie(ctx, tied, filePath)
 	}
 
 	// Strategy 2: Category Match - Check if file is in the staging/complete folder
@@ -130,21 +161,195 @@ func (m *Manager) findInstanceForFilePath(ctx context.Context, filePath string, 
 	if relativePath != "" {
 		slog.InfoContext(ctx, "Root folder match failed, attempting relative path search", "relative_path", relativePath)
 
+		// As in strategy 1, an instance that cannot be read must not drop out
+		// silently: when one of the same type as the match could not be
+		// checked, the file may be its, so the lookup is refused. A relative
+		// path that matches several instances is refused too.
+		var matches []rootCandidate
+		var unread []unscoredInstance
 		for _, instance := range allInstances {
 			if !instance.Enabled {
 				continue
 			}
 
-			if client, err := m.clients.GetOrCreateClient(instance); err == nil {
-				if m.hasFile(ctx, instance.Type, client, instance.Name, relativePath) {
-					slog.InfoContext(ctx, "Found managing instance by relative path", "instance", instance.Name, "type", instance.Type)
-					return instance.Type, instance.Name, nil
-				}
+			client, err := m.clients.GetOrCreateClient(instance)
+			if err != nil {
+				unread = append(unread, unscoredInstance{instanceType: instance.Type, instanceName: instance.Name, err: err})
+				continue
 			}
+			found, err := m.hasFile(ctx, instance.Type, client, instance.Name, relativePath)
+			if err != nil {
+				unread = append(unread, unscoredInstance{instanceType: instance.Type, instanceName: instance.Name, err: err})
+				continue
+			}
+			if found {
+				matches = append(matches, rootCandidate{instanceType: instance.Type, instanceName: instance.Name})
+			}
+		}
+		if len(matches) > 1 {
+			names := make([]string, 0, len(matches))
+			for _, c := range matches {
+				names = append(names, c.instanceName)
+			}
+			slog.WarnContext(ctx, "Relative path matches several instances; not acting",
+				"candidates", names, "file_path", filePath, "relative_path", relativePath)
+			return "", "", fmt.Errorf("%w: %s (relative path matches %v)", errAmbiguousInstance, filePath, names)
+		}
+		if len(matches) == 1 {
+			match := matches[0]
+			if err := refuseIfUnscoredPeer(ctx, matches, unread, filePath); err != nil {
+				return "", "", err
+			}
+			slog.InfoContext(ctx, "Found managing instance by relative path", "instance", match.instanceName, "type", match.instanceType)
+			return match.instanceType, match.instanceName, nil
+		}
+		if len(unread) > 0 {
+			errs := make([]error, 0, len(unread))
+			for _, u := range unread {
+				errs = append(errs, fmt.Errorf("%s: %w", u.instanceName, u.err))
+			}
+			return "", "", fmt.Errorf("no ARR instance found managing file path: %s (could not check: %w)", filePath, errors.Join(errs...))
 		}
 	}
 
 	return "", "", fmt.Errorf("no ARR instance found managing file path: %s", filePath)
+}
+
+// rootCandidate is an instance whose root folder claims a file.
+type rootCandidate struct {
+	instanceType string
+	instanceName string
+	client       any
+}
+
+// unscoredInstance is an enabled instance whose root folders could not be
+// checked, because it has no client or the root folder lookup failed.
+type unscoredInstance struct {
+	instanceType string
+	instanceName string
+	err          error
+}
+
+// errAmbiguousInstance is returned when the root folder that claims a file
+// does not single out one ARR instance: several instances share it and their
+// libraries do not decide, or an instance of the same type could not be checked.
+var errAmbiguousInstance = errors.New("cannot tell which ARR instance manages this file")
+
+// refuseIfUnscoredPeer returns errAmbiguousInstance when an instance of the
+// same type as a root folder winner could not be scored. That instance may
+// share the winning root folder, and the file may be its. Instances of other
+// types do not block, so one instance per type behaves as before.
+func refuseIfUnscoredPeer(ctx context.Context, winners []rootCandidate, unscored []unscoredInstance, filePath string) error {
+	types := make(map[string]bool, len(winners))
+	for _, w := range winners {
+		types[w.instanceType] = true
+	}
+	var names []string
+	var errs []error
+	for _, u := range unscored {
+		if types[u.instanceType] {
+			names = append(names, u.instanceName)
+			errs = append(errs, fmt.Errorf("%s: %w", u.instanceName, u.err))
+		}
+	}
+	if len(names) == 0 {
+		return nil
+	}
+	slog.WarnContext(ctx, "Root folder matched, but an instance of the same type could not be checked; not acting",
+		"unchecked", names, "file_path", filePath, "error", errors.Join(errs...))
+	return fmt.Errorf("%w: %s (could not check %v): %w", errAmbiguousInstance, filePath, names, errors.Join(errs...))
+}
+
+// resolveRootFolderTie picks, among instances whose root folders claim
+// filePath equally, the one whose library holds filePath (see holdsPath). With
+// none or more than one it returns errAmbiguousInstance rather than guess.
+func (m *Manager) resolveRootFolderTie(ctx context.Context, tied []rootCandidate, filePath string) (string, string, error) {
+	names := make([]string, 0, len(tied))
+	var holders []rootCandidate
+	var lookupErrs []error
+	for _, c := range tied {
+		names = append(names, c.instanceName)
+		holds, err := m.holdsPath(ctx, c, filePath)
+		if err != nil {
+			lookupErrs = append(lookupErrs, fmt.Errorf("%s: %w", c.instanceName, err))
+			continue
+		}
+		if holds {
+			holders = append(holders, c)
+		}
+	}
+	// An instance whose library could not be read might be the real holder,
+	// so a failed lookup never lets another instance win the tie.
+	if len(lookupErrs) > 0 {
+		slog.WarnContext(ctx, "Root folder shared by several instances and a library lookup failed; not acting",
+			"candidates", names, "file_path", filePath, "error", errors.Join(lookupErrs...))
+		return "", "", fmt.Errorf("%w: %s (candidates %v): %w", errAmbiguousInstance, filePath, names, errors.Join(lookupErrs...))
+	}
+	if len(holders) == 1 {
+		slog.InfoContext(ctx, "Root folder shared by several instances; chose the one holding the file",
+			"instance", holders[0].instanceName, "type", holders[0].instanceType, "candidates", names, "file_path", filePath)
+		return holders[0].instanceType, holders[0].instanceName, nil
+	}
+	slog.WarnContext(ctx, "Root folder shared by several instances and the file does not single one out; not acting",
+		"candidates", names, "holding_the_file", len(holders), "file_path", filePath)
+	return "", "", fmt.Errorf("%w: %s (candidates %v)", errAmbiguousInstance, filePath, names)
+}
+
+// holdsPath reports whether the candidate's library has a file at exactly
+// filePath: for Radarr a movie file, for Sonarr and Whisparr an episode file
+// of a series whose folder contains filePath. A series folder alone is not
+// enough, because two instances can each have a series in the same folder.
+// Other types cannot be checked and report false. An error means the library
+// could not be read, which is not the same as false.
+func (m *Manager) holdsPath(ctx context.Context, c rootCandidate, filePath string) (bool, error) {
+	if m.data == nil {
+		return false, errors.New("no library data source")
+	}
+	want := filepath.ToSlash(filepath.Clean(filePath))
+	switch c.instanceType {
+	case "radarr":
+		rc, ok := c.client.(*radarr.Radarr)
+		if !ok {
+			return false, errors.New("not a Radarr client")
+		}
+		movies, err := m.data.GetMovies(ctx, rc, c.instanceName)
+		if err != nil {
+			return false, err
+		}
+		for _, movie := range movies {
+			if movie != nil && movie.HasFile && movie.MovieFile != nil &&
+				filepath.ToSlash(filepath.Clean(movie.MovieFile.Path)) == want {
+				return true, nil
+			}
+		}
+		return false, nil
+	case "sonarr", "whisparr":
+		sc, ok := c.client.(clients.SonarrClient)
+		if !ok {
+			return false, errors.New("not a Sonarr client")
+		}
+		seriesList, err := m.data.GetSeries(ctx, sc, c.instanceName)
+		if err != nil {
+			return false, err
+		}
+		for _, series := range seriesList {
+			if series == nil || series.Path == "" || rootFolderScore(filePath, series.Path) == 0 {
+				continue
+			}
+			files, err := m.data.GetEpisodeFiles(ctx, sc, c.instanceName, series.ID)
+			if err != nil {
+				return false, err
+			}
+			for _, f := range files {
+				if f != nil && f.Path != "" && filepath.ToSlash(filepath.Clean(f.Path)) == want {
+					return true, nil
+				}
+			}
+		}
+		return false, nil
+	default:
+		return false, nil
+	}
 }
 
 // rootFolderScore reports how specifically rootPath claims filePath: the
@@ -169,70 +374,73 @@ func rootFolderScore(filePath, rootPath string) int {
 // managesFile reports how specifically instanceType's root folders claim
 // filePath: the length of the longest matching root folder, or 0 when none
 // matches. Callers compare scores across instances so the most specific root
-// wins (see findInstanceForFilePath).
-func (m *Manager) managesFile(ctx context.Context, instanceType string, client any, filePath string) int {
+// wins (see findInstanceForFilePath). An error means the root folders could
+// not be read, which is not the same as 0.
+func (m *Manager) managesFile(ctx context.Context, instanceType string, client any, filePath string) (int, error) {
 	switch instanceType {
 	case "radarr":
 		rc, ok := client.(*radarr.Radarr)
 		if !ok {
-			return 0
+			return 0, nil
 		}
 		return m.radarrManagesFile(ctx, rc, filePath)
 	case "sonarr":
 		sc, ok := client.(clients.SonarrClient)
 		if !ok {
-			return 0
+			return 0, nil
 		}
 		return m.sonarrManagesFile(ctx, sc, filePath)
 	case "lidarr":
 		lc, ok := client.(*lidarr.Lidarr)
 		if !ok {
-			return 0
+			return 0, nil
 		}
 		return m.lidarrManagesFile(ctx, lc, filePath)
 	case "readarr":
 		rc, ok := client.(*readarr.Readarr)
 		if !ok {
-			return 0
+			return 0, nil
 		}
 		return m.readarrManagesFile(ctx, rc, filePath)
 	case "whisparr":
 		wc, ok := client.(clients.SonarrClient)
 		if !ok {
-			return 0
+			return 0, nil
 		}
 		return m.sonarrManagesFile(ctx, wc, filePath)
 	default:
-		return 0
+		return 0, nil
 	}
 }
 
-func (m *Manager) hasFile(ctx context.Context, instanceType string, client any, instanceName, relativePath string) bool {
+// hasFile reports whether the instance's library has relativePath. An error
+// means the library could not be read, which is not the same as false.
+func (m *Manager) hasFile(ctx context.Context, instanceType string, client any, instanceName, relativePath string) (bool, error) {
 	switch instanceType {
 	case "radarr":
 		rc, ok := client.(*radarr.Radarr)
 		if !ok {
-			return false
+			return false, nil
 		}
 		return m.radarrHasFile(ctx, rc, instanceName, relativePath)
 	case "sonarr":
 		sc, ok := client.(clients.SonarrClient)
 		if !ok {
-			return false
+			return false, nil
 		}
 		return m.sonarrHasFile(ctx, sc, instanceName, relativePath)
 	case "lidarr", "readarr", "whisparr":
 		// For now, these don't have a slow path search implementation
 		// They rely on the Root Folder (Strategy 1) or Category (Strategy 2)
-		return false
+		return false, nil
 	default:
-		return false
+		return false, nil
 	}
 }
 
 // radarrManagesFile scores how specifically Radarr's root folders claim
 // filePath (checkrr approach). See rootFolderScore for the match rule.
-func (m *Manager) radarrManagesFile(ctx context.Context, client *radarr.Radarr, filePath string) int {
+func (m *Manager) radarrManagesFile(ctx context.Context, client *radarr.Radarr, filePath string) (int, error) {
 	slog.DebugContext(ctx, "Checking Radarr root folders for file ownership",
 		"file_path", filePath)
 
@@ -240,7 +448,7 @@ func (m *Manager) radarrManagesFile(ctx context.Context, client *radarr.Radarr, 
 	rootFolders, err := client.GetRootFoldersContext(ctx)
 	if err != nil {
 		slog.DebugContext(ctx, "Failed to get root folders from Radarr for file check", "error", err)
-		return 0
+		return 0, err
 	}
 
 	best := 0
@@ -255,12 +463,12 @@ func (m *Manager) radarrManagesFile(ctx context.Context, client *radarr.Radarr, 
 	if best == 0 {
 		slog.DebugContext(ctx, "File does not match any Radarr root folders")
 	}
-	return best
+	return best, nil
 }
 
 // sonarrManagesFile scores how specifically Sonarr's root folders claim
 // filePath (checkrr approach). See rootFolderScore for the match rule.
-func (m *Manager) sonarrManagesFile(ctx context.Context, client clients.SonarrClient, filePath string) int {
+func (m *Manager) sonarrManagesFile(ctx context.Context, client clients.SonarrClient, filePath string) (int, error) {
 	slog.DebugContext(ctx, "Checking Sonarr root folders for file ownership",
 		"file_path", filePath)
 
@@ -268,7 +476,7 @@ func (m *Manager) sonarrManagesFile(ctx context.Context, client clients.SonarrCl
 	rootFolders, err := client.GetRootFoldersContext(ctx)
 	if err != nil {
 		slog.DebugContext(ctx, "Failed to get root folders from Sonarr for file check", "error", err)
-		return 0
+		return 0, err
 	}
 
 	best := 0
@@ -283,16 +491,16 @@ func (m *Manager) sonarrManagesFile(ctx context.Context, client clients.SonarrCl
 	if best == 0 {
 		slog.DebugContext(ctx, "File does not match any Sonarr root folders")
 	}
-	return best
+	return best, nil
 }
 
 // lidarrManagesFile scores how specifically Lidarr's root folders claim filePath.
-func (m *Manager) lidarrManagesFile(ctx context.Context, client *lidarr.Lidarr, filePath string) int {
+func (m *Manager) lidarrManagesFile(ctx context.Context, client *lidarr.Lidarr, filePath string) (int, error) {
 	slog.DebugContext(ctx, "Checking Lidarr root folders for file ownership", "file_path", filePath)
 	rootFolders, err := client.GetRootFoldersContext(ctx)
 	if err != nil {
 		slog.DebugContext(ctx, "Failed to get root folders from Lidarr", "error", err)
-		return 0
+		return 0, err
 	}
 	best := 0
 	for _, folder := range rootFolders {
@@ -300,16 +508,16 @@ func (m *Manager) lidarrManagesFile(ctx context.Context, client *lidarr.Lidarr, 
 			best = score
 		}
 	}
-	return best
+	return best, nil
 }
 
 // readarrManagesFile scores how specifically Readarr's root folders claim filePath.
-func (m *Manager) readarrManagesFile(ctx context.Context, client *readarr.Readarr, filePath string) int {
+func (m *Manager) readarrManagesFile(ctx context.Context, client *readarr.Readarr, filePath string) (int, error) {
 	slog.DebugContext(ctx, "Checking Readarr root folders for file ownership", "file_path", filePath)
 	rootFolders, err := client.GetRootFoldersContext(ctx)
 	if err != nil {
 		slog.DebugContext(ctx, "Failed to get root folders from Readarr", "error", err)
-		return 0
+		return 0, err
 	}
 	best := 0
 	for _, folder := range rootFolders {
@@ -317,15 +525,15 @@ func (m *Manager) readarrManagesFile(ctx context.Context, client *readarr.Readar
 			best = score
 		}
 	}
-	return best
+	return best, nil
 }
 
 // radarrHasFile checks if any movie in the instance contains the given relative path
-func (m *Manager) radarrHasFile(ctx context.Context, client *radarr.Radarr, instanceName, relativePath string) bool {
+func (m *Manager) radarrHasFile(ctx context.Context, client *radarr.Radarr, instanceName, relativePath string) (bool, error) {
 	movies, err := m.data.GetMovies(ctx, client, instanceName)
 	if err != nil {
 		slog.ErrorContext(ctx, "Failed to get movies for relative path check", "instance", instanceName, "error", err)
-		return false
+		return false, err
 	}
 
 	strippedRelative := strings.TrimSuffix(relativePath, ".strm")
@@ -334,19 +542,19 @@ func (m *Manager) radarrHasFile(ctx context.Context, client *radarr.Radarr, inst
 		if movie.HasFile && movie.MovieFile != nil {
 			if strings.HasSuffix(movie.MovieFile.Path, relativePath) ||
 				strings.HasSuffix(strings.TrimSuffix(movie.MovieFile.Path, filepath.Ext(movie.MovieFile.Path)), strippedRelative) {
-				return true
+				return true, nil
 			}
 		}
 	}
-	return false
+	return false, nil
 }
 
 // sonarrHasFile checks if any series in the instance contains the given relative path
-func (m *Manager) sonarrHasFile(ctx context.Context, client clients.SonarrClient, instanceName, relativePath string) bool {
+func (m *Manager) sonarrHasFile(ctx context.Context, client clients.SonarrClient, instanceName, relativePath string) (bool, error) {
 	seriesList, err := m.data.GetSeries(ctx, client, instanceName)
 	if err != nil {
 		slog.ErrorContext(ctx, "Failed to get series for relative path check", "instance", instanceName, "error", err)
-		return false
+		return false, err
 	}
 
 	// Normalize relative path for comparison
@@ -357,10 +565,10 @@ func (m *Manager) sonarrHasFile(ctx context.Context, client clients.SonarrClient
 		// Check if the series folder name is part of the relative path
 		folderName := filepath.Base(series.Path)
 		if strings.Contains(relativePath, folderName) || strings.Contains(strippedRelative, folderName) {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 // TriggerFileRescan triggers a rescan for a specific file path through the appropriate ARR instance
