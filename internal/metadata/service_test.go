@@ -660,3 +660,49 @@ func TestDeleteDirectory_CachePurgeHandlesTrailingSlash(t *testing.T) {
 	_, cached := ms.liteCache.Get(virtualPath)
 	assert.False(t, cached, "cache entry must be purged even with a trailing-slash directory argument")
 }
+
+// The delete path behind DeleteCorruptedFile must find the .meta that was
+// written for a backslash path. Without normalization the delete looks for a
+// different name and returns nil, leaving the metadata behind.
+func TestDeleteCorruptedFile_NormalizesBackslashPath(t *testing.T) {
+	root := t.TempDir()
+	ms := NewMetadataService(root)
+
+	backslashPath := "movies/Release\\file.mkv"
+	normalizedPath := "movies/Release/file.mkv"
+
+	meta := ms.CreateFileMetadata(
+		1024, "test.nzb", metapb.FileStatus_FILE_STATUS_HEALTHY,
+		nil, metapb.Encryption_NONE, "", "", nil, nil, 0, nil, "delete12345",
+	)
+	require.NoError(t, ms.WriteFileMetadata(backslashPath, meta))
+	require.FileExists(t, ms.GetMetadataFilePath(normalizedPath))
+
+	require.NoError(t, ms.DeleteCorruptedFile(context.Background(), backslashPath, "", ""))
+
+	assert.NoFileExists(t, ms.GetMetadataFilePath(normalizedPath))
+}
+
+// MoveToCorrupted must move the normalized .meta and must not carry the
+// backslash into the name under corrupted_metadata. filepath.FromSlash is a
+// no-op on Linux, so it cannot be relied on for this.
+func TestMoveToCorrupted_NormalizesBackslashPath(t *testing.T) {
+	root := t.TempDir()
+	ms := NewMetadataService(root)
+
+	backslashPath := "movies/Release\\bad.mkv"
+	normalizedPath := "movies/Release/bad.mkv"
+
+	meta := ms.CreateFileMetadata(
+		512, "test.nzb", metapb.FileStatus_FILE_STATUS_CORRUPTED,
+		nil, metapb.Encryption_NONE, "", "", nil, nil, 0, nil, "corrupt1234",
+	)
+	require.NoError(t, ms.WriteFileMetadata(backslashPath, meta))
+	require.FileExists(t, ms.GetMetadataFilePath(normalizedPath))
+
+	require.NoError(t, ms.MoveToCorrupted(context.Background(), backslashPath))
+
+	assertNoBackslashPersisted(t, root)
+	assert.NoFileExists(t, ms.GetMetadataFilePath(normalizedPath))
+	require.FileExists(t, filepath.Join(root, "corrupted_metadata", "movies", "Release", "bad.mkv.meta"))
+}
